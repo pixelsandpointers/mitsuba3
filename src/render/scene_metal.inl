@@ -10,23 +10,36 @@
 #include <mitsuba/render/scene.h>
 #include <mitsuba/render/scene_ir.h>
 #include "metal/accel.h"
-#include "metal/shapes.h"
 
 NAMESPACE_BEGIN(mitsuba)
 
-/// Build the raw recovery tables that resolve \c pi.shape from a Metal hit.
-/// The trace reports raw instance and geometry indices. The offset table maps
-/// the pair into the shape-id table.
-static void build_recovery_table_data(const SceneIR &sd,
-                                      std::vector<uint32_t> &offsets,
+/// Bit of a TLAS entry's userID that marks shapes with null transmission,
+/// so that shadow traces can classify a hit without a table lookup
+static constexpr uint32_t MetalNullBit = 0x80000000u;
+
+/// Build the recovery table that resolves a Metal hit into \c pi.shape. The
+/// record index is the TLAS entry's userID (returned via \c user_ids, without
+/// \c MetalNullBit) plus the hit's geometry ID. Records are (shape id,
+/// instance index) pairs when the scene contains instances, plain shape ids
+/// otherwise.
+static void build_recovery_table_data(const SceneIR &sd, bool has_instances,
+                                      std::vector<uint32_t> &user_ids,
                                       std::vector<uint32_t> &table) {
-    offsets.clear();
+    user_ids.clear();
     table.clear();
-    offsets.reserve(sd.instances.size());
+    user_ids.reserve(sd.instances.size());
+    uint32_t cursor = 0;
     for (const InstanceEntry &inst : sd.instances) {
-        offsets.push_back((uint32_t) table.size());
+        bool null = false;
         for (const ShapeIR &g : sd.blases[inst.blas_index].geoms)
+            null |= (g.visibility_mask & (uint32_t) RayMask::Null) != 0;
+        user_ids.push_back(cursor | (null ? MetalNullBit : 0u));
+        for (const ShapeIR &g : sd.blases[inst.blas_index].geoms) {
             table.push_back(jit_registry_id(g.ctx));
+            if (has_instances)
+                table.push_back(inst.instance_index);
+            cursor++;
+        }
     }
 }
 
@@ -44,16 +57,18 @@ void MetalAccel<Float, Spectrum>::init(Scene<Float, Spectrum> *scene,
         return;
     }
 
-    std::vector<uint32_t> offsets, table;
-    build_recovery_table_data(sd, offsets, table);
+    has_instances = false;
+    for (const InstanceEntry &inst : sd.instances)
+        has_instances |= inst.instance_index != 0;
+
+    std::vector<uint32_t> user_ids, table;
+    build_recovery_table_data(sd, has_instances, user_ids, table);
     using UInt32 = dr::uint32_array_t<Float>;
-    geom_shape_offsets =
-        dr::load<DynamicBuffer<UInt32>>(offsets.data(), offsets.size());
     geom_shape_table =
         dr::load<DynamicBuffer<UInt32>>(table.data(), table.size());
 
     std::tie(accel, scene_index) =
-        build_metal_accel(sd, scene->m_compact_accel);
+        build_metal_accel(sd, user_ids, scene->compact_accel());
 
     accel_handle = UInt64::steal(jit_metal_scene_owner_handle(scene_index));
 }
@@ -85,22 +100,25 @@ void MetalAccel<Float, Spectrum>::release() {
 
 template <typename Float, typename Spectrum>
 void MetalAccel<Float, Spectrum>::trace(const Ray3f &ray, Mask active,
+                                        UInt32 ray_mask,
                                         uint32_t out[8], bool shadow) const {
     using Single = dr::float32_array_t<Float>;
     dr::Array<Single, 3> ray_o(ray.o), ray_d(ray.d);
     Single ray_tmin(0.f), ray_tmax(ray.maxt);
+    Single ray_time(ray.time);
 
     // Be careful with 'ray.maxt' in double precision variants
     if constexpr (!std::is_same_v<Single, Float>)
         ray_tmax = dr::minimum(ray_tmax, dr::Largest<Single>);
 
-    uint32_t args[8] = {
+    uint32_t args[10] = {
         ray_o.x().index(), ray_o.y().index(), ray_o.z().index(),
         ray_d.x().index(), ray_d.y().index(), ray_d.z().index(),
-        ray_tmin.index(), ray_tmax.index()
+        ray_tmin.index(), ray_tmax.index(), ray_time.index(),
+        ray_mask.index()
     };
 
-    jit_metal_ray_trace(8, args, active.index(), out, 8, scene_index, shadow);
+    jit_metal_ray_trace(10, args, active.index(), out, 8, scene_index, shadow);
 }
 
 template <typename Float, typename Spectrum>
@@ -108,7 +126,7 @@ typename MetalAccel<Float, Spectrum>::PreliminaryIntersection3f
 MetalAccel<Float, Spectrum>::ray_intersect_preliminary(
     const Scene<Float, Spectrum> * /*scene*/, const Ray3f &ray, Mask /*coh*/,
     bool /*reorder*/, UInt32 /*reorder_hint*/, uint32_t /*reorder_hint_bits*/,
-    Mask active) const {
+    Mask active, UInt32 ray_mask) const {
     using Single = dr::float32_array_t<Float>;
 
     PreliminaryIntersection3f pi = dr::zeros<PreliminaryIntersection3f>();
@@ -118,7 +136,7 @@ MetalAccel<Float, Spectrum>::ray_intersect_preliminary(
     // out: [valid, distance, bary_u, bary_v, instance_id, primitive_id,
     //       geometry_id, user_instance_id]
     uint32_t out[8];
-    trace(ray, active, out, /* shadow = */ false);
+    trace(ray, active, ray_mask, out, /* shadow = */ false);
 
     Mask valid = Mask::steal(out[0]);
 
@@ -128,40 +146,52 @@ MetalAccel<Float, Spectrum>::ray_intersect_preliminary(
                             Float(Single::steal(out[3])));
     pi.prim_index = UInt32::steal(out[5]);
 
-    UInt32 instance_id = UInt32::steal(out[4]);
+    UInt32::steal(out[4]); // raw TLAS entry index, unused
     UInt32 geometry_id = UInt32::steal(out[6]);
+    UInt32 user_id     = UInt32::steal(out[7]);
 
-    // The hit shape's registry id is the (instance, geometry) entry of the
-    // recovery table, so pi.shape names the actual child for every hit. The
-    // gathers are masked, so missed lanes read 0 (a null shape).
-    UInt32 off      = dr::gather<UInt32>(geom_shape_offsets, instance_id, valid);
-    UInt32 shape_id = dr::gather<UInt32>(geom_shape_table, off + geometry_id,
-                                         valid);
-    pi.shape = dr::reinterpret_array<ShapePtr, UInt32>(shape_id);
-
-    // userID is the owning Instance's registry id, or 0 (a null shape) for a
-    // top-level hit. Missed lanes read 0 too. Consecutive TLAS instances of one
-    // ShapeGroup (one per BLAS) share a userID, which is correct.
-    UInt32 user_id = dr::select(valid, UInt32::steal(out[7]), dr::zeros<UInt32>());
-    pi.instance = dr::reinterpret_array<ShapePtr, UInt32>(user_id);
+    // Recover the hit shape (and instance index, if instanced) from the
+    // record at userID + geometry ID. The masked gather leaves missed lanes
+    // with a null shape.
+    UInt32 index = (user_id & ~MetalNullBit) + geometry_id;
+    if (has_instances) {
+        dr::Array<UInt32, 2> rec =
+            dr::gather<dr::Array<UInt32, 2>>(geom_shape_table, index, valid);
+        pi.shape = dr::reinterpret_array<ShapePtr, UInt32>(rec[0]);
+        pi.instance_index = rec[1];
+    } else {
+        UInt32 shape_id = dr::gather<UInt32>(geom_shape_table, index, valid);
+        pi.shape = dr::reinterpret_array<ShapePtr, UInt32>(shape_id);
+    }
 
     return pi;
 }
 
 template <typename Float, typename Spectrum>
-typename MetalAccel<Float, Spectrum>::Mask
+ShadowTest<typename MetalAccel<Float, Spectrum>::Mask>
 MetalAccel<Float, Spectrum>::ray_test(const Scene<Float, Spectrum> * /*scene*/,
                                       const Ray3f &ray, Mask /*coherent*/,
-                                      Mask active) const {
+                                      Mask active,
+                                      UInt32 ray_mask,
+                                      bool skip_null) const {
     if (scene_index == 0) // Empty scene: no occluders
-        return dr::zeros<Mask>(dr::width(ray.o));
+        return { dr::zeros<Mask>(dr::width(ray.o)), Mask(false) };
 
     uint32_t out[8];
-    trace(ray, active, out, /* shadow = */ true);
+    trace(ray, active, ray_mask, out, /* shadow = */ true);
 
-    // A shadow trace computes only out[0] (the hit flag). out[1..7] are left
-    // untouched (see jit_metal_ray_trace), so steal just the hit flag.
-    return Mask::steal(out[0]);
+    // Only the hit flag and the user ID of the hit that ended the traversal
+    // are needed here
+    Mask hit = Mask::steal(out[0]);
+    UInt32 user_id = UInt32::steal(out[7]);
+    for (int i = 1; i < 7; ++i)
+        jit_var_dec_ref(out[i]);
+
+    if (!skip_null)
+        return { hit, Mask(false) };
+
+    Mask null = hit && (user_id & MetalNullBit) != 0u;
+    return { hit && !null, null };
 }
 
 template <typename Float, typename Spectrum>

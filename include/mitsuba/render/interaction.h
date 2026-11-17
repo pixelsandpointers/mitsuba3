@@ -1,7 +1,6 @@
 #pragma once
 
 #include <mitsuba/core/frame.h>
-#include <mitsuba/core/profiler.h>
 #include <mitsuba/core/ray.h>
 #include <mitsuba/core/spectrum.h>
 #include <mitsuba/render/fwd.h>
@@ -10,11 +9,11 @@
 NAMESPACE_BEGIN(mitsuba)
 
 /**
- * \brief This list of flags is used to determine which members of \ref SurfaceInteraction
- * should be computed when calling \ref compute_surface_interaction().
+ * Flags to determine which members of `SurfaceInteraction3f` should be computed
+ * when calling `Shape.compute_surface_interaction()`.
  *
- * It also specifies whether the \ref SurfaceInteraction should be differentiable with
- * respect to the shapes parameters.
+ * It also specifies differentiation behavior with respect to shape
+ * parameters.
  */
 enum class RayFlags : uint32_t {
 
@@ -22,70 +21,173 @@ enum class RayFlags : uint32_t {
     //             Surface interaction compute flags
     // =============================================================
 
-    /// No flags set
-    Empty = 0x0,
+    /// Compute the distance, position and geometric normal (cannot be disabled)
+    Minimal = 0x0,
 
-    /// Compute position and geometric normal
-    Minimal = 0x1,
+    /**
+     * Additionally compute the UV coordinates
+     * (`SurfaceInteraction3f.uv`), position partials
+     * (`SurfaceInteraction3f.dp_du`, `SurfaceInteraction3f.dp_dv`),
+     * shading frame (`SurfaceInteraction3f.sh_frame`), and the incident
+     * direction in the shading frame (`SurfaceInteraction3f.wi`).
+     *
+     * Part of `RayFlags.Default`.
+     */
+    Shading = 0x1,
 
-    /// Compute UV coordinates
-    UV = 0x2,
+    /**
+     * Additionally compute normal partial derivatives
+     * (`SurfaceInteraction3f.dn_du`, `SurfaceInteraction3f.dn_dv`), which
+     * encode information about curvature.
+     *
+     * Depends on `RayFlags.Shading`.
+     */
+    NormalPartials = 0x2,
 
-    /// Compute position partials wrt. UV coordinates
-    dPdUV = 0x4,
+    /**
+     * Additionally project the ray cone (`Ray3f.cone`) onto the surface and
+     * compute its UV-space footprint (`SurfaceInteraction3f.footprint`) for
+     * filtered texture lookups.
+     *
+     * The scene automatically unsets the flag when none of the registered
+     * textures performs filtered lookups (see `Scene.has_filtered_textures()`).
+     *
+     * Depends on `RayFlags.Shading`. Part of `RayFlags.Default`.
+     */
+    Footprint = 0x4,
 
-    /// Compute shading normal and shading frame
-    ShadingFrame = 0x8,
-
-    /// Compute the geometric normal partials wrt. the UV coordinates
-    dNGdUV = 0x10,
-
-    /// Compute the shading normal partials wrt. the UV coordinates
-    dNSdUV = 0x20,
+    /// The detail level requested by default, i.e. everything but
+    /// `RayFlags.NormalPartials`
+    Default = Shading | Footprint,
 
     // =============================================================
-    //!              Differentiability compute flags
+    //               Differentiability compute flags
     // =============================================================
 
-    /// Derivatives of the SurfaceInteraction fields follow shape's motion
-    FollowShape = 0x80,
+    /**
+     * Track differentiable dependence of the `SurfaceInteraction3f`
+     * with respect to shape parameters.
+     *
+     * By default (i.e., when neither FollowShape nor `RayFlags.DetachShape`
+     * is specified), intersections differentiably depend on both the ray
+     * (``ray.o``, ``ray.d``) and shape parameters. They conceptually slide
+     * along the surface as either the ray or the geometry moves.
+     *
+     * With `RayFlags.FollowShape`, the intersection is instead rigidly glued to the
+     * surface. The hit is first located non-differentiably, and the resulting
+     * point is then differentiably re-evaluated using a local parameterization.
+     * The point consequently moves along with and no longer tracks
+     * infinitesimal changes of the ray. This is the same quantity that
+     * `Shape.differential_motion()` returns.
+     *
+     * At most one of FollowShape or `RayFlags.DetachShape` can be specified.
+     * The flag has no effect in non-differentiable variants.
+     */
+    FollowShape = 0x100,
 
-    /// Derivatives of the SurfaceInteraction fields ignore shape's motion
-    DetachShape = 0x100,
-
-    // =============================================================
-    //!                 Compound compute flags
-    // =============================================================
-
-    /* \brief Default: compute all fields of the surface interaction data
-       structure except shading/geometric normal derivatives */
-    All = UV | dPdUV | ShadingFrame,
-
-    /// Compute all fields of the surface interaction ignoring shape's motion
-    AllNonDifferentiable = All | DetachShape,
+    /**
+     * Ignore the differentiable dependence of the
+     * `SurfaceInteraction3f` with respect to shape parameters.
+     *
+     * With `RayFlags.DetachShape`, the shape's parameters are detached before the
+     * interaction is computed, which amounts to intersecting a differentiable
+     * ray with a static surface. Derivatives then originate exclusively from
+     * ``ray.o`` and ``ray.d``, and the hit point slides across a surface that
+     * is held in place.
+     *
+     * At most one of `RayFlags.FollowShape` or DetachShape can be specified.
+     * The flag has no effect in non-differentiable variants.
+     */
+    DetachShape = 0x200,
 };
 
 MI_DECLARE_ENUM_OPERATORS(RayFlags)
 
+/**
+ * The ray categories that can see a shape or emitter
+ *
+ * This is the value of the ``visibility`` property of shapes and emitters
+ * (see `Shape.visibility()`). The section on visibility in the shape plugin
+ * documentation explains the meaning and typical uses of each value. The
+ * ray-side counterpart is `RayMask`.
+ */
+enum class ShapeVisibility : uint32_t {
+    /// Visible to primary rays, hidden from indirect/shadow rays
+    Primary   = 1,
+
+    /// Hidden from primary rays, visible to indirect/shadow rays
+    Secondary = 2,
+
+    /// Visible to every ray (the default)
+    All       = 3,
+
+    /// Hidden from every ray except explicit `RayMask.All` queries
+    Hidden    = 4
+};
+
+/**
+ * Per-ray visibility mask
+ *
+ * The `Scene` ray tracing methods only report intersections with shapes that
+ * the ray mask matches. The acceleration data structures store a mask for
+ * every shape that combines its `ShapeVisibility` with whether its BSDF has a
+ * `BSDFFlags.Null` component (see `Shape.has_null()`), and a ray intersects
+ * the shape when the two masks overlap. The bits are assigned as follows:
+ *
+ * .. code-block:: text
+ *
+ *    Visibility    Opaque   Null
+ *    Primary       0x01     0x08
+ *    Secondary     0x02     0x10
+ *    Hidden        0x04     0x20
+ *
+ * The `RayMask` enum exposes bit combinations to specifically seek out certain
+ * shapes (e.g., shapes visible to primary rays, opaque shapes only, etc.).
+ *
+ * Note to developers: the OptiX backend supports at most 8 flag bits. Mitsuba
+ * uses 6 bits and leaves 2 unused. They could be used in future extensions.
+ */
+enum class RayMask : uint32_t {
+    /// Shapes without null transmission
+    Opaque    = 0x07,
+
+    /// Shapes with null transmission
+    Null      = 0x38,
+
+    /// Shapes visible to camera rays
+    Primary   = 0x09,
+
+    /// Shapes visible to shadow and indirect rays
+    Secondary = 0x12,
+
+    /// Every shape, including hidden ones
+    All       = 0x3F
+};
+
+MI_DECLARE_ENUM_OPERATORS(RayMask)
+
+/// Parse the value of a ``visibility`` property
+extern MI_EXPORT_LIB ShapeVisibility parse_visibility(std::string_view value);
+
 // -----------------------------------------------------------------------------
 
-/// Generic surface interaction data structure
+/// Generic interaction data structure, shared by surface and medium interactions
 template <typename Float_, typename Spectrum_>
 struct Interaction {
     // =============================================================
-    //! @{ \name Type declarations
+    // Type declarations
     // =============================================================
 
     using Float    = Float_;
     using Spectrum = Spectrum_;
     MI_IMPORT_RENDER_BASIC_TYPES()
     MI_IMPORT_OBJECT_TYPES()
-
-    //! @}
-    // =============================================================
+    using PositionSample3f = typename RenderAliases::PositionSample3f;
 
     // =============================================================
-    //! @{ \name Fields
+
+    // =============================================================
+    // Fields
     // =============================================================
 
     /// Distance traveled along the ray
@@ -100,27 +202,33 @@ struct Interaction {
     /// Position of the interaction in world coordinates
     Point3f p;
 
-    /// Geometric normal (only valid for \c SurfaceInteraction)
+    /// Geometric normal (only valid for `SurfaceInteraction3f`)
     Normal3f n;
 
-    //! @}
+    /**
+     * Bound on the rounding error of ``p`` along ``n``, filled in by shapes.
+     * `Interaction3f.spawn_ray` offsets the ray origin by this amount.
+     */
+    Float p_err = 0.f;
+
     // =============================================================
 
     // =============================================================
-    //! @{ \name Methods
+    // Methods
     // =============================================================
 
     /// Constructor
     Interaction(Float t, Float time, const Wavelength &wavelengths,
-                const Point3f &p, const Normal3f &n = 0.f)
-        : t(t), time(time), wavelengths(wavelengths), p(p), n(n) { }
+                const Point3f &p, const Normal3f &n = 0.f, Float p_err = 0.f)
+        : t(t), time(time), wavelengths(wavelengths), p(p), n(n),
+          p_err(p_err) { }
 
     /// Virtual destructor
     virtual ~Interaction() = default;
 
     /**
      * This callback method is invoked by dr::zeros<>, and takes care of fields that deviate
-     * from the standard zero-initialization convention. In this particular class, the \c t
+     * from the standard zero-initialization convention. In this particular class, the ``t``
      * field should be set to an infinite value to mark invalid interaction records.
      */
     virtual void zero_(size_t size = 1) {
@@ -129,6 +237,7 @@ struct Interaction {
         wavelengths = dr::zeros<Wavelength>(size);
         p           = dr::zeros<Point3f>(size);
         n           = dr::zeros<Normal3f>(size);
+        p_err       = dr::zeros<Float>(size);
     }
 
     /// Is the current interaction valid?
@@ -141,7 +250,13 @@ struct Interaction {
         return Ray3f(offset_p(d), d, dr::Largest<Float>, time, wavelengths);
     }
 
-    /// Spawn a finite ray towards the given position
+    /**
+     * Spawn a finite ray towards a bare point
+     *
+     * The segment is shortened by ``mi.math.ShadowEpsilon`` since the point
+     * carries no error bound. Prefer the `PositionSample3f` overload when the
+     * target lies on a shape.
+     */
     Ray3f spawn_ray_to(const Point3f &t) const {
         Point3f o = offset_p(t - p);
         Vector3f d = t - o;
@@ -151,23 +266,46 @@ struct Interaction {
                      wavelengths);
     }
 
-    //! @}
+    /**
+     * Spawn a finite ray towards a sampled position
+     *
+     * The segment stops short of the target by `PositionSample3f.p_err`
+     * projected onto the segment, plus a relative amount that absorbs the
+     * rounding of the distance. The endpoint moves back along the ray rather
+     * than along ``ps.n``, which is more robust when ``ps.n`` is a shading
+     * normal.
+     */
+    Ray3f spawn_ray_to(const PositionSample3f &ps) const {
+        Point3f o = offset_p(ps.p - p);
+        Vector3f d = ps.p - o;
+        Float dist = dr::norm(d);
+        d /= dist;
+        Float cos_theta = dr::maximum(dr::abs_dot(ps.n, d), 0.1f),
+              maxt = dr::fnmadd(dist, math::PositionEpsilon<Float>, dist) -
+                     dr::detach(ps.p_err) / cos_theta;
+        return Ray3f(o, d, dr::maximum(maxt, 0.f), time, wavelengths);
+    }
+
     // =============================================================
 
-    DRJIT_STRUCT(Interaction, t, time, wavelengths, p, n);
+    DRJIT_STRUCT(Interaction, t, time, wavelengths, p, n, p_err);
 
 private:
-    /**
-     * Compute an offset position, used when spawning a ray from this
-     * interaction. When the interaction is on the surface of a shape, the
-     * position is offset along the surface normal to prevent self intersection.
-     */
+    /// Offset ``p`` along ``n`` towards the side of ``d`` by ``p_err``
     Point3f offset_p(const Vector3f &d) const {
-        Float mag = (1.f + dr::max(dr::abs(p))) * math::RayEpsilon<Float>;
-        mag = dr::detach(dr::mulsign(mag, dr::dot(n, d)));
+        Float mag = dr::detach(dr::mulsign(p_err, dr::dot(n, d)));
         return dr::fmadd(mag, dr::detach(n), p);
     }
 };
+
+/// Bound on the rounding error of the point ``ray(t)`` along the unit vector ``n``
+template <typename Ray3f, typename Float, typename Normal3f>
+Float ray_error(const Ray3f &ray, const Float &t, const Normal3f &n) {
+    using Vector = typename Ray3f::Vector;
+    Vector mag = Vector(dr::abs(dr::detach(ray.o))) +
+                 dr::abs(dr::detach(ray.d) * dr::detach(t));
+    return dr::dot(dr::abs(dr::detach(n)), mag) * math::PositionEpsilon<Float>;
+}
 
 // -----------------------------------------------------------------------------
 
@@ -179,14 +317,14 @@ template <typename Float_, typename Spectrum_>
 struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
 
     // =============================================================
-    //! @{ \name Type declarations
+    // Type declarations
     // =============================================================
 
     using Float    = Float_;
     using Spectrum = Spectrum_;
 
     // Make parent fields/functions visible
-    MI_IMPORT_BASE(Interaction, t, time, wavelengths, p, n, is_valid)
+    MI_IMPORT_BASE(Interaction, t, time, wavelengths, p, n, p_err, is_valid)
 
     MI_IMPORT_RENDER_BASIC_TYPES()
     MI_IMPORT_OBJECT_TYPES()
@@ -194,11 +332,10 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
     using Index            = typename CoreAliases::UInt32;
     using PositionSample3f = typename RenderAliases::PositionSample3f;
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Fields
+    // Fields
     // =============================================================
 
     /// Pointer to the associated shape
@@ -210,14 +347,42 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
     /// Shading frame
     Frame3f sh_frame;
 
+    /**
+     * Is the shading frame left-handed?
+     *
+     * This bit denotes when a shape wants to set up a left-handed shading
+     * frame, e.g., on meshes with inverted UVs or instances with mirror
+     * transformation. This is important to correctly interpret normal maps.
+     */
+    Bool frame_flipped = false;
+
     /// Position partials wrt. the UV parameterization
     Vector3f dp_du, dp_dv;
 
-    /// Normal partials wrt. the UV parameterization
+    /// Shading normal partials wrt. the UV parameterization
     Vector3f dn_du, dn_dv;
 
-    /// UV partials wrt. changes in screen-space
-    Vector2f duv_dx, duv_dy;
+    /**
+     * UV-space footprint of the ray cone at the interaction
+     *
+     * The ray cone projects to an ellipse on the surface. The columns of this
+     * matrix store a pair of conjugate diameters of this ellipse. Their
+     * orientation about the ray is arbitrary.
+     *
+     * The field is only computed when `RayFlags.Footprint` is set and is
+     * zero otherwise. See `compute_footprint()`.
+     */
+    Matrix2f footprint;
+
+    /**
+     * Scale factor of the ray cone that produced `footprint`
+     *
+     * This is `RayCone.scale_factor` of the traced ray, e.g. 1/sqrt(spp) for
+     * jittered camera rays. Dividing `footprint` by it yields the footprint
+     * of the full pixel, which consumers with a nonlinear response (e.g. bump
+     * maps) may prefer over the per-sample footprint.
+     */
+    Float footprint_scale;
 
     /// Incident direction in the local shading frame
     Vector3f wi;
@@ -225,28 +390,29 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
     /// Primitive index, e.g. the triangle ID (if applicable)
     Index prim_index;
 
-    /// Stores a pointer to the parent instance (if applicable)
-    ShapePtr instance = nullptr;
-
-    //! @}
-    // =============================================================
+    /// Instance index. The value 0 encodes that the shape is not instanced.
+    Index instance_index = 0;
 
     // =============================================================
-    //! @{ \name Methods
+
+    // =============================================================
+    // Methods
     // =============================================================
 
     /**
      * Construct from a position sample.
      * Unavailable fields such as `wi` and the partial derivatives are left
      * uninitialized.
-     * The `shape` pointer is left uninitialized because we can't guarantee that
-     * the given \ref PositionSample::object points to a Shape instance.
+     * The `shape` pointer is left uninitialized because `PositionSample3f`
+     * does not store a pointer to its originating object (unlike
+     * `DirectionSample3f.emitter`), so we can't guarantee that it
+     * corresponds to a `Shape` instance.
      */
     explicit SurfaceInteraction(const PositionSample3f &ps,
                                 const Wavelength &wavelengths)
-        : Base(0.f, ps.time, wavelengths, ps.p, ps.n), uv(ps.uv),
+        : Base(0.f, ps.time, wavelengths, ps.p, ps.n, ps.p_err), uv(ps.uv),
           sh_frame(Frame3f(ps.n)), dp_du(0), dp_dv(0), dn_du(0), dn_dv(0),
-          duv_dx(0), duv_dy(0), wi(0), prim_index(0) {}
+          footprint(0), footprint_scale(1), wi(0), prim_index(0) {}
 
     /**
      * This callback method is invoked by dr::zeros<>, and takes care of fields that deviate
@@ -254,37 +420,19 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
      */
     void zero_(size_t size = 1) override {
         Interaction<Float_, Spectrum_>::zero_(size);
-        uv          = dr::zeros<Point2f>(size);
-        sh_frame    = dr::zeros<Frame3f>(size);
-        dp_du       = dr::zeros<Vector3f>(size);
-        dp_dv       = dr::zeros<Vector3f>(size);
-        dn_du       = dr::zeros<Vector3f>(size);
-        dn_dv       = dr::zeros<Vector3f>(size);
-        duv_dx      = dr::zeros<Vector2f>(size);
-        duv_dy      = dr::zeros<Vector2f>(size);
-        wi          = dr::zeros<Vector3f>(size);
-        prim_index  = dr::zeros<Index>(size);
-
-        if constexpr (dr::is_jit_v<Float_>) {
-            shape       = dr::zeros<ShapePtr>(size);
-            instance    = dr::zeros<ShapePtr>(size);
-        } else {
-            shape       = nullptr;
-            instance    = nullptr;
-        }
-    }
-
-    /// Initialize local shading frame using Gram-schmidt orthogonalization
-    void initialize_sh_frame() {
-        sh_frame.s = dr::normalize(
-            dr::fmadd(sh_frame.n, -dr::dot(sh_frame.n, dp_du), dp_du));
-
-        // When dp_du is invalid, use an orthonormal basis
-        Mask singularity_mask = dr::all(dp_du == 0.f);
-        if (unlikely(dr::any_or<true>(singularity_mask)))
-            sh_frame.s[singularity_mask] = coordinate_system(sh_frame.n).first;
-
-        sh_frame.t = dr::cross(sh_frame.n, sh_frame.s);
+        uv              = dr::zeros<Point2f>(size);
+        sh_frame        = dr::zeros<Frame3f>(size);
+        frame_flipped   = dr::zeros<Bool>(size);
+        dp_du           = dr::zeros<Vector3f>(size);
+        dp_dv           = dr::zeros<Vector3f>(size);
+        dn_du           = dr::zeros<Vector3f>(size);
+        dn_dv           = dr::zeros<Vector3f>(size);
+        footprint       = dr::zeros<Matrix2f>(size);
+        footprint_scale = dr::full<Float>(1, size);
+        wi              = dr::zeros<Vector3f>(size);
+        prim_index      = dr::zeros<Index>(size);
+        instance_index  = dr::zeros<Index>(size);
+        shape           = dr::zeros<ShapePtr>(size);
     }
 
     /// Convert a local shading-space vector into world space
@@ -299,9 +447,18 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
 
     /**
      * Return the emitter associated with the intersection (if any)
-     * \note Defined in scene.h
+     *
+     * The ``ray_mask`` should be the ray-side mask of the trace that
+     * produced this interaction (see `RayMask`). Escaped rays report the
+     * environment emitter only when the mask matches its visibility.
+     *
+     * Note:
+     *     Defined in scene.h
      */
-    EmitterPtr emitter(const Scene *scene, Mask active = true) const;
+    EmitterPtr emitter(const Scene *scene,
+                       dr::uint32_array_t<Float> ray_mask
+                           = (uint32_t) RayMask::Secondary,
+                       Mask active = true) const;
 
     /// Is the intersected shape also a sensor?
     Mask is_sensor() const { return shape->is_sensor(); }
@@ -310,9 +467,9 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
     Mask is_medium_transition() const { return shape->is_medium_transition(); }
 
     /**
-     * \brief Determine the target medium
+     * Determine the target medium
      *
-     * When ``is_medium_transition()`` = \c true, determine the medium that
+     * When `is_medium_transition()` = ``True``, determine the medium that
      * contains the ``ray(this->p, d)``
      */
     MediumPtr target_medium(const Vector3f &d) const {
@@ -320,89 +477,41 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
     }
 
     /**
-     * \brief Determine the target medium based on the cosine
+     * Determine the target medium based on the cosine
      * of the angle between the geometric normal and a direction
      *
      * Returns the exterior medium when ``cos_theta > 0`` and
      * the interior medium when ``cos_theta <= 0``.
      */
-    MediumPtr target_medium(const Float &cos_theta) const {
+    MediumPtr target_medium(Float cos_theta) const {
         return dr::select(cos_theta > 0, shape->exterior_medium(),
                                          shape->interior_medium());
     }
 
-    /**
-     * \brief Returns the BSDF of the intersected shape.
-     *
-     * The parameter \c ray must match the one used to create the interaction
-     * record. This function computes texture coordinate partials if this is
-     * required by the BSDF (e.g. for texture filtering).
-     *
-     * Implementation in 'bsdf.h'
-     */
-    BSDFPtr bsdf(const RayDifferential3f &ray);
-
-    // Returns the BSDF of the intersected shape
+    /// Returns the `BSDF` of the intersected shape
     BSDFPtr bsdf() const { return shape->bsdf(); }
 
-    /// Computes texture coordinate partials
-    void compute_uv_partials(const RayDifferential3f &ray) {
-        if (!ray.has_differentials)
-            return;
-
-        // Compute interaction with the two offset rays
-        Float d   = dr::dot(n, p),
-              t_x = (d - dr::dot(n, ray.o_x)) / dr::dot(n, ray.d_x),
-              t_y = (d - dr::dot(n, ray.o_y)) / dr::dot(n, ray.d_y);
-
-        // Corresponding positions near the surface
-        Vector3f dp_dx = dr::fmadd(ray.d_x, t_x, ray.o_x) - p,
-                 dp_dy = dr::fmadd(ray.d_y, t_y, ray.o_y) - p;
-
-        // Solve a least squares problem to turn this into UV coordinates
-        Float a00 = dr::dot(dp_du, dp_du),
-              a01 = dr::dot(dp_du, dp_dv),
-              a11 = dr::dot(dp_dv, dp_dv),
-              inv_det = dr::rcp(dr::fmsub(a00, a11, a01*a01));
-
-        Float b0x = dr::dot(dp_du, dp_dx),
-              b1x = dr::dot(dp_dv, dp_dx),
-              b0y = dr::dot(dp_du, dp_dy),
-              b1y = dr::dot(dp_dv, dp_dy);
-
-        // Set the UV partials to zero if dpdu and/or dpdv == 0
-        inv_det = dr::select(dr::isfinite(inv_det), inv_det, 0.f);
-
-        duv_dx = Vector2f(dr::fmsub(a11, b0x, a01 * b1x),
-                          dr::fmsub(a00, b1x, a01 * b0x)) * inv_det;
-
-        duv_dy = Vector2f(dr::fmsub(a11, b0y, a01 * b1y),
-                          dr::fmsub(a00, b1y, a01 * b0y)) * inv_det;
-    }
-
     /**
-     * \brief Converts a Mueller matrix defined in a local frame to world space
+     * Converts a Mueller matrix defined in a local frame to world space
      *
      * A Mueller matrix operates from the (implicitly) defined frame
-     * stokes_basis(in_forward) to the frame stokes_basis(out_forward).
+     * ``stokes_basis(in_forward)`` to the frame ``stokes_basis(out_forward)``.
      * This method converts a Mueller matrix defined on directions in the local
      * frame to a Mueller matrix defined on world-space directions.
      *
      * This expands to a no-op in non-polarized modes.
      *
-     * \param M_local
-     *      The Mueller matrix in local space, e.g. returned by a BSDF.
+     * Args:
+     *     M_local: The Mueller matrix in local space, e.g. returned by a `BSDF`.
      *
-     * \param in_forward_local
-     *      Incident direction (along propagation direction of light),
-     *      given in local frame coordinates.
+     *     in_forward_local: Incident direction (along propagation direction of light),
+     *         given in local frame coordinates.
      *
-     * \param wo_local
-     *      Outgoing direction (along propagation direction of light),
-     *      given in local frame coordinates.
+     *     out_forward_local: Outgoing direction (along propagation direction of light),
+     *         given in local frame coordinates.
      *
-     * \return
-     *      Equivalent Mueller matrix that operates in world-space coordinates.
+     * Returns:
+     *     Equivalent Mueller matrix that operates in world-space coordinates.
      */
     Spectrum to_world_mueller(const Spectrum &M_local,
                               const Vector3f &in_forward_local,
@@ -428,25 +537,26 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
     }
 
     /**
-     * \brief Converts a Mueller matrix defined in world space to a local frame
+     * Converts a Mueller matrix defined in world space to a local frame
      *
      * A Mueller matrix operates from the (implicitly) defined frame
-     * stokes_basis(in_forward) to the frame stokes_basis(out_forward).
+     * ``stokes_basis(in_forward)`` to the frame ``stokes_basis(out_forward)``.
      * This method converts a Mueller matrix defined on directions in
      * world-space to a Mueller matrix defined in the local frame.
      *
      * This expands to a no-op in non-polarized modes.
      *
-     * \param in_forward_local
-     *      Incident direction (along propagation direction of light),
-     *      given in world-space coordinates.
+     * Args:
+     *     M_world: The Mueller matrix in world space.
      *
-     * \param wo_local
-     *      Outgoing direction (along propagation direction of light),
-     *      given in world-space coordinates.
+     *     in_forward_world: Incident direction (along propagation direction of light),
+     *         given in world-space coordinates.
      *
-     * \return
-     *      Equivalent Mueller matrix that operates in local frame coordinates.
+     *     out_forward_world: Outgoing direction (along propagation direction of light),
+     *         given in world-space coordinates.
+     *
+     * Returns:
+     *     Equivalent Mueller matrix that operates in local frame coordinates.
      */
     Spectrum to_local_mueller(const Spectrum &M_world,
                               const Vector3f &in_forward_world,
@@ -469,13 +579,6 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
         }
     }
 
-    bool has_uv_partials() const {
-        if constexpr (dr::is_dynamic_v<Float>)
-            return dr::width(duv_dx) > 0 || dr::width(duv_dy) > 0;
-        else
-            return dr::any_nested((duv_dx != 0.f) || (duv_dy != 0.f));
-    }
-
     bool has_n_partials() const {
         if constexpr (dr::is_dynamic_v<Float>)
             return dr::width(dn_du) > 0 || dr::width(dn_dv) > 0;
@@ -483,16 +586,119 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
             return dr::any_nested((dn_du != 0.f) || (dn_dv != 0.f));
     }
 
+    bool has_footprint() const {
+        if constexpr (dr::is_dynamic_v<Float>)
+            return dr::width(footprint) > 0;
+        else
+            return dr::any_nested(footprint != 0.f);
+    }
+
     /**
-     * \brief Fills uninitialized fields after a call to \ref Shape::compute_surface_interaction()
+     * Project the ray cone onto the surface and store its UV-space footprint
      *
-     * \param pi
-     *      Preliminary intersection which was used to during the call to
-     *      \ref Shape::compute_surface_interaction()
-     * \param ray
-     *      Ray associated with the ray intersection
-     * \param ray_flags
-     *      Flags specifying which information should be computed
+     * The cross section of ``ray.cone`` at the hit is a disk perpendicular to
+     * the ray. Projecting it onto the tangent plane yields an ellipse. This
+     * function computes it following :cite:`AkenineMoller2021RayCones` and
+     * stores its conjugate diameters in the `footprint` field, along with the
+     * cone's scale factor in `footprint_scale`.
+     */
+    void compute_footprint(const Ray3f &ray, Mask active = true) {
+        dr::suspend_grad<Float> guard;
+
+        // Diameter of the cone at the hit point
+        Float w = dr::abs(ray.cone.propagate(t).width);
+
+        // Projection along the ray onto the tangent plane. A floor on the
+        // cosine keeps grazing hits finite.
+        Float cos_theta = dr::dot(ray.d, n),
+              inv_cos   = dr::rcp(dr::mulsign(
+                  dr::maximum(dr::abs(cos_theta), 1e-4f), cos_theta));
+        auto project = [&](const Vector3f &v) {
+            return dr::fnmadd(ray.d, dr::dot(v, n) * inv_cos, v) * w;
+        };
+
+        // Least squares projection onto the parameterization. The determinant
+        // never exceeds E*G, which makes the test scale invariant.
+        Float E   = dr::dot(dp_du, dp_du),
+              F   = dr::dot(dp_du, dp_dv),
+              G   = dr::dot(dp_dv, dp_dv),
+              EG  = E * G,
+              det = dr::fnmadd(F, F, EG);
+        Mask valid = active && (det > 1e-6f * EG);
+        Float inv_det = dr::rcp(det);
+
+        auto to_uv = [&](const Vector3f &v) {
+            Float b0 = dr::dot(dp_du, v),
+                  b1 = dr::dot(dp_dv, v);
+
+            Vector2f tmp(dr::fmsub(G, b0, F * b1),
+                         dr::fmsub(E, b1, F * b0));
+
+            return dr::select(valid, tmp * inv_det, 0.f);
+        };
+
+        auto [e1, e2] = coordinate_system(ray.d);
+        Vector2f a = to_uv(project(e1)),
+                 b = to_uv(project(e2));
+
+        footprint = Matrix2f(a.x(), b.x(),
+                             a.y(), b.y());
+        footprint_scale = ray.cone.scale_factor;
+    }
+
+    /**
+     * Attach the motion of this interaction under the requested differentiation mode
+     *
+     * This function exists for use within implementations of
+     * `Shape.compute_surface_interaction()`. It reads ``t``, ``p`` and ``n`` and
+     * updates the AD state of ``t`` and ``p``, so that their derivatives express
+     * how the interaction point responds to a change of the scene parameters:
+     * it either stays on the ray while the surface moves underneath it (the
+     * default), or follows the surface (`RayFlags.FollowShape`).
+     * The case `RayFlags.DetachShape` must be handled on the caller's end.
+     *
+     * Shapes that recover their local coordinates from ``p`` need nothing
+     * further. Those parameterized by ``pi.prim_uv`` must furthermore update it
+     * to match ``p`` by projecting the (primal-zero) displacement ``p -
+     * p_att`` onto the tangent basis and attaching it via ``dr::replace_grad``.
+     *
+     * Args:
+     *     p_att: Surface position at the *detached* parameterization, attached to the
+     *         shape's parameters. Its primal value equals ``p``.
+     */
+    void attach_motion(const Ray3f &ray, const Point3f &p_att, uint32_t ray_flags) {
+        if constexpr (!dr::is_diff_v<Float>) {
+            DRJIT_MARK_USED(ray);
+            DRJIT_MARK_USED(p_att);
+            DRJIT_MARK_USED(ray_flags);
+        } else if (has_flag(ray_flags, RayFlags::FollowShape)) {
+            // Glue the interaction point to the shape: it is then no longer
+            // tied to the ray, and the distance follows the surface motion.
+            Float t_att = dr::norm(p_att - ray.o) / dr::norm(ray.d);
+            t = dr::replace_grad(t, t_att);
+            p = dr::replace_grad(p, p_att);
+        } else {
+            // Keep the interaction point on the ray, intersecting the moving
+            // tangent plane at the hit point. The normal is detached (dependence
+            // on it would be a higher order effect.)
+            Normal3f nd = dr::detach(n);
+            Float t_att = dr::dot(p_att - ray.o, nd) / dr::dot(nd, ray.d);
+            t = dr::replace_grad(t, t_att);
+            p = dr::replace_grad(p, ray(t));
+        }
+    }
+
+    /**
+     * Fills uninitialized fields after a call to
+     * `Shape.compute_surface_interaction()`
+     *
+     * Args:
+     *     pi: Preliminary intersection which was used to during the call to
+     *         `Shape.compute_surface_interaction()`
+     *
+     *     ray: Ray associated with the ray intersection
+     *
+     *     ray_flags: Flags specifying which information should be computed
      */
     void finalize_surface_interaction(
         const PreliminaryIntersection<Float, Shape> & /*pi*/, const Ray3f &ray,
@@ -500,19 +706,52 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
         dr::masked(t, !active) = dr::Infinity<Float>;
         active &= is_valid();
 
-        dr::masked(shape, !active)    = nullptr;
-        dr::masked(instance, !active) = nullptr;
+        dr::masked(shape, !active)          = nullptr;
+        dr::masked(instance_index, !active) = 0u;
 
         time        = ray.time;
         wavelengths = ray.wavelengths;
 
-        if (has_flag(ray_flags, RayFlags::ShadingFrame))
+        if (has_flag(ray_flags, RayFlags::Shading)) {
             initialize_sh_frame();
+            wi = dr::select(active, to_local(-ray.d), -ray.d);
 
-        // Incident direction in local coordinates
-        wi = dr::select(active, to_local(-ray.d), -ray.d);
+            if (has_flag(ray_flags, RayFlags::Footprint))
+                compute_footprint(ray, active);
+        }
+    }
 
-        duv_dx = duv_dy = dr::zeros<Point2f>();
+    /**
+     * Initialize the shading frame
+     *
+     * This function takes the normal ``sh_frame.n`` and tentative tangent
+     * ``sh_frame.s`` and completes ``sh_frame`` to an orthonormal basis. The
+     * tangent does not need to be orthogonal and can even be zero.
+     */
+    void initialize_sh_frame() {
+        Vector3f n = sh_frame.n,
+                 s = dr::fnmadd(n, dr::dot(n, sh_frame.s), sh_frame.s);
+        Float sqr_norm = dr::squared_norm(s);
+
+        auto [s2, t2] = dr::if_stmt(
+            std::make_tuple(n, s, sqr_norm), sqr_norm > 0.f,
+
+            [](Vector3f &n, Vector3f &s, Float &sqr_norm) {
+                Vector3f s2 = s * dr::rsqrt(sqr_norm);
+                return std::make_pair(s2, Vector3f(dr::cross(n, s2)));
+            },
+
+            // Fall back to an arbitrary basis when degenerate
+            [](Vector3f &n, Vector3f &, Float &) {
+                return coordinate_system(n);
+            },
+
+            "SurfaceInteraction::initialize_sh_frame()"
+        );
+
+        // The bitangent follows the orientation of the parameterization
+        sh_frame.s = s2;
+        sh_frame.t = dr::select(frame_flipped, -t2, t2);
     }
 
     /// Convenience operator for masking
@@ -521,12 +760,11 @@ struct SurfaceInteraction : Interaction<Float_, Spectrum_> {
         return dr::masked(*this, array);
     }
 
-    //! @}
     // =============================================================
 
-    DRJIT_STRUCT(SurfaceInteraction, t, time, wavelengths, p, n, shape, uv,
-                 sh_frame, dp_du, dp_dv, dn_du, dn_dv, duv_dx,
-                 duv_dy, wi, prim_index, instance)
+    DRJIT_STRUCT(SurfaceInteraction, t, time, wavelengths, p, n, p_err, shape, uv,
+                 sh_frame, frame_flipped, dp_du, dp_dv, dn_du, dn_dv,
+                 footprint, footprint_scale, wi, prim_index, instance_index)
 };
 
 // -----------------------------------------------------------------------------
@@ -536,7 +774,7 @@ template <typename Float_, typename Spectrum_>
 struct MediumInteraction : Interaction<Float_, Spectrum_> {
 
     // =============================================================
-    //! @{ \name Type declarations
+    // Type declarations
     // =============================================================
     using Float    = Float_;
     using Spectrum = Spectrum_;
@@ -545,13 +783,12 @@ struct MediumInteraction : Interaction<Float_, Spectrum_> {
     using Index = typename CoreAliases::UInt32;
 
     // Make parent fields/functions visible
-    MI_IMPORT_BASE(Interaction, t, time, wavelengths, p, n, is_valid)
-    //! @}
+    MI_IMPORT_BASE(Interaction, t, time, wavelengths, p, n, p_err, is_valid)
     // =============================================================
 
 
     // =============================================================
-    //! @{ \name Fields
+    // Fields
     // =============================================================
 
     /// Pointer to the associated medium
@@ -568,11 +805,10 @@ struct MediumInteraction : Interaction<Float_, Spectrum_> {
     /// mint used when sampling the given distance ``t``
     Float mint;
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Methods
+    // Methods
     // =============================================================
 
     /**
@@ -588,28 +824,22 @@ struct MediumInteraction : Interaction<Float_, Spectrum_> {
         sigma_t             = dr::zeros<UnpolarizedSpectrum>(size);
         combined_extinction = dr::zeros<UnpolarizedSpectrum>(size);
         mint                = dr::zeros<Float>(size);
-
-        if constexpr (dr::is_jit_v<Float_>) {
-            medium      = dr::zeros<MediumPtr>(size);
-        } else {
-            medium      = nullptr;
-        }
+        medium              = dr::zeros<MediumPtr>(size);
     }
 
-    /// Convert a local shading-space (defined by ``wi``) vector into world space
+    /// Convert a local shading-space (defined by `wi`) vector into world space
     Vector3f to_world(const Vector3f &v) const {
         return sh_frame.to_world(v);
     }
 
-    /// Convert a world-space vector into local shading coordinates (defined by ``wi``)
+    /// Convert a world-space vector into local shading coordinates (defined by `wi`)
     Vector3f to_local(const Vector3f &v) const {
         return sh_frame.to_local(v);
     }
 
-    //! @}
     // =============================================================
 
-    DRJIT_STRUCT(MediumInteraction, t, time, wavelengths, p, n, medium,
+    DRJIT_STRUCT(MediumInteraction, t, time, wavelengths, p, n, p_err, medium,
                  sh_frame, wi, sigma_s, sigma_n, sigma_t,
                  combined_extinction, mint)
 };
@@ -617,20 +847,21 @@ struct MediumInteraction : Interaction<Float_, Spectrum_> {
 // -----------------------------------------------------------------------------
 
 /**
- * \brief Stores preliminary information related to a ray intersection
+ * Stores preliminary information related to a ray intersection
  *
- * This data structure is used as return type for the \ref Shape::ray_intersect_preliminary
- * efficient ray intersection routine. It stores whether the shape is intersected by a
- * given ray, and cache preliminary information about the intersection if that is the case.
+ * This data structure is used as return type for the
+ * `Shape.ray_intersect_preliminary()` efficient ray intersection routine. It
+ * stores whether the shape is intersected by a given ray, and cache
+ * preliminary information about the intersection if that is the case.
  *
- * If the intersection is deemed relevant, detailed intersection information can later be
- * obtained via the  \ref compute_surface_interaction() method.
+ * If the intersection is deemed relevant, detailed intersection information
+ * can later be obtained via `Scene.compute_surface_interaction()`.
  */
 template <typename Float_, typename Shape_>
 struct PreliminaryIntersection {
 
     // =============================================================
-    //! @{ \name Type declarations
+    // Type declarations
     // =============================================================
 
     using Float    = Float_;
@@ -642,11 +873,10 @@ struct PreliminaryIntersection {
     using Ray3f = typename Shape_::Ray3f;
     using Spectrum = typename Ray3f::Spectrum;
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Fields
+    // Fields
     // =============================================================
 
     /// Whether the ray query found a hit. This mask already includes the
@@ -662,41 +892,30 @@ struct PreliminaryIntersection {
     /// Primitive index, e.g. the triangle ID (if applicable)
     Index prim_index;
 
-    /// Shape index, e.g. the shape ID in shapegroup (if applicable)
-    Index shape_index;
+    /// Instance index. The value 0 encodes that the shape is not instanced.
+    Index instance_index = 0;
 
-    /// Pointer to the associated shape
+    /// Pointer to the associated shape (the leaf shape for instanced hits)
     ShapePtr shape = nullptr;
 
-    /// Stores a pointer to the parent instance (if applicable)
-    ShapePtr instance = nullptr;
-
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Methods
+    // Methods
     // =============================================================
 
     /**
      * This callback method is invoked by dr::zeros<>, and takes care of fields
      * that deviate from the standard zero-initialization convention. It clears
-     * \c valid and sets \c t to infinity for invalid intersection records.
+     * ``valid`` and sets ``t`` to infinity for invalid intersection records.
      */
     void zero_(size_t size = 1) {
-        valid       = dr::zeros<Mask>(size);
-        t           = dr::full<Float>(dr::Infinity<Float>, size);
-        prim_uv     = dr::zeros<Point2f>(size);
-        prim_index  = dr::zeros<Index>(size);
-        shape_index = dr::zeros<Index>(size);
-
-        if constexpr (dr::is_jit_v<Float_>) {
-            shape       = dr::zeros<ShapePtr>(size);
-            instance    = dr::zeros<ShapePtr>(size);
-        } else {
-            shape       = nullptr;
-            instance    = nullptr;
-        }
+        valid          = dr::zeros<Mask>(size);
+        t              = dr::full<Float>(dr::Infinity<Float>, size);
+        prim_uv        = dr::zeros<Point2f>(size);
+        prim_index     = dr::zeros<Index>(size);
+        instance_index = dr::zeros<Index>(size);
+        shape          = dr::zeros<ShapePtr>(size);
     }
 
     /// Is the current interaction valid?
@@ -704,49 +923,10 @@ struct PreliminaryIntersection {
         return valid;
     }
 
-    /**
-     * \brief Compute and return detailed information related to a surface interaction
-     *
-     * \param ray
-     *      Ray associated with the ray intersection
-     * \param ray_flags
-     *      Flags specifying which information should be computed
-     * \return
-     *      A data structure containing the detailed information
-     */
-    auto compute_surface_interaction(const Ray3f &ray,
-                                     uint32_t ray_flags = +RayFlags::All,
-                                     Mask active = true) {
-        if constexpr (!std::is_same_v<Shape_, Shape<Float, Spectrum>>) {
-            Throw("PreliminaryIntersection::compute_surface_interaction(): not implemented!");
-        } else {
-            using SurfaceInteraction3f = SurfaceInteraction<Float, Spectrum>;
-            using ShapePtr = typename SurfaceInteraction3f::ShapePtr;
-
-            active &= is_valid();
-            if (dr::none_or<false>(active)) {
-                SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
-                si.wi = -ray.d;
-                si.wavelengths = ray.wavelengths;
-                return si;
-            }
-
-            ScopedPhase sp(ProfilerPhase::CreateSurfaceInteraction);
-
-            ShapePtr target = dr::select(instance == nullptr, shape, instance);
-            SurfaceInteraction3f si =
-                target->compute_surface_interaction(ray, *this, ray_flags, 0u, active);
-            si.finalize_surface_interaction(*this, ray, ray_flags, active);
-
-            return si;
-        }
-    }
-
-    //! @}
     // =============================================================
 
     DRJIT_STRUCT(PreliminaryIntersection, valid, t, prim_uv, prim_index,
-                 shape_index, shape, instance);
+                 instance_index, shape);
 };
 
 // -----------------------------------------------------------------------------
@@ -787,13 +967,13 @@ std::ostream &operator<<(std::ostream &os, const SurfaceInteraction<Float, Spect
             os << "  dn_du = " << string::indent(it.dn_du, 11) << "," << std::endl
                << "  dn_dv = " << string::indent(it.dn_dv, 11) << "," << std::endl;
 
-        if (it.has_uv_partials())
-            os << "  duv_dx = " << string::indent(it.duv_dx, 11) << "," << std::endl
-               << "  duv_dy = " << string::indent(it.duv_dy, 11) << "," << std::endl;
+        if (it.has_footprint())
+            os << "  footprint = " << string::indent(it.footprint, 14) << "," << std::endl
+               << "  footprint_scale = " << it.footprint_scale << "," << std::endl;
 
         os << "  wi = " << string::indent(it.wi, 7) << "," << std::endl
            << "  prim_index = " << it.prim_index << "," << std::endl
-           << "  instance = " << string::indent(it.instance, 13) << std::endl
+           << "  instance_index = " << it.instance_index << std::endl
            << "]";
     }
     return os;
@@ -827,9 +1007,8 @@ std::ostream &operator<<(std::ostream &os, const PreliminaryIntersection<Float, 
            << "  t = " << pi.t << "," << std::endl
            << "  prim_uv = " << pi.prim_uv << "," << std::endl
            << "  prim_index = " << pi.prim_index << "," << std::endl
-           << "  shape_index = " << pi.shape_index << "," << std::endl
+           << "  instance_index = " << pi.instance_index << "," << std::endl
            << "  shape = " << string::indent(pi.shape, 6) << "," << std::endl
-           << "  instance = " << string::indent(pi.instance, 6) << "," << std::endl
            << "]";
     }
     return os;

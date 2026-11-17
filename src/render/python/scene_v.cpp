@@ -35,7 +35,8 @@ static void register_typed_plugin(std::string_view name, nb::handle constructor,
 
     auto release = [](void *payload) {
         nb::gil_scoped_acquire gil;
-        nb::handle((PyObject *) payload).dec_ref();
+        if (gil.is_valid())
+            nb::handle((PyObject *) payload).dec_ref();
     };
 
     PluginManager::instance()->register_plugin(
@@ -45,31 +46,49 @@ static void register_typed_plugin(std::string_view name, nb::handle constructor,
 
 MI_PY_EXPORT(Scene) {
     MI_PY_IMPORT_TYPES(Scene, Integrator, SamplingIntegrator, MonteCarloIntegrator, Sensor)
+
     auto scene = MI_PY_CLASS(Scene, Object, nb::is_final())
         .def(nb::init<const Properties>())
-        .def("ray_intersect_preliminary",
-             nb::overload_cast<const Ray3f &, Mask, Mask>(&Scene::ray_intersect_preliminary, nb::const_),
-             "ray"_a, "coherent"_a = false, "active"_a = true, D(Scene, ray_intersect_preliminary))
-        .def("ray_intersect_preliminary",
-             nb::overload_cast<const Ray3f &, Mask, bool, UInt32, uint32_t, Mask>(&Scene::ray_intersect_preliminary, nb::const_),
-             "ray"_a, "coherent"_a, "reorder"_a = false,
-             "reorder_hint"_a = 0, "reorder_hint_bits"_a = 0, "active"_a = true, D(Scene, ray_intersect_preliminary, 2))
+        // 'ray_mask' and the arguments after it are keyword-only so that
+        // calls written against the previous positional order raise
+        .def("ray_intersect_preliminary", &Scene::ray_intersect_preliminary,
+             "ray"_a, "coherent"_a = false, nb::kw_only(),
+             "ray_mask"_a = +RayMask::Secondary, "active"_a = true,
+             "reorder"_a = false, "reorder_hint"_a = 0,
+             "reorder_hint_bits"_a = 0, D(Scene, ray_intersect_preliminary))
         .def("ray_intersect",
              nb::overload_cast<const Ray3f &, Mask>(&Scene::ray_intersect, nb::const_),
              "ray"_a, "active"_a = true, D(Scene, ray_intersect))
         .def("ray_intersect",
-             nb::overload_cast<const Ray3f &, uint32_t, Mask, Mask>(&Scene::ray_intersect, nb::const_),
-             "ray"_a, "ray_flags"_a, "coherent"_a, "active"_a = true, D(Scene, ray_intersect, 2))
-        .def("ray_intersect",
-             nb::overload_cast<const Ray3f &, uint32_t, Mask, bool, UInt32, uint32_t, Mask>(&Scene::ray_intersect, nb::const_),
-             "ray"_a, "ray_flags"_a, "coherent"_a, "reorder"_a = false,
-             "reorder_hint"_a = 0, "reorder_hint_bits"_a = 0, "active"_a = true, D(Scene, ray_intersect, 3))
+             nb::overload_cast<const Ray3f &, uint32_t, Mask, UInt32, Mask, bool, UInt32, uint32_t>(&Scene::ray_intersect, nb::const_),
+             "ray"_a, "ray_flags"_a, "coherent"_a = false, nb::kw_only(),
+             "ray_mask"_a = +RayMask::Secondary, "active"_a = true,
+             "reorder"_a = false, "reorder_hint"_a = 0, "reorder_hint_bits"_a = 0,
+             D(Scene, ray_intersect, 2))
+        .def("compute_surface_interaction",
+             &Scene::compute_surface_interaction, "ray"_a, "pi"_a,
+             "ray_flags"_a = +RayFlags::Default, "active"_a = true,
+             D(Scene, compute_surface_interaction))
+        .def("instance", &Scene::instance, "index"_a,
+             nb::rv_policy::reference_internal, D(Scene, instance))
         .def("ray_test",
              nb::overload_cast<const Ray3f &, Mask>(&Scene::ray_test, nb::const_),
              "ray"_a, "active"_a = true, D(Scene, ray_test))
         .def("ray_test",
-             nb::overload_cast<const Ray3f &, Mask, Mask>(&Scene::ray_test, nb::const_),
-             "ray"_a, "coherent"_a, "active"_a = true, D(Scene, ray_test, 2))
+             nb::overload_cast<const Ray3f &, Mask, UInt32, Mask>(&Scene::ray_test, nb::const_),
+             "ray"_a, "coherent"_a, nb::kw_only(),
+             "ray_mask"_a = +RayMask::Secondary, "active"_a = true,
+             D(Scene, ray_test, 2))
+        .def("ray_test_tr", &Scene::ray_test_tr,
+             "ray"_a, "ray_flags"_a = +RayFlags::Default, "coherent"_a = false,
+             "ray_mask"_a = +RayMask::Secondary, "active"_a = true,
+             D(Scene, ray_test_tr))
+        .def("ray_intersect_tr", &Scene::ray_intersect_tr,
+             "ray"_a, "ray_flags"_a = +RayFlags::Default, "coherent"_a = false,
+             "ray_mask"_a = +RayMask::Secondary, "active"_a = true,
+             D(Scene, ray_intersect_tr))
+        .def_method(Scene, has_null_shapes)
+        .def_method(Scene, has_filtered_textures)
 #if !defined(MI_ENABLE_EMBREE)
         .def("ray_intersect_naive",
             &Scene::ray_intersect_naive,
@@ -100,16 +119,16 @@ MI_PY_EXPORT(Scene) {
         .def_method(Scene, bbox)
         .def("sensors",
              [](const Scene &scene) {
-                 nb::list result;
+                 nb::list_builder result(scene.sensors().size());
                  for (const Sensor *s : scene.sensors()) {
                      const ProjectiveCamera *p =
                          dynamic_cast<const ProjectiveCamera *>(s);
                      if (p)
-                         result.append(nb::cast(ref<const ProjectiveCamera>(p)));
+                         result.put(nb::cast(ref<const ProjectiveCamera>(p)));
                      else
-                         result.append(nb::cast(ref<const Sensor>(s)));
+                         result.put(nb::cast(ref<const Sensor>(s)));
                  }
-                 return result;
+                 return result.commit();
              },
              D(Scene, sensors))
         .def("sensors_dr", &Scene::sensors_dr, D(Scene, sensors_dr))
@@ -118,29 +137,31 @@ MI_PY_EXPORT(Scene) {
         .def_method(Scene, environment)
         .def("shapes",
              [](const Scene &scene) {
-                 nb::list result;
+                 nb::list_builder result(scene.shapes().size());
                  for (const Shape *s : scene.shapes()) {
                      const Mesh *m = dynamic_cast<const Mesh *>(s);
                      if (m)
-                         result.append(nb::cast(m));
+                         result.put(nb::cast(m));
                      else
-                         result.append(nb::cast(s));
+                         result.put(nb::cast(s));
                  }
-                 return result;
+                 return result.commit();
              },
              D(Scene, shapes))
+        .def_method(Scene, shape_index, "shape"_a)
         .def("shapes_dr", &Scene::shapes_dr, D(Scene, shapes_dr))
+        .def("portals", &Scene::portals, D(Scene, portals))
         .def("silhouette_shapes",
              [](const Scene &scene) {
-                 nb::list result;
+                 nb::list_builder result(scene.silhouette_shapes().size());
                  for (const Shape *s : scene.silhouette_shapes()) {
                      const Mesh *m = dynamic_cast<const Mesh *>(s);
                      if (m)
-                         result.append(nb::cast(m));
+                         result.put(nb::cast(m));
                      else
-                         result.append(nb::cast(s));
+                         result.put(nb::cast(s));
                  }
-                 return result;
+                 return result.commit();
              },
              D(Scene, silhouette_shapes))
         .def("integrator",
@@ -218,6 +239,13 @@ MI_PY_EXPORT(Scene) {
           },
           "name"_a, "constructor"_a,
           "Register a Python film plugin");
+
+    m.def("register_postprocess",
+          [](const std::string &name, nb::object constructor) {
+              register_typed_plugin(name, constructor, ObjectType::PostProcess);
+          },
+          "name"_a, "constructor"_a,
+          "Register a Python post-processing plugin");
 
     m.def("register_rfilter",
           [](const std::string &name, nb::object constructor) {

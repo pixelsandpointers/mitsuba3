@@ -215,18 +215,8 @@ public:
     }
 
     void parameters_changed(const std::vector<std::string> &keys = {}) override {
-        // Compute inverse of eta squared
-        m_inv_eta_2 = 1.f / (m_eta * m_eta);
-
-        /* Compute weights that further steer samples towards
-           the specular or diffuse components */
-        Float d_mean = m_diffuse_reflectance->mean(),
-              s_mean = 1.f;
-
-        if (m_specular_reflectance)
-            s_mean = m_specular_reflectance->mean();
-
-        m_specular_sampling_weight = s_mean / (d_mean + s_mean);
+        m_inv_eta   = dr::rcp(m_eta);
+        m_inv_eta_2 = dr::square(m_inv_eta);
 
         // Precompute rough reflectance (vectorized)
         if (keys.empty() || string::contains(keys, "alpha") || string::contains(keys, "eta")) {
@@ -249,9 +239,34 @@ public:
 
             m_internal_reflectance =
                 dr::mean(eval_reflectance(distr, wi, 1.f / eta) * wi.z()) * 2.f;
+
+            // Fraction of the diffusely scattered light that leaves
+            m_diffuse_transmittance =
+                dr::mean(external_transmittance * wi.z()) * 2.f / (eta * eta);
         }
-        dr::make_opaque(m_eta, m_inv_eta_2, m_alpha, m_specular_sampling_weight,
-                        m_internal_reflectance);
+        dr::make_opaque(m_eta, m_inv_eta, m_inv_eta_2, m_alpha,
+                        m_internal_reflectance, m_diffuse_transmittance);
+
+        m_distr = MicrofacetDistribution(m_type, m_alpha, m_sample_visible);
+        dr::make_opaque(m_distr);
+    }
+
+    UnpolarizedSpectrum eval_specular_reflectance(const SurfaceInteraction3f &si,
+                                                  Mask active) const {
+        if (m_specular_reflectance)
+            return m_specular_reflectance->eval(si, active);
+        else
+            return UnpolarizedSpectrum(1.f);
+    }
+
+    /**
+     * Compute the weight that steers samples towards the specular or diffuse
+     * component from the reflectance of both at the shading point
+     */
+    static Float specular_sampling_weight(const UnpolarizedSpectrum &diff,
+                                          const UnpolarizedSpectrum &spec) {
+        Float d = dr::mean(diff), s = dr::mean(spec);
+        return s / dr::maximum(d + s, dr::Epsilon<Float>);
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
@@ -276,8 +291,11 @@ public:
                                 MI_ROUGH_TRANSMITTANCE_RES, active);
 
         // Determine which component should be sampled
-        Float prob_specular = (1.f - t_i) * m_specular_sampling_weight,
-              prob_diffuse  = t_i * (1.f - m_specular_sampling_weight);
+        Float weight = specular_sampling_weight(
+                  m_diffuse_reflectance->eval(si, active),
+                  eval_specular_reflectance(si, active)),
+              prob_specular = (1.f - t_i) * weight,
+              prob_diffuse  = t_i * (1.f - weight);
 
         if (unlikely(has_specular != has_diffuse))
             prob_specular = has_specular ? 1.f : 0.f;
@@ -291,7 +309,7 @@ public:
         bs.eta = 1.f;
 
         if (dr::any_or<true>(sample_specular)) {
-            MicrofacetDistribution distr(m_type, m_alpha, m_sample_visible);
+            const MicrofacetDistribution &distr = m_distr;
             Normal3f m = std::get<0>(distr.sample(si.wi, sample2));
 
             dr::masked(bs.wo, sample_specular) = reflect(si.wi, m);
@@ -329,7 +347,7 @@ public:
 
         UnpolarizedSpectrum value(0.f);
         if (has_specular) {
-            MicrofacetDistribution distr(m_type, m_alpha, m_sample_visible);
+            const MicrofacetDistribution &distr = m_distr;
 
             // Calculate the reflection half-vector
             Vector3f H = dr::normalize(wo + si.wi);
@@ -338,7 +356,7 @@ public:
             Float D = distr.eval(H);
 
             // Fresnel term
-            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), Float(m_eta)));
+            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), m_eta, m_inv_eta));
 
             // Smith's shadow-masking function
             Float G = distr.G(si.wi, wo, H);
@@ -357,8 +375,8 @@ public:
                                     MI_ROUGH_TRANSMITTANCE_RES, active);
 
             UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
-            diff /= 1.f - (m_nonlinear ? (diff * m_internal_reflectance)
-                                       : UnpolarizedSpectrum(m_internal_reflectance));
+            diff /= m_nonlinear ? dr::fnmadd(diff, m_internal_reflectance, 1.f)
+                                : UnpolarizedSpectrum(1.f - m_internal_reflectance);
 
             value += diff * (dr::InvPi<Float> * m_inv_eta_2 * cos_theta_o * t_i * t_o);
         }
@@ -397,8 +415,11 @@ public:
                                 MI_ROUGH_TRANSMITTANCE_RES, active);
 
         // Determine which component should be sampled
-        Float prob_specular = (1.f - t_i) * m_specular_sampling_weight,
-              prob_diffuse  = t_i * (1.f - m_specular_sampling_weight);
+        Float weight = specular_sampling_weight(
+                  m_diffuse_reflectance->eval(si, active),
+                  eval_specular_reflectance(si, active)),
+              prob_specular = (1.f - t_i) * weight,
+              prob_diffuse  = t_i * (1.f - weight);
 
         if (unlikely(has_specular != has_diffuse))
             prob_specular = has_specular ? 1.f : 0.f;
@@ -408,7 +429,7 @@ public:
 
         Vector3f H = dr::normalize(wo + si.wi);
 
-        MicrofacetDistribution distr(m_type, m_alpha, m_sample_visible);
+        const MicrofacetDistribution &distr = m_distr;
         Float result = 0.f;
         if (m_sample_visible)
             result = distr.eval(H) * distr.smith_g1(si.wi, H) /
@@ -442,9 +463,13 @@ public:
         Float t_i = lerp_gather(m_external_transmittance, cos_theta_i,
                                 MI_ROUGH_TRANSMITTANCE_RES, active);
 
+        UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active),
+                            spec = eval_specular_reflectance(si, active);
+
         // Determine which component should be sampled
-        Float prob_specular = (1.f - t_i) * m_specular_sampling_weight,
-              prob_diffuse  = t_i * (1.f - m_specular_sampling_weight);
+        Float weight = specular_sampling_weight(diff, spec),
+              prob_specular = (1.f - t_i) * weight,
+              prob_diffuse  = t_i * (1.f - weight);
 
         if (unlikely(has_specular != has_diffuse))
             prob_specular = has_specular ? 1.f : 0.f;
@@ -455,7 +480,7 @@ public:
         // Calculate the reflection half-vector
         Vector3f H = dr::normalize(wo + si.wi);
 
-        MicrofacetDistribution distr(m_type, m_alpha, m_sample_visible);
+        const MicrofacetDistribution &distr = m_distr;
 
         // Evaluate the microfacet normal distribution
         Float D = distr.eval(H);
@@ -475,25 +500,21 @@ public:
         UnpolarizedSpectrum value(0.f);
         if (has_specular) {
             // Fresnel term
-            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), Float(m_eta)));
+            Float F = std::get<0>(fresnel(dr::dot(si.wi, H), m_eta, m_inv_eta));
 
             // Smith's shadow-masking function
             Float G = distr.smith_g1(wo, H) * smith_g1_wi;
 
             // Calculate the specular reflection component
-            value = F * D * G / (4.f * cos_theta_i);
-
-            if (m_specular_reflectance)
-                value *= m_specular_reflectance->eval(si, active);
+            value = spec * F * D * G / (4.f * cos_theta_i);
         }
 
         if (has_diffuse) {
             Float t_o = lerp_gather(m_external_transmittance, cos_theta_o,
                                     MI_ROUGH_TRANSMITTANCE_RES, active);
 
-            UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
-            diff /= 1.f - (m_nonlinear ? (diff * m_internal_reflectance)
-                                       : UnpolarizedSpectrum(m_internal_reflectance));
+            diff /= m_nonlinear ? dr::fnmadd(diff, m_internal_reflectance, 1.f)
+                                : UnpolarizedSpectrum(1.f - m_internal_reflectance);
 
             value += diff * (dr::InvPi<Float> * m_inv_eta_2 * cos_theta_o * t_i * t_o);
         }
@@ -501,9 +522,23 @@ public:
         return { depolarizer<Spectrum>(value) & active, pdf };
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si,
-                                      Mask active) const override {
-        return m_diffuse_reflectance->eval(si, active);
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        Float cos_theta_i = Frame3f::cos_theta(si.wi);
+        active &= cos_theta_i > 0.f;
+
+        // The interface transmits t_i of the incident light, and the rest
+        // approximates the reflection lobe
+        Float t_i = lerp_gather(m_external_transmittance, cos_theta_i,
+                                MI_ROUGH_TRANSMITTANCE_RES, active);
+        UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
+        diff /= m_nonlinear ? dr::fnmadd(diff, m_internal_reflectance, 1.f)
+                            : UnpolarizedSpectrum(1.f - m_internal_reflectance);
+        diff *= t_i * m_diffuse_transmittance;
+
+        return { dr::select(active, diff, 0.f),
+                 dr::select(active, eval_specular_reflectance(si, active) * (1.f - t_i), 0.f),
+                 0.f, si.sh_frame, m_alpha };
     }
 
     std::string to_string() const override {
@@ -517,8 +552,7 @@ public:
         if (m_specular_reflectance)
             oss << "  specular_reflectance = "     << m_specular_reflectance              << "," << std::endl;
 
-        oss << "  specular_sampling_weight = " << m_specular_sampling_weight          << "," << std::endl
-            << "  eta = "                      << m_eta                               << "," << std::endl
+        oss << "  eta = "                      << m_eta                               << "," << std::endl
             << "  nonlinear = "                << m_nonlinear                         << std::endl
             << "]";
         return oss.str();
@@ -530,17 +564,18 @@ private:
     ref<Texture> m_specular_reflectance;
     MicrofacetType m_type;
     Float m_eta;
-    Float m_inv_eta_2;
+    Float m_inv_eta, m_inv_eta_2;
     Float m_alpha;
-    Float m_specular_sampling_weight;
     bool m_nonlinear;
     bool m_sample_visible;
     DynamicBuffer<Float> m_external_transmittance;
     Float m_internal_reflectance;
+    Float m_diffuse_transmittance;
+    MicrofacetDistribution m_distr;
 
     MI_TRAVERSE_CB(Base, m_diffuse_reflectance, m_specular_reflectance, m_eta,
-                   m_inv_eta_2, m_alpha, m_specular_sampling_weight,
-                   m_external_transmittance, m_internal_reflectance)
+                   m_inv_eta, m_inv_eta_2, m_alpha, m_external_transmittance,
+                   m_internal_reflectance, m_diffuse_transmittance, m_distr)
 };
 
 MI_EXPORT_PLUGIN(RoughPlastic)

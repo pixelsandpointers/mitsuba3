@@ -26,8 +26,8 @@ Distant radiancemeter sensor (:monosp:`distant`)
 .. pluginparameters::
 
  * - to_world
-   - |transform|
-   - Sensor-to-world transformation matrix.
+   - |transform| or |animation|
+   - Sensor-to-world transformation matrix (can be animated).
 
  * - direction
    - |vector|
@@ -136,7 +136,8 @@ protected:
 template <typename Float, typename Spectrum, RayTargetType TargetType>
 class DistantSensorImpl final : public Sensor<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Sensor, m_to_world, m_film, sample_wavelengths)
+    MI_IMPORT_BASE(Sensor, m_to_world, m_film, sample_wavelengths,
+                   world_transform, world_transform_string)
     MI_IMPORT_TYPES(Scene, Shape)
 
     DistantSensorImpl(const Properties &props) : Base(props) {
@@ -177,6 +178,9 @@ public:
             if (!m_target_shape)
                 Throw(
                     "Invalid parameter target, must be a Point3f or a Shape.");
+
+            // Build the target's sampling table, which ``sample_ray()`` needs
+            m_target_shape->surface_area();
         } else {
             Log(Debug, "No target specified.");
         }
@@ -209,7 +213,7 @@ public:
         Spectrum ray_weight = 0.f;
 
         // Set ray direction
-        ray.d = m_to_world.value() * Vector3f{ 0.f, 0.f, 1.f };
+        ray.d = world_transform(time) * Vector3f{ 0.f, 0.f, 1.f };
 
         // Sample target point and position ray origin
         if constexpr (TargetType == RayTargetType::Point) {
@@ -226,27 +230,10 @@ public:
             Point2f offset =
                 warp::square_to_uniform_disk_concentric(aperture_sample);
             Vector3f perp_offset =
-                m_to_world.value() * Vector3f(offset.x(), offset.y(), 0.f);
+                world_transform(time) * Vector3f(offset.x(), offset.y(), 0.f);
             ray.o = m_bsphere.center + perp_offset * m_bsphere.radius - ray.d * m_bsphere.radius;
             ray_weight = wav_weight;
         }
-
-        return { ray, ray_weight & active };
-    }
-
-    std::pair<RayDifferential3f, Spectrum> sample_ray_differential(
-        Float time, Float wavelength_sample, const Point2f &film_sample,
-        const Point2f &aperture_sample, Mask active) const override {
-        MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleRay, active);
-
-        RayDifferential3f ray;
-        Spectrum ray_weight;
-
-        std::tie(ray, ray_weight) = sample_ray(
-            time, wavelength_sample, film_sample, aperture_sample, active);
-
-        // Since the film size is always 1x1, we don't have differentials
-        ray.has_differentials = false;
 
         return { ray, ray_weight & active };
     }
@@ -258,7 +245,7 @@ public:
     std::string to_string() const override {
         std::ostringstream oss;
         oss << "DistantSensor[" << std::endl
-            << "  to_world = " << m_to_world << "," << std::endl
+            << "  to_world = " << world_transform_string() << "," << std::endl
             << "  film = " << m_film << "," << std::endl;
 
         if constexpr (TargetType == RayTargetType::Point)
@@ -279,6 +266,8 @@ protected:
     ScalarBoundingSphere3f m_bsphere;
     ref<Shape> m_target_shape;
     Point3f m_target_point;
+
+    MI_TRAVERSE_CB(Base, m_target_shape, m_target_point)
 };
 
 MI_EXPORT_PLUGIN(DistantSensor)

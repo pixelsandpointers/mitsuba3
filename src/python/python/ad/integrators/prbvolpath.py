@@ -17,7 +17,7 @@ class PRBVolpathIntegrator(RBIntegrator):
     .. _integrator-prbvolpath:
 
     Path Replay Backpropagation Volumetric Integrator (:monosp:`prbvolpath`)
-    -------------------------------------------------------------------------
+    ------------------------------------------------------------------------
 
     .. pluginparameters::
 
@@ -34,10 +34,6 @@ class PRBVolpathIntegrator(RBIntegrator):
          the *russian roulette* path termination criterion. For example, if set to
          1, then path generation many randomly cease after encountering directly
          visible surfaces. (Default: 5)
-
-     * - hide_emitters
-       - |bool|
-       - Hide directly visible emitters. (Default: no, i.e. |false|)
 
 
     This class implements a volumetric Path Replay Backpropagation (PRB) integrator
@@ -119,6 +115,9 @@ class PRBVolpathIntegrator(RBIntegrator):
         η = mi.Float(1)                               # Index of refraction
         active = mi.Bool(active)
 
+        # Null tests fold to literals in scenes without null shapes
+        has_null = scene.has_null_shapes()
+
         si = dr.zeros(mi.SurfaceInteraction3f)
         needs_intersection = mi.Bool(True)
         last_scatter_event = dr.zeros(mi.Interaction3f)
@@ -131,6 +130,7 @@ class PRBVolpathIntegrator(RBIntegrator):
         depth = mi.UInt32(0)
         valid_ray = mi.Bool(False)
         specular_chain = mi.Bool(True)
+        ray_mask = mi.UInt32(mi.RayMask.Primary)
 
         if mi.is_rgb:
             # Sample a color channel to sample free-flight distances
@@ -161,7 +161,8 @@ class PRBVolpathIntegrator(RBIntegrator):
 
                 ray.maxt[active_medium & medium.is_homogeneous() & mei.is_valid()] = mei.t
                 intersect = needs_intersection & active_medium
-                si[intersect] = scene.ray_intersect(ray, intersect)
+                si[intersect] = scene.ray_intersect(
+                    ray, mi.RayFlags.Default, False, ray_mask=ray_mask, active=intersect)
 
                 needs_intersection &= ~active_medium
                 mei.t[active_medium & (si.t < mei.t)] = dr.inf
@@ -211,31 +212,17 @@ class PRBVolpathIntegrator(RBIntegrator):
 
                 active_surface |= escaped_medium
                 intersect = active_surface & needs_intersection
-                si[intersect] = scene.ray_intersect(ray, intersect)
-
-                # ---------------------- Hide area emitters ----------------------
-
-                if dr.hint(self.hide_emitters, mode='scalar'):
-                    # Are we on the first segment and did we hit an area emitter?
-                    # If so, skip all area emitters along this ray
-                    skip_emitters = (
-                        si.is_valid() &
-                        (si.shape.emitter() != None) &
-                        (depth == 0) &
-                        intersect
-                    )
-
-                    ray_skip = si.spawn_ray(ray.d)
-                    pi = self.skip_area_emitters(scene, ray_skip, True, skip_emitters)
-                    si_after_skip = pi.compute_surface_interaction(ray, mi.RayFlags.All, skip_emitters)
-                    si[skip_emitters] = si_after_skip
+                si[intersect] = scene.ray_intersect(
+                    ray, mi.RayFlags.Default, False, ray_mask=ray_mask, active=intersect)
 
                 # ----------------- Intersection with emitters -----------------
 
                 ray_from_camera = active_surface & (depth == 0)
                 count_direct = ray_from_camera | specular_chain
-                emitter = si.emitter(scene)
-                active_e = active_surface & (emitter != None) & ~((depth == 0) & self.hide_emitters)
+                # Reusing the trace's ray mask hides an invisible environment
+                # from escaped depth-0 rays
+                emitter = si.emitter(scene, ray_mask=ray_mask)
+                active_e = active_surface & (emitter != None)
 
                 # Get the PDF of sampling this emitter using next event estimation
                 ds = mi.DirectionSample3f(scene, si, last_scatter_event)
@@ -251,13 +238,16 @@ class PRBVolpathIntegrator(RBIntegrator):
                     dr.backward(δL * contrib)
 
                 active_surface &= si.is_valid()
-                ctx = mi.BSDFContext()
-                bsdf = si.bsdf(ray)
+                # This integrator samples null transmission through the BSDF
+                # interface, unlike the surface path tracers (see
+                # BSDFContext.type_mask)
+                ctx = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All)
+                bsdf = si.bsdf()
 
                 # ---------------------- Emitter sampling ----------------------
 
                 if dr.hint(self.use_nee, mode='scalar'):
-                    active_e_surface = active_surface & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth) & (depth + 1 < self.max_depth)
+                    active_e_surface = active_surface & bsdf.has_flag(mi.BSDFFlags.Smooth) & (depth + 1 < self.max_depth)
                     sample_emitters = mei.medium.use_emitter_sampling()
                     specular_chain &= ~act_medium_scatter
                     specular_chain |= act_medium_scatter & ~sample_emitters
@@ -309,6 +299,7 @@ class PRBVolpathIntegrator(RBIntegrator):
                 ray[act_medium_scatter] = mei.spawn_ray(wo)
                 needs_intersection |= act_medium_scatter
                 last_scatter_direction_pdf[act_medium_scatter] = phase_pdf
+                ray_mask[act_medium_scatter] = mi.RayMask.Secondary
 
                 # ------------------------ BSDF sampling -----------------------
 
@@ -334,15 +325,19 @@ class PRBVolpathIntegrator(RBIntegrator):
                 ray[active_surface] = bsdf_ray
 
                 needs_intersection |= active_surface
-                non_null_bsdf = active_surface & ~mi.has_flag(bs.sampled_type, mi.BSDFFlags.Null)
+                null = bs.is_null() if has_null else mi.Bool(False)
+                non_null_bsdf = active_surface & ~null
                 depth[non_null_bsdf] += 1
+
+                # A specular event leaves the visibility class unchanged
+                ray_mask[non_null_bsdf & ~bs.is_delta()] = mi.RayMask.Secondary
 
                 # update the last scatter PDF event if we encountered a non-null scatter event
                 last_scatter_event[non_null_bsdf] = si
                 last_scatter_direction_pdf[non_null_bsdf] = bs.pdf
 
                 valid_ray |= non_null_bsdf
-                specular_chain |= non_null_bsdf & mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta)
+                specular_chain |= non_null_bsdf & bs.is_delta()
                 specular_chain &= ~(active_surface & mi.has_flag(bs.sampled_type, mi.BSDFFlags.Smooth))
                 has_medium_trans = active_surface & si.is_medium_transition()
                 medium[has_medium_trans] = si.target_medium(ray.d)
@@ -372,7 +367,7 @@ class PRBVolpathIntegrator(RBIntegrator):
         medium = dr.select(active, medium, dr.zeros(mi.MediumPtr))
         medium[(active_surface & si.is_medium_transition())] = si.target_medium(ds.d)
 
-        ray = ref_interaction.spawn_ray_to(ds.p)
+        ray = ref_interaction.spawn_ray_to(ds)
         max_dist = mi.Float(ray.maxt)
         total_dist = mi.Float(0.0)
         si = dr.zeros(mi.SurfaceInteraction3f)
@@ -418,8 +413,8 @@ class PRBVolpathIntegrator(RBIntegrator):
             # Handle interactions with surfaces
             active_surface |= escaped_medium
             active_surface &= si.is_valid() & ~active_medium
-            bsdf = si.bsdf(ray)
-            bsdf_val = bsdf.eval_null_transmission(si, active_surface)
+            bsdf = si.bsdf()
+            bsdf_val = bsdf.eval_null(si, active_surface)
             tr_multiplier[active_surface] *= bsdf_val
 
             if dr.hint(not is_primal and dr.grad_enabled(tr_multiplier), mode='scalar'):
@@ -436,6 +431,11 @@ class PRBVolpathIntegrator(RBIntegrator):
             # Continue tracing through scene if non-zero weights exist
             active &= (active_medium | active_surface) & dr.any(transmittance != 0.0)
             total_dist[active] += dr.select(active_medium, mei.t, si.t)
+
+            # Account for the rounding-related ray epsilon that Mitsuba
+            # adds when spawning rays
+            total_dist[active & active_surface] += \
+                dr.detach(dr.dot(ray.o - si.p, ray.d))
 
             # If a medium transition is taking place: Update the medium pointer
             has_medium_trans = active_surface & si.is_medium_transition()

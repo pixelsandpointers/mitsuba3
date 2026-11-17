@@ -9,10 +9,12 @@ NAMESPACE_BEGIN(mitsuba)
 struct BSDFContext;
 struct ShapeIR;
 template <typename Float, typename Spectrum> class BSDF;
+template <typename Float, typename Spectrum> class DirectedEdge;
 template <typename Float, typename Spectrum> class OptixDenoiser;
 template <typename Float, typename Spectrum> class Emitter;
 template <typename Float, typename Spectrum> class Endpoint;
 template <typename Float, typename Spectrum> class Film;
+template <typename Float, typename Spectrum> class PostProcess;
 template <typename Float, typename Spectrum> class ImageBlock;
 template <typename Float, typename Spectrum> class Integrator;
 template <typename Float, typename Spectrum> class SamplingIntegrator;
@@ -38,6 +40,7 @@ template <typename Float, typename Spectrum> class MeshAttribute;
 template <typename Float, typename Spectrum> struct DirectionSample;
 template <typename Float, typename Spectrum> struct PositionSample;
 template <typename Float, typename Spectrum> struct BSDFSample3;
+template <typename Float, typename Spectrum> struct BSDFFeatures;
 template <typename Float, typename Spectrum> struct SilhouetteSample;
 template <typename Float, typename Spectrum> struct PhaseFunctionContext;
 template <typename Float, typename Spectrum> struct Interaction;
@@ -47,40 +50,40 @@ template <typename Float, typename Shape>    struct PreliminaryIntersection;
 
 /// Shape type bit flags driving GPU intersection-function dispatch.
 enum class ShapeType : uint32_t {
-    /// Meshes (`ply`, `obj`, `serialized`)
+    /// Meshes (``ply``, ``obj``, ``serialized``)
     Mesh = 1u << 0,
 
     /// Rectangle: a particular type of mesh
     Rectangle = Mesh | (1u << 1), // Tagged with an extra bit
 
-    /// B-Spline curves (`bsplinecurve`)
+    /// B-Spline curves (``bsplinecurve``)
     BSplineCurve = 1u << 2,
 
-    /// Linear curves (`linearcurve`)
+    /// Linear curves (``linearcurve``)
     LinearCurve = 1u << 3,
 
-    /// Cylinders (`cylinder`)
+    /// Cylinders (``cylinder``)
     Cylinder = 1u << 4,
 
-    /// Disks (`disk`)
+    /// Disks (``disk``)
     Disk = 1u << 5,
 
-    /// SDF Grids (`sdfgrid`)
+    /// SDF Grids (``sdfgrid``)
     SDFGrid = 1u << 6,
 
-    /// Spheres (`sphere`)
+    /// Spheres (``sphere``)
     Sphere = 1u << 7,
 
-    /// Ellipsoids (`ellipsoids`)
+    /// Ellipsoids (``ellipsoids``)
     Ellipsoids = 1u << 8,
 
-    /// Ellipsoid meshes (`ellipsoidsmesh`)
+    /// Ellipsoid meshes (``ellipsoidsmesh``)
     EllipsoidsMesh = Mesh | (1u << 9), // Tagged with an extra bit
 
-    /// Instance (`instance`)
+    /// Instance (``instance``)
     Instance = 1u << 10,
 
-    /// ShapeGroup (`shapegroup`)
+    /// ShapeGroup (``shapegroup``)
     ShapeGroup = 1u << 11,
 
     /// Invalid for default initialization
@@ -100,11 +103,12 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
     using MuellerMatrix4f           = MuellerMatrix<UnpolarizedSpectrum>;
 
     using Ray3f                     = Ray<Point<Float, 3>, Spectrum>;
-    using RayDifferential3f         = RayDifferential<Point<Float, 3>, Spectrum>;
+    using AnimatedTransform4f       = AnimatedTransform<Float, Spectrum>;
 
     using PositionSample3f          = PositionSample<Float, Spectrum>;
     using DirectionSample3f         = DirectionSample<Float, Spectrum>;
     using BSDFSample3f              = BSDFSample3<Float, Spectrum>;
+    using BSDFFeatures3f            = BSDFFeatures<Float, Spectrum>;
     using SilhouetteSample3f        = SilhouetteSample<Float, Spectrum>;
     using PhaseFunctionContext      = mitsuba::PhaseFunctionContext<Float, Spectrum>;
     using Interaction3f             = Interaction<Float, Spectrum>;
@@ -119,6 +123,7 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
     using ShapeGroup             = mitsuba::ShapeGroup<Float, Spectrum>;
     using ShapeKDTree            = mitsuba::ShapeKDTree<Float, Spectrum>;
     using Mesh                   = mitsuba::Mesh<Float, Spectrum>;
+    using DirectedEdge           = mitsuba::DirectedEdge<Float, Spectrum>;
     using Integrator             = mitsuba::Integrator<Float, Spectrum>;
     using SamplingIntegrator     = mitsuba::SamplingIntegrator<Float, Spectrum>;
     using MonteCarloIntegrator   = mitsuba::MonteCarloIntegrator<Float, Spectrum>;
@@ -132,6 +137,7 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
     using Medium                 = mitsuba::Medium<Float, Spectrum>;
     using PhaseFunction          = mitsuba::PhaseFunction<Float, Spectrum>;
     using Film                   = mitsuba::Film<Float, Spectrum>;
+    using PostProcess            = mitsuba::PostProcess<Float, Spectrum>;
     using ImageBlock             = mitsuba::ImageBlock<Float, Spectrum>;
     using ReconstructionFilter   = mitsuba::ReconstructionFilter<Float, Spectrum>;
     using Texture                = mitsuba::Texture<Float, Spectrum>;
@@ -152,23 +158,23 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
 };
 
 /**
- * \brief Imports the desired methods and fields by generating a sequence of
- * `using` declarations. This is useful when inheriting from template parents,
+ * Imports the desired methods and fields by generating a sequence of
+ * ``using`` declarations. This is useful when inheriting from template parents,
  * since methods and fields must be explicitly made visible.
  *
  * For example,
  *
- * \code
+ * .. code-block:: c++
+ *
  *     MI_IMPORT_BASE(BSDF, m_flags, m_components)
- * \endcode
  *
  * expands to
  *
- * \code
+ * .. code-block:: c++
+ *
  *     using Base = BSDF<Float, Spectrum>;
  *     using Base::m_flags;
  *     using Base::m_components;
- * \endcode
  */
 #define MI_IMPORT_BASE(Name, ...)                                                                  \
     using Base = Name<Float, Spectrum>;                                                            \
@@ -183,7 +189,7 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
     using StokesVector4f       = typename RenderAliases::StokesVector4f;                           \
     using MuellerMatrix4f      = typename RenderAliases::MuellerMatrix4f;                          \
     using Ray3f                = typename RenderAliases::Ray3f;                                    \
-    using RayDifferential3f    = typename RenderAliases::RayDifferential3f;
+    using AnimatedTransform4f  = typename RenderAliases::AnimatedTransform4f;
 
 #define MI_IMPORT_TYPES_MACRO(x) using x = typename RenderAliases::x;
 
@@ -196,6 +202,7 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
     using MediumInteraction3f       = typename RenderAliases::MediumInteraction3f;                 \
     using PreliminaryIntersection3f = typename RenderAliases::PreliminaryIntersection3f;           \
     using BSDFSample3f              = typename RenderAliases::BSDFSample3f;                        \
+    using BSDFFeatures3f            = typename RenderAliases::BSDFFeatures3f;                      \
     using SilhouetteSample3f        = typename RenderAliases::SilhouetteSample3f;                  \
     DRJIT_MAP(MI_IMPORT_TYPES_MACRO, __VA_ARGS__)
 
@@ -219,6 +226,7 @@ template <typename Float_, typename Spectrum_> struct RenderAliases {
     using Medium                 = typename RenderAliases::Medium;                                 \
     using PhaseFunction          = typename RenderAliases::PhaseFunction;                          \
     using Film                   = typename RenderAliases::Film;                                   \
+    using PostProcess            = typename RenderAliases::PostProcess;                            \
     using ImageBlock             = typename RenderAliases::ImageBlock;                             \
     using ReconstructionFilter   = typename RenderAliases::ReconstructionFilter;                   \
     using Texture                = typename RenderAliases::Texture;                                \

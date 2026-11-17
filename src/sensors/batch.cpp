@@ -96,9 +96,9 @@ public:
                 m_sensors.push_back(sensor);
             } else if (Shape *shape = prop.try_get<Shape>()) {
                 if (shape->is_sensor()) {
-                    /* Inner sensors only have a weak ref to any parent shape
-                     * to make sure lifetime of shapes are at least that of
-                     * batch sensor */
+                    // Inner sensors only have a weak ref to any parent shape
+                    // to make sure lifetime of shapes are at least that of
+                    // batch sensor
                     m_shapes.push_back(shape);
                     m_sensors.push_back(shape->sensor());
                 } else {
@@ -148,41 +148,11 @@ public:
             sensor->sample_ray(time, wavelength_sample, position_sample_2,
                                aperture_sample, active);
 
-        /* The `m_last_index` variable **needs** to be updated after the
-         * virtual function call above. In recorded JIT modes, the tracing will
-         * also cover this function and hence overwrite `m_last_index` as part
-         * of that process. To "undo" that undesired side_effect, we must
-         * update `m_last_index` after that virtual function call. */
-        m_last_index = index;
-
-        return { ray, spec };
-    }
-
-    std::pair<RayDifferential3f, Spectrum>
-    sample_ray_differential(Float time, Float wavelength_sample,
-                            const Point2f &position_sample,
-                            const Point2f &aperture_sample,
-                            Mask active) const override {
-
-        MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleRay, active);
-
-        Float  idx_f = position_sample.x() * (ScalarFloat) m_sensors.size();
-        UInt32 idx_u = UInt32(idx_f);
-
-        UInt32 index = dr::minimum(idx_u, (uint32_t) (m_sensors.size() - 1));
-        SensorPtr sensor = dr::gather<SensorPtr>(m_sensors_dr, index, active);
-
-        Point2f position_sample_2(idx_f - Float(idx_u), position_sample.y());
-
-        auto [ray, spec] = sensor->sample_ray_differential(
-            time, wavelength_sample, position_sample_2, aperture_sample,
-            active);
-
-        /* The `m_last_index` variable **needs** to be updated after the
-         * virtual function call above. In recorded JIT modes, the tracing will
-         * also cover this function and hence overwrite `m_last_index` as part
-         * of that process. To "undo" that undesired side_effect, we must
-         * update `m_last_index` after that virtual function call. */
+        // The `m_last_index` variable **needs** to be updated after the
+        // virtual function call above. In recorded JIT modes, the tracing will
+        // also cover this function and hence overwrite `m_last_index` as part
+        // of that process. To "undo" that undesired side_effect, we must
+        // update `m_last_index` after that virtual function call.
         m_last_index = index;
 
         return { ray, spec };
@@ -281,42 +251,22 @@ public:
         }
     }
 
-    void traverse_1_cb_ro(void *payload, dr::detail::traverse_callback_ro fn) const override {
+    void traverse_cb(void *payload, const dr::TraverseVisitor &cb) override {
         // Only traverse the scene for frozen functions, since accidentally
         // traversing the scene in loops or vcalls can cause errors with variable
         // size mismatches, and backpropagation of gradients.
-        if (!jit_flag(JitFlag::EnableObjectTraversal))
+        if (cb.role != dr::TraverseRole::Freeze)
             return;
 
-        Object::traverse_1_cb_ro(payload, fn);
-        dr::traverse_1(this->traverse_1_cb_fields_(), [payload, fn](auto &x) {
-            dr::traverse_1_fn_ro(x, payload, fn);
+        Object::traverse_cb(payload, cb);
+        size_t i = 0;
+        dr::traverse_1(this->traverse_cb_fields_(), [&](auto &x) {
+            dr::traverse_fn(x, payload, cb, this->traverse_cb_names_[i++]);
         });
 
-        dr::traverse_1_fn_ro(m_sensors_dr, payload, fn);
-        for(size_t i = 0; i < m_sensors.size(); i++) {
-            m_sensors[i]->traverse_1_cb_ro(payload, fn);
-        }
+        dr::traverse_fn(m_sensors_dr, payload, cb, "m_sensors_dr");
+        dr::traverse_fn(m_sensors, payload, cb, "m_sensors");
     }
-
-    void traverse_1_cb_rw(void *payload, dr::detail::traverse_callback_rw fn) override {
-        // Only traverse the scene for frozen functions, since accidentally
-        // traversing the scene in loops or vcalls can cause errors with variable
-        // size mismatches, and backpropagation of gradients.
-        if (!jit_flag(JitFlag::EnableObjectTraversal))
-            return;
-
-        Object::traverse_1_cb_rw(payload, fn);
-        dr::traverse_1(this->traverse_1_cb_fields_(), [payload, fn](auto &x) {
-            dr::traverse_1_fn_rw(x, payload, fn);
-        });
-
-        dr::traverse_1_fn_rw(m_sensors_dr, payload, fn);
-        for(size_t i = 0; i < m_sensors.size(); i++) {
-            m_sensors[i]->traverse_1_cb_rw(payload, fn);
-        }
-    }
-
 
     MI_DECLARE_CLASS(BatchSensor)
 private:

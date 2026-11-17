@@ -115,8 +115,8 @@ def test02_sample_ray(variants_vec_spectral, origin, direction, aperture_rad, fo
 @pytest.mark.parametrize("direction", directions)
 @pytest.mark.parametrize("aperture_rad", [0.01, 0.1, 0.25])
 @pytest.mark.parametrize("focus_dist", [15, 25])
-def test03_sample_ray_diff(variants_vec_spectral, origin, direction, aperture_rad, focus_dist):
-    """Check the correctness of the sample_ray_differential() method"""
+def test03_sample_ray(variants_vec_spectral, origin, direction, aperture_rad, focus_dist):
+    """Check the correctness of the sample_ray() method"""
 
     near_clip = 1.0
     cam = create_camera(origin, direction, aperture=aperture_rad, focus_dist=focus_dist, near_clip=near_clip)
@@ -126,7 +126,7 @@ def test03_sample_ray_diff(variants_vec_spectral, origin, direction, aperture_ra
     pos_sample = [[0.2, 0.1, 0.2], [0.6, 0.9, 0.2]]
     aperture_sample = [0.5, 0.5]
 
-    ray, spec_weight = cam.sample_ray_differential(
+    ray, spec_weight = cam.sample_ray(
         time, wav_sample, pos_sample, aperture_sample)
 
     # Importance sample wavelength and weight
@@ -140,33 +140,11 @@ def test03_sample_ray_diff(variants_vec_spectral, origin, direction, aperture_ra
     o = mi.Point3f(origin) + near_clip * inv_z * mi.Vector3f(ray.d)
     assert dr.allclose(ray.o, o, atol=1e-4)
 
-    # ----------------------------------------_
-    # Check that the derivatives are orthogonal
-
-    assert dr.allclose(dr.dot(ray.d_x - ray.d, ray.d_y - ray.d), 0, atol=1e-7)
-
     # Check that a [0.5, 0.5] position_sample and [0.5, 0.5] aperture_sample
     # generates a ray that points in the camera direction
 
-    ray_center, _ = cam.sample_ray_differential(0, 0, [0.5, 0.5], [0.5, 0.5])
+    ray_center, _ = cam.sample_ray(0, 0, [0.5, 0.5], [0.5, 0.5])
     assert dr.allclose(ray_center.d, direction, atol=1e-7)
-
-    # ----------------------------------------
-    # Check correctness of the ray derivatives
-
-    aperture_sample = [[0.9, 0.4, 0.2], [0.6, 0.9, 0.7]]
-    ray_center, _ = cam.sample_ray_differential(0, 0, [0.5, 0.5], aperture_sample)
-
-    # Deltas in screen space
-    dx = 1.0 / cam.film().crop_size().x
-    dy = 1.0 / cam.film().crop_size().y
-
-    # Sample the rays by offsetting the position_sample with the deltas (aperture centered)
-    ray_dx, _ = cam.sample_ray_differential(0, 0, [0.5 + dx, 0.5], aperture_sample)
-    ray_dy, _ = cam.sample_ray_differential(0, 0, [0.5, 0.5 + dy], aperture_sample)
-
-    assert dr.allclose(ray_dx.d, ray_center.d_x)
-    assert dr.allclose(ray_dy.d, ray_center.d_y)
 
     # --------------------------------------
     # Check correctness of aperture sampling
@@ -261,3 +239,46 @@ def test05_spectrum_sampling(variants_vec_spectral):
                 }
             }
         })
+
+
+def test06_ray_cone(variants_all_backends_once):
+    import math
+
+    camera = mi.load_dict({
+        'type': 'thinlens', 'fov': 90, 'fov_axis': 'x', 'near_clip': 0.5,
+        'aperture_radius': 0.1, 'focus_distance': 4,
+        'film': {'type': 'hdrfilm', 'width': 100, 'height': 50}
+    })
+
+    # The cone is that of a pinhole camera at the sampled aperture position
+    # and is as wide as the pixel's footprint on the focal plane. The ray
+    # starts on the near plane, 0.5 units past the aperture.
+    ray, _ = camera.sample_ray(0, 0.5, [0.5, 0.5], [0.5, 0.5])
+    pixel = 2 * math.tan(math.radians(45)) / 100
+    assert dr.allclose(ray.cone.spread, pixel, rtol=1e-5)
+    assert dr.allclose(ray.cone.width, 0.5 * pixel, rtol=1e-5)
+    assert dr.allclose(ray.cone.propagate(4 - 0.5).width, 4 * pixel, rtol=1e-4)
+
+
+def test07_principal_point_offset(variants_vec_rgb):
+    params = {
+        'fov': 60, 'near_clip': 0.5, 'principal_point_offset_x': 0.2,
+        'principal_point_offset_y': -0.1,
+        'film': {'type': 'hdrfilm', 'width': 64, 'height': 32}
+    }
+    camera = mi.load_dict({'type': 'thinlens', 'aperture_radius': 0.1,
+                           'focus_distance': 4, **params})
+    pinhole = mi.load_dict({'type': 'perspective', **params})
+
+    # Rays through the aperture center follow the pinhole camera
+    pos = mi.Point2f([0.1, 0.5, 0.9], [0.2, 0.5, 0.7])
+    ray, _ = camera.sample_ray(0, 0.5, pos, [0.5, 0.5])
+    ray_ref, _ = pinhole.sample_ray(0, 0.5, pos, [0.5, 0.5])
+    assert dr.allclose(ray.d, ray_ref.d)
+
+    # sample_direction() maps a point on the focal plane back to its pixel
+    ray, _ = camera.sample_ray(0, 0.5, pos, [0.3, 0.8])
+    it = dr.zeros(mi.Interaction3f)
+    it.p = ray(4 / ray.d.z - 0.5 / ray.d.z)
+    ds, _ = camera.sample_direction(it, [0.5, 0.5])
+    assert dr.allclose(ds.uv, pos * mi.ScalarVector2f(64, 32), rtol=1e-4)

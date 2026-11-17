@@ -190,13 +190,14 @@ public:
             Throw("Only one of pigmentation or aborption can be specified, not "
                   "both!");
 
-        dr::make_opaque(m_eumelanin, m_pheomelanin, m_sigma_a);
+        m_inv_eta = dr::rcp(m_eta);
+        m_eta_2   = dr::square(m_eta);
+        dr::make_opaque(m_eta, m_inv_eta, m_eta_2, m_eumelanin, m_pheomelanin,
+                        m_sigma_a, m_scale);
 
         m_components.push_back(BSDFFlags::Glossy | BSDFFlags::Anisotropic |
                                BSDFFlags::NonSymmetric | BSDFFlags::FrontSide);
-        m_components.push_back(BSDFFlags::Null | BSDFFlags::BackSide);
-
-        m_flags = m_components[0] | m_components[1];
+        m_flags = m_components[0];
 
         update();
     }
@@ -221,7 +222,10 @@ public:
             update();
         }
 
-        dr::make_opaque(m_eumelanin, m_pheomelanin, m_sigma_a);
+        m_inv_eta = dr::rcp(m_eta);
+        m_eta_2   = dr::square(m_eta);
+        dr::make_opaque(m_eta, m_inv_eta, m_eta_2, m_eumelanin, m_pheomelanin,
+                        m_sigma_a, m_scale);
     }
 
     std::pair<BSDFSample3f, Spectrum>
@@ -258,6 +262,9 @@ public:
             dr::masked(u[0][1], sample_p) = u[0][0] / a_p_pdf[i + 1];
         }
 
+        // Rounding in the rescaling above can push 'u[0][1]' out of [0, 1]
+        u[0][1] = dr::clip(u[0][1], 0.f, 1.f);
+
         // Account for scales on hair surface
         Float sin_theta_ip(0.f);
         Float cos_theta_ip(0.f);
@@ -275,6 +282,10 @@ public:
         for (size_t i = 0; i < P_MAX; i++)
             dr::masked(cos_theta, p == i) =
                 1 + m_v[i] * dr::log(u[1][0] + (1.f - u[1][0]) * dr::exp(-2.f / m_v[i]));
+
+        // 'exp(-2/m_v)' underflows for small roughness, giving 'log(0)'
+        cos_theta = dr::clip(cos_theta, -1.f, 1.f);
+
         Float sin_theta = dr::safe_sqrt(1.f - dr::square(cos_theta));
         Float cos_phi = dr::cos(2 * dr::Pi<ScalarFloat> * u[1][1]);
         Float sin_theta_o =
@@ -282,8 +293,7 @@ public:
         Float cos_theta_o = dr::safe_sqrt(1.f - dr::square(sin_theta_o));
 
         // Transmission angle in azimuthal plane
-        Float eta_p = azimuthal_ior(sin_theta_i, cos_theta_i);
-        Float sin_gamma_t = h / eta_p;
+        Float sin_gamma_t = h * inv_azimuthal_ior(sin_theta_i, cos_theta_i);
         Float gamma_t = dr::safe_asin(sin_gamma_t);
 
         // Sample azimuthal scattering
@@ -346,19 +356,17 @@ public:
         Float phi_o = azimuthal_angle(wo);
 
         // Transmission angle in longitudinal plane
-        Float sin_theta_t = sin_theta_i / m_eta;
-        Float cos_theta_t = dr::safe_sqrt(1.f - dr::square(sin_theta_t));
+        Float sin_theta_t = sin_theta_i * m_inv_eta;
+        Float inv_cos_theta_t = dr::safe_rsqrt(1.f - dr::square(sin_theta_t));
 
         // Transmission angle in azimuthal plane
-        Float eta_p =
-            dr::safe_sqrt(dr::square(m_eta) - dr::square(sin_theta_i)) / cos_theta_i;
-        Float sin_gamma_t = h / eta_p;
+        Float sin_gamma_t = h * inv_azimuthal_ior(sin_theta_i, cos_theta_i);
         Float cos_gamma_t = dr::safe_sqrt(1.f - dr::square(sin_gamma_t));
         Float gamma_t = dr::safe_asin(sin_gamma_t);
 
         // Attenuation coefficients
         UnpolarizedSpectrum sigma_a = absorption(si, active);
-        Float transmitted_length = 2 * cos_gamma_t / cos_theta_t;
+        Float transmitted_length = 2 * cos_gamma_t * inv_cos_theta_t;
         UnpolarizedSpectrum transmittance = dr::exp(-sigma_a * transmitted_length);
         AttenuationCoeffs a_p =
             attenuation(cos_theta_i, m_eta, h, transmittance);
@@ -404,10 +412,7 @@ public:
         Float phi_o = azimuthal_angle(wo);
 
         // Transmission angle in azimuthal plane
-        Float eta_p =
-            dr::safe_sqrt(Float(m_eta * m_eta) - dr::square(sin_theta_i)) /
-            cos_theta_i;
-        Float sin_gamma_t = h / eta_p;
+        Float sin_gamma_t = h * inv_azimuthal_ior(sin_theta_i, cos_theta_i);
         Float gamma_t = dr::safe_asin(sin_gamma_t);
 
         // Attenuation PDF
@@ -455,23 +460,20 @@ public:
         auto [sin_phi_i, cos_phi_i] = dr::sincos(phi_i);
 
         // Transmission angle in longitudinal plane
-        Float sin_theta_t = sin_theta_i / m_eta;
-        Float cos_theta_t = dr::safe_sqrt(1.f - dr::square(sin_theta_t));
+        Float sin_theta_t = sin_theta_i * m_inv_eta;
+        Float inv_cos_theta_t = dr::safe_rsqrt(1.f - dr::square(sin_theta_t));
 
         // Transmission angle in azimuthal plane
-        Float eta_p =
-            dr::safe_sqrt(Float(m_eta * m_eta) - dr::square(sin_theta_i)) /
-            cos_theta_i;
-        Float sin_gamma_t = h / eta_p;
+        Float sin_gamma_t = h * inv_azimuthal_ior(sin_theta_i, cos_theta_i);
         Float cos_gamma_t = dr::safe_sqrt(1.f - dr::square(sin_gamma_t));
         Float gamma_t = dr::safe_asin(sin_gamma_t);
 
         // Attenuation coefficients
         UnpolarizedSpectrum sigma_a = absorption(si, active);
-        Float transmitted_length = 2 * cos_gamma_t / cos_theta_t;
+        Float transmitted_length = 2 * cos_gamma_t * inv_cos_theta_t;
         UnpolarizedSpectrum transmittance = dr::exp(-sigma_a * transmitted_length);
         AttenuationCoeffs a_p =
-            attenuation(cos_theta_i, Float(m_eta), h, transmittance);
+            attenuation(cos_theta_i, m_eta, h, transmittance);
         dr::Array<Float, P_MAX + 1> a_p_pdf = attenuation_pdf(cos_theta_i, si);
 
         // Accumulate PDF and contribution for each segment length
@@ -528,9 +530,9 @@ private:
 
     /// Coefficients for spectral upsampling
     static inline const ScalarVector3f EUMELANIN_SRGB_COEFFS =
-        srgb_model_fetch(EUMELANIN_SIGMA_A);
+        SRGBModel<Float, Spectrum>::fetch(EUMELANIN_SIGMA_A);
     static inline const ScalarVector3f PHEOMELANIN_SRGB_COEFFS =
-        srgb_model_fetch(PHEOMELANIN_SIGMA_A);
+        SRGBModel<Float, Spectrum>::fetch(PHEOMELANIN_SIGMA_A);
 
     using AttenuationCoeffs = dr::Array<UnpolarizedSpectrum, P_MAX + 1>;
 
@@ -588,10 +590,10 @@ private:
         return dr::select(w.x() < 0, gamma, -gamma);
     }
 
-    /// Modified index of refraction, considers projection in the normal plane
-    MI_INLINE Float azimuthal_ior(Float sin_theta_i, Float cos_theta_i) const {
-        return dr::safe_sqrt(dr::square(m_eta) - dr::square(sin_theta_i)) /
-               cos_theta_i;
+    /// Reciprocal of the modified index of refraction, which accounts for
+    /// the projection into the normal plane
+    MI_INLINE Float inv_azimuthal_ior(Float sin_theta_i, Float cos_theta_i) const {
+        return cos_theta_i * dr::safe_rsqrt(m_eta_2 - dr::square(sin_theta_i));
     }
 
     /// Return modified direction to account for angle of scales on hair surface
@@ -660,17 +662,16 @@ private:
         Float sin_theta_i = dr::safe_sqrt(1.f - cos_theta_i * cos_theta_i);
 
         // Transmission angle in longitudinal plane
-        Float sin_theta_t = sin_theta_i / m_eta;
-        Float cos_theta_t = dr::safe_sqrt(1.f - dr::square(sin_theta_t));
+        Float sin_theta_t = sin_theta_i * m_inv_eta;
+        Float inv_cos_theta_t = dr::safe_rsqrt(1.f - dr::square(sin_theta_t));
 
         // Transmission angle in azimuthal plane
-        Float eta_p = azimuthal_ior(sin_theta_i, cos_theta_i);
-        Float sin_gamma_t = h / eta_p;
+        Float sin_gamma_t = h * inv_azimuthal_ior(sin_theta_i, cos_theta_i);
         Float cos_gamma_t = dr::safe_sqrt(1.f - dr::square(sin_gamma_t));
 
         // Attenuation coefficients
         UnpolarizedSpectrum sigma_a = absorption(si, active);
-        Float transmitted_length = 2 * cos_gamma_t / cos_theta_t;
+        Float transmitted_length = 2 * cos_gamma_t * inv_cos_theta_t;
         UnpolarizedSpectrum transmittance = dr::exp(-sigma_a * transmitted_length);
         AttenuationCoeffs a_p = attenuation(cos_theta_i, m_eta, h, transmittance);
 
@@ -773,21 +774,22 @@ private:
     Float m_longitudinal_roughness, m_azimuthal_roughness;
 
     Float m_alpha; /// Angle of scales
-    Float m_eta; /// IOR
+    Float m_eta, m_inv_eta, m_eta_2; /// IOR, its reciprocal, and its square
 
     /// Pigmentation
     bool m_use_pigmentation = true;
     Float m_eumelanin, m_pheomelanin;
 
     ref<Texture> m_sigma_a; /// Absorption if pigmentation is not used;
-    ScalarFloat m_scale;
+    Float m_scale;
 
     Float m_v[P_MAX + 1]; /// Longitudinal variance due to roughness
     Float m_s; /// Azimuthal roughness scaling factor
     Float m_sin_2k_alpha[3], m_cos_2k_alpha[3];
 
     MI_TRAVERSE_CB(Base, m_longitudinal_roughness, m_azimuthal_roughness,
-                   m_alpha, m_eta, m_eumelanin, m_pheomelanin, m_sigma_a,
+                   m_alpha, m_eta, m_inv_eta, m_eta_2, m_eumelanin,
+                   m_pheomelanin, m_sigma_a, m_scale,
                    m_v[0], m_v[1], m_v[2], m_v[3], m_s, m_sin_2k_alpha[0],
                    m_sin_2k_alpha[1], m_sin_2k_alpha[2], m_cos_2k_alpha[0],
                    m_cos_2k_alpha[1], m_cos_2k_alpha[2])

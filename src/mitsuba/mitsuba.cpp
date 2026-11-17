@@ -13,6 +13,7 @@
 #include <mitsuba/render/integrator.h>
 #include <mitsuba/render/records.h>
 #include <mitsuba/render/scene.h>
+#include <mitsuba/render/srgb.h>
 #include <functional>
 
 #if !defined(_WIN32)
@@ -95,26 +96,8 @@ Options:
 
  === The following options are only relevant for JIT (CUDA/LLVM) modes ===
 
-    -O [0-5]
-        Enables successive optimizations (default: -O5):
-          (0. all disabled, 1: de-duplicate virtual functions,
-           2: constant propagation, 3. value numbering,
-           4. virtual call optimizations, 5. loop optimizations)
-
     -S
         Dump the PTX or LLVM intermediate representation to the console
-
-    -W
-        Instead of compiling a megakernel, perform rendering using a
-        series of wavefronts. Specify twice to unroll both loops *and*
-        virtual function calls.
-
-    -V <width>
-        Override the vector width of the LLVM backend ('width' must be
-        a power of two). Values of 4/8/16 cause SSE/NEON, AVX, or AVX512
-        registers being used (if supported). Going beyond the natively
-        supported width is legal and causes arithmetic operations to be
-        replicated multiple times.
 
 )";
 }
@@ -133,6 +116,11 @@ void scene_static_accel_initialization() {
 template <typename Float, typename Spectrum>
 void scene_static_accel_shutdown() {
     Scene<Float, Spectrum>::static_accel_shutdown();
+}
+
+template <typename Float, typename Spectrum>
+void srgb_model_static_shutdown() {
+    SRGBModel<Float, Spectrum>::static_shutdown();
 }
 
 template <typename Float, typename Spectrum>
@@ -156,7 +144,8 @@ void render(Object *scene_, size_t sensor_i, fs::path filename) {
                        0 /* seed */,
                        0 /* spp */,
                        false /* develop */,
-                       true /* evaluate */);
+                       true /* evaluate */,
+                       true /* profile */);
 
     develop_callback_fn = nullptr;
 
@@ -190,16 +179,13 @@ int main(int argc, char *argv[]) {
     auto arg_extra     = parser.add("", true);
 
     // Specialized flags for the JIT compiler
-    auto arg_optim_lev = parser.add(StringVec{ "-O" }, true);
-    auto arg_wavefront = parser.add(StringVec{ "-W" });
     auto arg_source    = parser.add(StringVec{ "-S" });
-    auto arg_vec_width = parser.add(StringVec{ "-V" }, true);
 
     parser::ParameterList params;
     std::string error_msg, mode;
 
 #if !defined(_WIN32)
-    /* Initialize signal handlers */
+    // Initialize signal handlers
     struct sigaction sa;
     sa.sa_handler = hup_signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -246,7 +232,7 @@ int main(int argc, char *argv[]) {
 #endif
 
         // Initialize nanothread with the requested number of threads
-        uint32_t thread_count = pool_size() + 1;
+        uint32_t thread_count = pool_size();
         if (*arg_threads) {
             thread_count = arg_threads->as_int();
             if (thread_count < 1) {
@@ -255,7 +241,7 @@ int main(int argc, char *argv[]) {
                 thread_count = 1;
             }
         }
-        pool_set_size(nullptr, thread_count - 1);
+        pool_set_size(nullptr, thread_count);
 
         while (arg_define && *arg_define) {
             std::string value = arg_define->as_string();
@@ -270,7 +256,7 @@ int main(int argc, char *argv[]) {
             init_variant_backend(mode);
         } else if (*arg_extra && !*arg_help) {
             // Pick the most capable variant whose backend is available
-            for (const std::string &v : string::tokenize(MI_VARIANT_PRIORITY, "\n")) {
+            for (const std::string &v : string::tokenize(MI_VARIANTS, "\n")) {
                 if (init_variant_backend(v)) {
                     mode = v;
                     break;
@@ -286,46 +272,13 @@ int main(int argc, char *argv[]) {
         bool jit   = cuda || llvm || metal;
 
 #if defined(MI_ENABLE_LLVM) || defined(MI_ENABLE_CUDA) || defined(MI_ENABLE_METAL)
-        if (jit) {
-            if (*arg_optim_lev) {
-                int lev = arg_optim_lev->as_int();
-                jit_set_flag(JitFlag::VCallDeduplicate, lev > 0);
-                jit_set_flag(JitFlag::ConstantPropagation, lev > 1);
-                jit_set_flag(JitFlag::ValueNumbering, lev > 2);
-                jit_set_flag(JitFlag::VCallOptimize, lev > 3);
-                jit_set_flag(JitFlag::LoopOptimize, lev > 4);
-            }
-
-            if (*arg_wavefront) {
-                jit_set_flag(JitFlag::LoopRecord, false);
-                if (arg_wavefront->next())
-                    jit_set_flag(JitFlag::VCallRecord, false);
-            }
-
-            if (*arg_source)
-                jit_set_flag(JitFlag::PrintIR, true);
-
-            if (*arg_vec_width && llvm) {
-                uint32_t width = arg_vec_width->as_int();
-                if (!math::is_power_of_two(width))
-                    Throw("Value specified to the -V argument must be a power of two!");
-
-                std::string target_cpu = jit_llvm_target_cpu(),
-                            target_features = jit_llvm_target_features();
-
-                jit_llvm_set_target(target_cpu.c_str(),
-                                    target_features.c_str(),
-                                    (uint32_t) width);
-            }
-        }
+        if (jit && *arg_source)
+            jit_set_flag(JitFlag::PrintIR, true);
 #else
-        DRJIT_MARK_USED(arg_wavefront);
-        DRJIT_MARK_USED(arg_optim_lev);
         DRJIT_MARK_USED(arg_source);
 #endif
 
-        if (!jit &&
-            (*arg_optim_lev || *arg_wavefront || *arg_source || *arg_vec_width))
+        if (!jit && *arg_source)
             Throw("Specified an argument that only makes sense in a JIT (LLVM/CUDA/Metal) mode!");
 
         Profiler::static_initialization();
@@ -352,9 +305,9 @@ int main(int argc, char *argv[]) {
         }
 
         if (!*arg_extra || *arg_help) {
-            help(pool_size() + 1);
+            help(pool_size());
         } else {
-            Log(Info, "%s", util::info_build(pool_size() + 1));
+            Log(Info, "%s", util::info_build(pool_size()));
             Log(Info, "%s", util::info_copyright());
             Log(Info, "%s", util::info_features());
             Log(Info, "Rendering using the \"%s\" variant.", mode);
@@ -368,14 +321,6 @@ int main(int argc, char *argv[]) {
 
         while (arg_extra && *arg_extra) {
             fs::path filename(arg_extra->as_string());
-            ref<FileResolver> fr2 = new FileResolver(*fr);
-            set_file_resolver(fr2);
-
-            // Add the scene file's directory to the search path.
-            fs::path scene_dir = filename.parent_path();
-            if (!fr2->contains(scene_dir))
-                fr2->append(scene_dir);
-
             if (*arg_output)
                 filename = fs::path(arg_output->as_string());
 
@@ -421,6 +366,7 @@ int main(int argc, char *argv[]) {
     }
 
     MI_INVOKE_VARIANT(mode, scene_static_accel_shutdown);
+    MI_INVOKE_VARIANT(mode, srgb_model_static_shutdown);
     color_management_static_shutdown();
     Profiler::static_shutdown();
     Bitmap::static_shutdown();

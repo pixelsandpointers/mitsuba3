@@ -196,14 +196,14 @@ def test05_eval_spectral(variants_vec_backends_once_spectral):
     si.wavelengths = np.linspace(mi.MI_CIE_MIN, mi.MI_CIE_MAX, mi.MI_WAVELENGTH_SAMPLES)
     si.uv = [x, y]
 
-    with pytest.raises(RuntimeError):
-        mono = bitmap.eval_1(si)
-    with pytest.raises(RuntimeError):
-        color = bitmap.eval_3(si)
     spec = bitmap.eval(si)
-
     expected = [0.0023, 0.1910, 0.0059, 0.0003]
     assert dr.allclose(expected, spec, atol=1e-04)
+
+    # The sRGB data remains available alongside the upsampled spectrum
+    color = bitmap.eval_3(si)
+    assert dr.allclose([0.0012, 0.1946, 0.0242], color, atol=1e-04)
+    assert dr.allclose(mi.luminance(color), bitmap.eval_1(si), atol=1e-04)
 
     # Grayscale image
     bitmap = mi.load_dict({
@@ -230,13 +230,16 @@ def test05_eval_spectral(variants_vec_backends_once_spectral):
 
 
 def test06_tensor_load(variants_all_rgb):
+    si = dr.zeros(mi.SurfaceInteraction3f)
+    si.uv = [0.3, 0.7]
+
     bitmap = mi.load_dict({
         'type' : 'bitmap',
         'data' : dr.ones(mi.TensorXf, shape = [30, 30, 3]),
         'raw' : True
     })
 
-    assert dr.allclose(bitmap.mean(), 1.0);
+    assert dr.allclose(bitmap.eval(si), 1.0)
 
     bitmap = mi.load_dict({
         'type' : 'bitmap',
@@ -244,7 +247,7 @@ def test06_tensor_load(variants_all_rgb):
         'raw' : True
     })
 
-    assert dr.allclose(bitmap.mean(), 3.0);
+    assert dr.allclose(bitmap.eval(si), 3.0)
 
 
 @fresolver_append_path
@@ -303,18 +306,29 @@ def test09_eval_u8(variants_vec_backends_once_rgb):
 
     assert dr.allclose(tex_ref.eval_3(si), tex_u8.eval_3(si), atol=2e-3)
     assert dr.allclose(tex_ref.eval_1(si), tex_u8.eval_1(si), atol=2e-3)
-    assert dr.allclose(tex_ref.mean(), tex_u8.mean(), atol=2e-3)
 
 
 @fresolver_append_path
-def test10_u8_unsupported_in_spectral(variants_vec_backends_once_spectral):
-    # 8-bit storage cannot hold spectral upsampling coefficients
-    with pytest.raises(RuntimeError):
-        mi.load_dict({
-            'type'     : 'bitmap',
-            'filename' : 'resources/data/common/textures/carrot.png',
-            'format'   : 'uint8'
-        })
+def test10_eval_u8_spectral(variants_vec_backends_once_spectral):
+    # The upsampling coefficients derived from 8-bit sRGB storage should match
+    # those of the float path
+    common = {
+        'type'     : 'bitmap',
+        'filename' : 'resources/data/common/textures/carrot.png'
+    }
+    tex_ref = mi.load_dict({ **common, 'format' : 'variant' })
+    tex_u8  = mi.load_dict({ **common, 'format' : 'uint8' })
+
+    x_res, y_res = tex_ref.resolution()
+    x = (1 / x_res) * 7 + (1 / (2 * x_res))
+    y = (1 / y_res) * 1 + (1 / (2 * y_res))
+
+    si = dr.zeros(mi.SurfaceInteraction3f)
+    si.wavelengths = [450., 550., 600., 650.]
+    si.uv = [x, y]
+
+    assert dr.allclose(tex_ref.eval(si), tex_u8.eval(si), atol=2e-3)
+    assert dr.allclose(tex_ref.eval_3(si), tex_u8.eval_3(si), atol=2e-3)
 
 
 def test11_u8_small_bitmap_upsample(variants_vec_backends_once_rgb, tmpdir):
@@ -338,3 +352,162 @@ def test11_u8_small_bitmap_upsample(variants_vec_backends_once_rgb, tmpdir):
     si.uv = [0.5, 0.5]
     val = tex.eval_3(si)
     assert dr.all(val > 0)
+
+
+@pytest.mark.parametrize('channels', [1, 3])
+def test12_eval_grad_anisotropic(variant_scalar_rgb, channels):
+    """The gradient follows the ``to_uv`` transform, including when a
+    non-square resolution scales the two axes differently."""
+    import numpy as np
+    h, w = 16, 64
+    r, c = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+    plane = 0.3 * c / (w - 1) + 0.7 * r / (h - 1)
+    values = np.float32(plane if channels == 1 else
+                        np.stack([plane, 0.5 * plane[:, ::-1], 0.25 + 0.2 * plane], -1))
+
+    # Keep the unit square fixed so that the probes below stay clear of the
+    # clamped border, where the gradient vanishes and the test says nothing
+    def centered(t):
+        return (mi.ScalarTransform4f().translate([0.5, 0.5, 0]) @ t @
+                mi.ScalarTransform4f().translate([-0.5, -0.5, 0]))
+
+    delta = 1e-3
+    for transform in [mi.ScalarTransform4f(),
+                      centered(mi.ScalarTransform4f().scale([2, 1.8, 1])),
+                      centered(mi.ScalarTransform4f().rotate([0, 0, 1], 30)),
+                      centered(mi.ScalarTransform4f().rotate([0, 0, 1], -50)
+                               .scale([2, 1, 1]))]:
+        tex = mi.load_dict({'type': 'bitmap', 'raw': True, 'to_uv': transform,
+                            'wrap_mode': 'clamp', 'bitmap': mi.Bitmap(values)})
+        si = mi.SurfaceInteraction3f()
+
+        for uv in [(0.37, 0.51), (0.62, 0.28), (0.45, 0.45)]:
+            def eval_at(du, dv):
+                si.uv = mi.Point2f(uv[0] + du, uv[1] + dv)
+                return tex.eval_1(si)
+
+            fd = mi.Vector2f((eval_at(delta, 0) - eval_at(-delta, 0)) / (2 * delta),
+                             (eval_at(0, delta) - eval_at(0, -delta)) / (2 * delta))
+            si.uv = mi.Point2f(*uv)
+            grad = tex.eval_1_grad(si)
+            assert dr.all(dr.abs(grad) > 1e-2), (transform, uv)
+            assert dr.allclose(grad, fd, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize('filter_type', ['trilinear', 'anisotropic'])
+def test13_filtered_lookup(variants_all_backends_once, filter_type):
+    import numpy as np
+    rng = np.random.default_rng(0)
+    values = rng.random((64, 64, 3), dtype=np.float32)
+
+    def load(filter_type):
+        return mi.load_dict({'type': 'bitmap', 'raw': True, 'wrap_mode': 'clamp',
+                             'filter_type': filter_type, 'bitmap': mi.Bitmap(values)})
+
+    tex, ref = load(filter_type), load('bilinear')
+    si = dr.zeros(mi.SurfaceInteraction3f)
+
+    # Without a footprint, the lookup samples the finest level
+    si.uv = mi.Point2f(0.3, 0.7)
+    assert dr.allclose(tex.eval_3(si), ref.eval_3(si), atol=1e-5)
+
+    # A footprint of 1/8 selects the 8x8 level, i.e. the mean of a block
+    si.uv = mi.Point2f(2.5 / 8, 5.5 / 8)
+    si.footprint = mi.Matrix2f([[1 / 8, 0], [0, 1 / 8]])
+    block = values[40:48, 16:24].mean(axis=(0, 1))
+    assert dr.allclose(tex.eval_3(si), mi.Color3f(block), atol=1e-4)
+    assert dr.allclose(tex.eval_1(si), mi.luminance(mi.Color3f(block)), atol=1e-4)
+
+    # A footprint covering the whole texture yields its mean
+    si.footprint = mi.Matrix2f([[2, 0], [0, 2]])
+    assert dr.allclose(tex.eval_3(si), mi.Color3f(values.mean(axis=(0, 1))), atol=1e-4)
+
+    with pytest.raises(RuntimeError, match='max_anisotropy'):
+        mi.load_dict({'type': 'bitmap', 'raw': True, 'filter_type': 'anisotropic',
+                      'max_anisotropy': 32, 'bitmap': mi.Bitmap(values)})
+
+
+def bc4_constant_texture(path, name, value, width, height, levels):
+    """Write a BC4 texture whose texels all equal ``value`` (0-255) to a
+    packed container. A BC4 block with both endpoints equal to ``value`` and
+    zero indices decodes to that value everywhere."""
+    pf = mi.PackedFile(path)
+    pf.begin(name)
+    s = pf.stream()
+    s.write(b'BTEX')
+    s.write_uint32(1)
+    s.write_uint8(4)       # format
+    s.write_uint8(0)       # sRGB
+    s.write_uint8(levels)
+    s.write_uint8(1)       # channels
+    s.write_uint32(width)
+    s.write_uint32(height)
+    block = bytes([value, value, 0, 0, 0, 0, 0, 0])
+    w, h = width, height
+    for _ in range(levels):
+        pf.write_array(block * (((w + 3) // 4) * ((h + 3) // 4)))
+        w, h = max(w // 2, 1), max(h // 2, 1)
+    pf.close()
+
+
+@pytest.mark.parametrize('filter_type', ['bilinear', 'trilinear'])
+def test14_packed_container(variants_all_rgb, tmp_path, filter_type):
+    """Block-compressed textures load from a packed container, selected by
+    index or name, and decode to the stored values"""
+    fname = str(tmp_path / 'textures.packed')
+    pf = mi.PackedFile(fname)
+    pf.close()
+    bc4_constant_texture(fname, 'first', 51, 8, 8, 1)
+
+    tex = mi.load_dict({'type': 'bitmap', 'filename': fname, 'raw': True,
+                        'filter_type': filter_type})
+    si = dr.zeros(mi.SurfaceInteraction3f)
+    si.uv = [0.3, 0.6]
+    assert dr.allclose(tex.eval_1(si), 51 / 255, atol=1e-3)
+    assert dr.all(tex.resolution() == mi.ScalarVector2i(8, 8))
+
+    with pytest.raises(Exception, match='out of range'):
+        mi.load_dict({'type': 'bitmap', 'filename': fname, 'index': 1})
+    with pytest.raises(Exception, match='no entry named'):
+        mi.load_dict({'type': 'bitmap', 'filename': fname, 'name': 'second'})
+
+    # A complete MIP chain is used by the trilinear filter
+    fname = str(tmp_path / 'chain.packed')
+    bc4_constant_texture(fname, 'chain', 102, 8, 4, 4)
+    tex = mi.load_dict({'type': 'bitmap', 'filename': fname, 'raw': True,
+                        'name': 'chain', 'filter_type': filter_type})
+    assert dr.allclose(tex.eval_1(si), 102 / 255, atol=1e-3)
+
+
+def test15_forward_ad_spectral(variants_all_ad_spectral):
+    """Gradients reach the sRGB data through the spectral upsampling model"""
+    import numpy as np
+
+    def make(green):
+        image = np.full((4, 4, 3), [0.2, green, 0.8], dtype=np.float32)
+        return mi.load_dict({'type': 'bitmap', 'bitmap': mi.Bitmap(image),
+                             'raw': False})
+
+    si = dr.zeros(mi.SurfaceInteraction3f)
+    si.wavelengths = type(si.wavelengths)(450., 550., 600., 650.)
+    si.uv = mi.Point2f(0.5, 0.5)
+
+    tex = make(0.5)
+    params = mi.traverse(tex)
+    dr.enable_grad(params['data'])
+    params.update()
+
+    # The exposed data is the sRGB image, not the upsampling coefficients
+    dr.assert_allclose(tex.eval_3(si), [0.2, 0.5, 0.8])
+
+    value = tex.eval(si)
+    seed = np.zeros((4, 4, 3), dtype=np.float32)
+    seed[:, :, 1] = 1
+    dr.set_grad(params['data'], mi.TensorXf(seed))
+    dr.forward_to(value)
+
+    eps = 1e-3
+    finite_diff = (np.array(make(0.5 + eps).eval(si)) -
+                   np.array(make(0.5 - eps).eval(si))).ravel() / (2 * eps)
+
+    dr.assert_allclose(dr.grad(value), finite_diff, atol=1e-3)

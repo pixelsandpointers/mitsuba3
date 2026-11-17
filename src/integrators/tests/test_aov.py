@@ -51,11 +51,12 @@ def test02_radiance_consistent(variants_all_rgb):
         'my_image': path_integrator
     })
 
-    spp = 1
+    spp = 4
     path_image = path_integrator.render(scene, seed=0, spp=spp)
     aovs_image = aov_integrator.render(scene, seed=0, spp=spp)
 
-    # Make sure radiance is consistent
+    # The first nested integrator sees the same random numbers as when
+    # rendering alone, hence the radiance must match
     assert(dr.allclose(path_image, aovs_image[:,:,:3]))
 
 
@@ -74,16 +75,29 @@ def test03_supports_multiple_inner_integrators(variants_all_rgb):
         'my_image2' : path_integrator
     })
 
-    # sampler is shared between integrators, use a higher spp to reduce noise
-    # difference between both rendered images
     spp = 32
     aovs_image = aov_integrator.render(scene, seed=0, spp=spp)
 
-    # Make sure radiance is consistent between two inner integrators
-    assert(dr.allclose(aovs_image[:,:,:3], aovs_image[:,:, 3:6]))
+    # The inner integrators share the sampler and therefore have independent
+    # noise. Their mean radiance must agree.
+    import numpy as np
+    image = np.array(aovs_image)
+    assert np.allclose(image[:, :, :3].mean(axis=(0, 1)),
+                       image[:, :, 3:6].mean(axis=(0, 1)), rtol=2e-2)
+
+    # The first inner integrator occupies the base channels of the film, the
+    # second one receives a group of channels named after it
+    film = scene.sensors()[0].film()
+    assert film.channels() == ['R', 'G', 'B', 'my_image2.R', 'my_image2.G',
+                               'my_image2.B', 'dd.y.T', 'nn.X', 'nn.Y', 'nn.Z']
+    assert dr.allclose(aovs_image, film.develop())
 
 
-def test04_check_aov_correct(variants_all_rgb):
+# With a wide filter or a nested integrator that has its own pass structure,
+# correct AOVs require that all sources share sample positions and weights
+@pytest.mark.parametrize('rfilter,samples_per_pass', [
+    ('box', None), ('gaussian', None), ('gaussian', 1)])
+def test04_check_aov_correct(variants_all_rgb, rfilter, samples_per_pass):
     albedo = 0.4
     camera_offset = 1
     plane_offset = -1
@@ -100,10 +114,13 @@ def test04_check_aov_correct(variants_all_rgb):
         'to_world' : mi.ScalarTransform4f().scale([10.0, 10.0, 1.0]).translate([0,0,plane_offset])
     }
 
-    path_integrator = mi.load_dict({
+    path_dict = {
         'type': 'path',
         'max_depth': 6
-    })
+    }
+    if samples_per_pass is not None:
+        path_dict['samples_per_pass'] = samples_per_pass
+    path_integrator = mi.load_dict(path_dict)
 
     aov_integrator = mi.load_dict({
         'type': 'aov',
@@ -126,7 +143,7 @@ def test04_check_aov_correct(variants_all_rgb):
             'film': {
                 'type': 'hdrfilm',
                 'width': 128, 'height': 128,
-                'rfilter': {'type': 'box'}
+                'rfilter': {'type': rfilter}
             },
         },
         'emitter' : {
@@ -173,10 +190,10 @@ def test05_check_aov_film(variants_all_rgb):
     film = scene.sensors()[0].film()
 
     path_integrator.render(scene, seed=0, spp=spp)
-    bitmap_path = film.bitmap(raw=False)
+    bitmap_path = film.bitmap()
 
     _ = aov_integrator.render(scene, seed=0, spp=spp)
-    bitmap_aov = film.bitmap(raw=False)
+    bitmap_aov = film.bitmap()
 
     # Make sure radiance is consistent
     assert(np.allclose(bitmap_aov.split()[0][1],bitmap_path.split()[0][1]))
@@ -328,3 +345,87 @@ def test07_test_aov_normalmap(variants_all_ad_rgb):
     assert(dr.allclose(
         image[:,:,3:6].array,
         dr.tile(n, image.shape[0] * image.shape[1])))
+
+
+def test08_nested_aov_integrators(variants_all_rgb):
+    scene = mi.load_file(find_resource('resources/data/scenes/cbox/cbox.xml'), res=32)
+
+    direct_integrator = mi.load_dict({'type': 'direct'})
+    outer_aov = mi.load_dict({
+        'type': 'aov',
+        'aovs': 'dd:depth',
+        'inner_aov': {
+            'type': 'aov',
+            'aovs': 'nn:sh_normal',
+            'inner_direct': direct_integrator,
+        },
+    })
+
+    spp = 4
+    direct_image = direct_integrator.render(scene, seed=0, spp=spp)
+    aov_image = outer_aov.render(scene, seed=0, spp=spp)
+    # The image of the innermost integrator occupies the base channels of the
+    # film at every level of nesting
+    expected_aov_names = [
+        'inner_aov.nn.X',
+        'inner_aov.nn.Y',
+        'inner_aov.nn.Z',
+        'dd.T',
+    ]
+    assert outer_aov.aov_names(scene.sensors()[0].film()) == expected_aov_names
+    # Developed RGB image contains 7 channels (3 base + 3 normals + 1 depth)
+    assert aov_image.shape[2] == 7
+    assert dr.allclose(direct_image[:, :, :3], aov_image[:, :, :3], atol=1e-2)
+    assert dr.any(aov_image[:, :, 3:6] != 0.0) # non-zero normal values
+    assert dr.any(aov_image[:, :, 6] > 0.0)  # positive depth values
+
+    # The developed image is what the film holds
+    film = scene.sensors()[0].film()
+    assert film.channels() == ['R', 'G', 'B'] + expected_aov_names
+    assert dr.allclose(aov_image, film.develop())
+
+    # Verify that bitmap.split() cleanly splits channels into expected layer sub-bitmaps
+    split_layers = dict(film.bitmap().split())
+    assert split_layers.keys() == {
+        '<root>',
+        'inner_aov.nn',
+        'dd',
+    }
+
+    # <root> layer contains the developed base RGB image
+    root_layer = mi.TensorXf(split_layers['<root>'])
+    assert dr.allclose(direct_image[:, :, :3], root_layer[:, :, :3], atol=1e-2)
+
+
+def test09_material_aovs(variants_all_rgb):
+    # A smooth glass plane seen head-on reflects ((eta-1)/(eta+1))^2 of the
+    # light and transmits the rest
+    eta = 1.5
+    r = ((eta - 1) / (eta + 1)) ** 2
+
+    scene = mi.load_dict({
+        'type': 'scene',
+        'sensor': {
+            'type': 'orthographic',
+            'to_world': mi.ScalarTransform4f().look_at(
+                origin=(0, 0, 1), target=(0, 0, 0), up=(0, 1, 0)),
+            'film': {'type': 'hdrfilm', 'width': 4, 'height': 4,
+                     'rfilter': {'type': 'box'}},
+        },
+        'plane': {
+            'type': 'rectangle',
+            'to_world': mi.ScalarTransform4f().scale(10),
+            'material': {'type': 'dielectric', 'int_ior': eta, 'ext_ior': 1.0},
+        },
+    })
+
+    integrator = mi.load_dict({
+        'type': 'aov',
+        'aovs': 'a:albedo,d:diffuse_albedo,r:specular_reflectance,'
+                't:specular_transmittance,rough:roughness',
+    })
+
+    image = integrator.render(scene, spp=1)
+    expected = [1, 1, 1, 0, 0, 0, r, r, r, 1 - r, 1 - r, 1 - r, 0]
+    assert dr.allclose(image[:, :, 3:], mi.TensorXf(expected * 16, (4, 4, 13)),
+                       atol=1e-5)

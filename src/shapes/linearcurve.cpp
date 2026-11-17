@@ -4,13 +4,13 @@
 #include <mitsuba/core/transform.h>
 #include <mitsuba/core/util.h>
 #include <mitsuba/core/warp.h>
-#include <mitsuba/core/fresolver.h>
-#include <mitsuba/core/mmap.h>
 #include <mitsuba/core/timer.h>
 #include <mitsuba/render/fwd.h>
 #include <mitsuba/render/interaction.h>
 #include <mitsuba/render/shape.h>
 #include <mitsuba/render/scene_ir.h>
+
+#include "curve.h"
 
 #include <drjit/texture.h>
 
@@ -18,11 +18,6 @@
 #include <embree3/rtcore.h>
 #endif
 
-#if defined(MI_ENABLE_METAL)
-#include "../render/metal/shapes.h"
-#endif
-
-#include "../render/bbox_reduce.h"
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -38,7 +33,17 @@ Linear curve (:monosp:`linearcurve`)
 
  * - filename
    - |string|
-   - Filename of the curves to be loaded
+   - Filename of the curves to be loaded, either a text file or a
+     ``.packed`` container
+
+ * - index
+   - |int|
+   - Index of the entry to load from a ``.packed`` container. (Default: 0)
+
+ * - name
+   - |string|
+   - Alternatively, the name of the entry to load from a ``.packed``
+     container.
 
  * - to_world
    - |transform|
@@ -96,6 +101,13 @@ points and increasing radii::
      4.0 1.0 2.2 5
      4.0 0.0 2.3 6
 
+Large sets of curves are better stored in a ``.packed`` container, which
+holds the control points in a compressed binary form that loads considerably
+faster than the text format. The :ref:`file format description
+<sec-packed-curve>` documents the layout of a curve entry. When
+:monosp:`filename` refers to a container, the ``index`` or ``name``
+parameter selects the entry.
+
 .. tabs::
     .. code-tab:: xml
         :name: linearcurve
@@ -123,9 +135,8 @@ points and increasing radii::
 template <typename Float, typename Spectrum>
 class LinearCurve final : public Shape<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Shape, m_to_world, m_is_instance, m_shape_type,
-                   initialize, mark_dirty, get_children_string,
-                   parameters_grad_enabled)
+    MI_IMPORT_BASE(Shape, m_to_world, m_shape_type, initialize, mark_dirty,
+                   get_children_string)
     MI_IMPORT_TYPES()
 
     using typename Base::ScalarIndex;
@@ -145,170 +156,34 @@ public:
                   "variants!");
 #endif
 
-        auto fs = file_resolver();
-        fs::path file_path = fs->resolve(props.get<std::string_view>("filename"));
-        std::string m_name = file_path.filename().string();
-
-        // used for throwing an error later
-        auto fail = [&](const char *descr, auto... args) {
-            Throw(("Error while loading linear curve(s) from \"%s\": " + std::string(descr))
-                      .c_str(), m_name, args...);
-        };
-
-        Log(Debug, "Loading linear curve(s) from \"%s\" ..", m_name);
-        if (!fs::exists(file_path))
-            fail("file not found!");
-
-        ref<MemoryMappedFile> mmap = new MemoryMappedFile(file_path);
         ScopedPhase phase(ProfilerPhase::LoadGeometry);
-
-        // Temporary buffers for vertices and radius
-        std::vector<InputPoint3f> vertices;
-        std::vector<InputFloat> radius;
-        ScalarSize vertex_guess = (ScalarSize) mmap->size() / 100;
-        vertices.reserve(vertex_guess);
-        radius.reserve(vertex_guess);
-
-        // Load data from the given file
-        const char *ptr = (const char *) mmap->data();
-        const char *eof = ptr + mmap->size();
-        char buf[1025];
         Timer timer;
 
-        size_t segment_count = 0;
-        std::vector<size_t> curve_1st_idx;
-        curve_1st_idx.reserve(vertex_guess / 4);
-        bool new_curve = true;
+        constexpr JitBackend Backend = dr::backend_v<Float>;
 
-        auto finish_curve = [&]() {
-            if (!new_curve) {
-                size_t num_control_points = vertices.size() - curve_1st_idx[curve_1st_idx.size() - 1];
-                if (unlikely((num_control_points < 2) && (num_control_points > 0)))
-                    fail("Linear curves must have at least two control points!");
-                if (likely(num_control_points > 0))
-                    segment_count += (num_control_points - 1);
-            }
-        };
+        CurveData data = load_curves(Backend, props, m_to_world.scalar(), 2);
+        m_control_point_count = (ScalarSize) data.control_point_count();
 
-        while (ptr < eof) {
-            // Determine the offset of the next newline
-            const char *next = ptr;
-            advance<false>(&next, eof, "\n");
-
-            // Copy buf into a 0-terminated buffer
-            ScalarSize size = (ScalarSize) (next - ptr);
-            if (size >= sizeof(buf) - 1)
-                fail("file contains an excessively long line! (%i characters)!", size);
-            memcpy(buf, ptr, size);
-            buf[size] = '\0';
-
-            // Skip whitespace(s)
-            const char *cur = buf, *eol = buf + size;
-            advance<true>(&cur, eol, " \t\r");
-            bool parse_error = false;
-
-            // Empty line
-            if (*cur == '\0') {
-                finish_curve();
-                new_curve = true;
-                ptr = next + 1;
-                continue;
-            }
-
-            // Handle current line: v.x v.y v.z radius
-            if (new_curve) {
-                curve_1st_idx.push_back(vertices.size());
-                new_curve = false;
-            }
-
-            // Vertex position
-            InputPoint3f p;
-            for (ScalarSize i = 0; i < 3; ++i) {
-                const char *orig = cur;
-                p[i] = string::strtof<InputFloat>(cur, (char **) &cur);
-                parse_error |= cur == orig;
-            }
-            p = m_to_world.scalar() * p;
-
-            // Vertex radius
-            InputFloat r;
-            const char *orig = cur;
-            r = string::strtof<InputFloat>(cur, (char **) &cur);
-            parse_error |= cur == orig;
-
-            if (unlikely(!all(dr::isfinite(p))))
-                fail("Control point contains invalid position data (line: \"%s\")!", buf);
-            if (unlikely(!dr::isfinite(r)))
-                fail("Control point contains invalid radius data (line: \"%s\")!", buf);
-
-            vertices.push_back(p);
-            radius.push_back(r);
-
-            if (unlikely(parse_error))
-                fail("Could not parse line \"%s\"!", buf);
-            ptr = next + 1;
-        }
-        if (curve_1st_idx.size() == 0)
-            fail("Empty curve file: no control points were read!");
-        finish_curve();
-
-        m_control_point_count = (ScalarSize) vertices.size();
-
-        std::unique_ptr<ScalarIndex[]> indices = std::make_unique<ScalarIndex[]>(segment_count);
+        // Every curve with n control points contributes n - 1 segments
+        size_t curve_count = data.curve_count(),
+               segment_count = m_control_point_count - curve_count;
+        drjit::unique_buffer<ScalarIndex> indices(Backend, segment_count,
+                                                  /* shared = */ true);
         size_t segment_index = 0;
-        for (size_t i = 0; i < curve_1st_idx.size(); ++i) {
-            size_t next_curve_idx = i + 1 < curve_1st_idx.size() ? curve_1st_idx[i + 1] : vertices.size();
-            size_t curve_segment_count = next_curve_idx - curve_1st_idx[i] - 1;
-            for (size_t j = 0; j < curve_segment_count; ++j)
-                indices[segment_index++] = (ScalarIndex) (curve_1st_idx[i] + j);
-        }
-        m_indices = dr::load<UInt32Storage>(indices.get(), segment_count);
+        for (size_t i = 0; i < curve_count; ++i)
+            for (uint32_t j = data.offsets[i]; j + 1 < data.offsets[i + 1]; ++j)
+                indices[segment_index++] = (ScalarIndex) j;
 
-        std::unique_ptr<InputFloat[]> positions =
-            std::make_unique<InputFloat[]>(m_control_point_count * 3);
-        for (ScalarIndex i = 0; i < vertices.size(); i++) {
-            InputFloat *vertex_ptr = positions.get() + i * 3;
-            dr::store(vertex_ptr, vertices[i]);
-        }
+        // Reduce on the host while the control points are still staged there
+        m_bbox = reduce_bbox_host<ScalarPoint3f, 4, 3>(
+            data.control_points.data(), m_control_point_count);
 
-        // Merge buffers into m_control_points
-        m_control_points = dr::empty<FloatStorage>(m_control_point_count * 4);
-        FloatStorage vertex_buffer = dr::load<FloatStorage>(positions.get(), m_control_point_count * 3);
-        FloatStorage radius_buffer = dr::load<FloatStorage>(radius.data(), m_control_point_count * 1);
+        m_indices = adopt<UInt32Storage>(indices);
+        m_control_points = adopt<FloatStorage>(data.control_points);
 
-        if constexpr (dr::is_jit_v<Float>) {
-            DynamicBuffer<UInt32> idx = dr::arange<DynamicBuffer<UInt32>>(m_control_point_count);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(vertex_buffer, idx * 3u + 0u), idx * 4u + 0u);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(vertex_buffer, idx * 3u + 1u), idx * 4u + 1u);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(vertex_buffer, idx * 3u + 2u), idx * 4u + 2u);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(radius_buffer, idx * 1u + 0u), idx * 4u + 3u);
-        } else {
-            for (size_t i = 0; i < m_control_point_count; ++i) {
-                m_control_points[i * 4 + 0] = vertex_buffer[i * 3 + 0];
-                m_control_points[i * 4 + 1] = vertex_buffer[i * 3 + 1];
-                m_control_points[i * 4 + 2] = vertex_buffer[i * 3 + 2];
-                m_control_points[i * 4 + 3] = radius_buffer[i * 1 + 0];
-            }
-        }
-
-        // Compute bounding box
-        m_bbox.reset();
-        for (ScalarSize i = 0; i < m_control_point_count; ++i) {
-            ScalarPoint3f p(positions[3 * i + 0], positions[3 * i + 1],
-                            positions[3 * i + 2]);
-            ScalarFloat r(radius[i]);
-            m_bbox.expand(p + r * ScalarVector3f(-1, 0, 0));
-            m_bbox.expand(p + r * ScalarVector3f(1, 0, 0));
-            m_bbox.expand(p + r * ScalarVector3f(0, -1, 0));
-            m_bbox.expand(p + r * ScalarVector3f(0, 1, 0));
-            m_bbox.expand(p + r * ScalarVector3f(0, 0, -1));
-            m_bbox.expand(p + r * ScalarVector3f(0, 0, 1));
-        }
-
-        ScalarSize control_point_bytes = 4 * sizeof(InputFloat);
         Log(Debug, "\"%s\": read %i control points (%s in %s)",
-            m_name, m_control_point_count,
-            util::mem_string(m_control_point_count * control_point_bytes),
+            data.name, m_control_point_count,
+            util::mem_string(m_control_point_count * 4 * sizeof(InputFloat)),
             util::time_string((float) timer.value())
         );
 
@@ -322,19 +197,18 @@ public:
     SurfaceInteraction3f compute_surface_interaction(const Ray3f &ray,
                                                      const PreliminaryIntersection3f &pi,
                                                      uint32_t ray_flags,
-                                                     uint32_t recursion_depth,
                                                      Mask active) const override {
         MI_MASK_ARGUMENT(active);
 
-        // Early exit when tracing isn't necessary
-        if (!m_is_instance && recursion_depth > 0)
-            return dr::zeros<SurfaceInteraction3f>();
+        bool shading = has_flag(ray_flags, RayFlags::Shading);
 
-        bool need_uv = has_flag(ray_flags, RayFlags::UV);
+        // If necessary, temporally suspend gradient tracking for all shape
+        // parameters to construct a surface interaction completely detached
+        // from the shape.
+        dr::suspend_grad<Float> scope(
+            has_flag(ray_flags, RayFlags::DetachShape), m_control_points);
 
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
-        si.t = dr::select(active, pi.t, dr::Infinity<Float>);
-        si.p = ray(pi.t);
 
         Float v_local = pi.prim_uv.x();
         UInt32 prim_idx = pi.prim_index;
@@ -349,20 +223,54 @@ public:
         Point3f p0 = Point3f(c0.x(), c0.y(), c0.z()),
                 p1 = Point3f(c1.x(), c1.y(), c1.z());
 
+        Vector3f axis = dr::normalize(p1 - p0);
+
         Vector3f u_rot, u_rad;
-        std::tie(u_rot, u_rad) = local_frame(dr::normalize(p1 - p0));
+        std::tie(u_rot, u_rad) = local_frame(axis);
 
         Point3f c = p0 * (1.f - v_local) + p1 * v_local;
-        si.n = si.sh_frame.n = dr::normalize(si.p - c);
+
+        si.t = pi.t;
+        si.p = dr::detach(ray(pi.t));
+
+        Vector3f rad_vec_d = si.p - dr::detach(c);
+        si.n = dr::normalize(rad_vec_d);
+        si.p_err = ray_error(ray, pi.t, si.n);
+
+        // Surface position at the detached parameterization: the offset from the
+        // center line is held fixed in the curve's frame, so that it rotates
+        // along with the segment.
+        Point3f p_att = c + dr::dot(rad_vec_d, dr::detach(u_rad)) * u_rad +
+                            dr::dot(rad_vec_d, dr::detach(u_rot)) * u_rot +
+                            dr::dot(rad_vec_d, dr::detach(axis))  * axis;
+
+        si.attach_motion(ray, p_att, ray_flags);
+
+        if constexpr (dr::is_diff_v<Float>) {
+            if (!has_flag(ray_flags, RayFlags::FollowShape)) {
+                // Let the curve parameter follow the sliding of the interaction
+                // point across the moving surface
+                Vector3f dp_dv = dr::detach(
+                    (p1 - p0) + (c1.w() - c0.w()) * dr::normalize(rad_vec_d));
+
+                v_local = dr::replace_grad(
+                    v_local, v_local + dr::dot(si.p - p_att, dp_dv) /
+                                           dr::squared_norm(dp_dv));
+
+                // Recompute the center line with the correct motion
+                c = p0 * (1.f - v_local) + p1 * v_local;
+            }
+        }
+
+        si.n = dr::normalize(si.p - c);
 
         // Embree and OptiX cull linear-curve backfaces at trace time; Metal's
         // HW intersector reports both sides. Drop inside hits to match (a no-op
         // on backends that already cull).
         this->cull_backface(si, ray, active);
 
-        if (need_uv) {
-            Vector3f rad_vec = si.p - c;
-            Vector3f rad_vec_normalized = dr::normalize(rad_vec);
+        if (shading) {
+            Vector3f rad_vec_normalized = dr::normalize(si.p - c);
 
             Float u = dr::atan2(dr::dot(u_rot, rad_vec_normalized),
                                 dr::dot(u_rad, rad_vec_normalized));
@@ -371,11 +279,21 @@ public:
             Float v = (v_local + prim_idx) / dr::width(m_indices);
 
             si.uv = Point2f(u, v);
+
+            // Tangents of the (u, v) parameterization: ``u`` runs around the
+            // curve, ``v`` along all segments.
+            Float segment_count = (Float) dr::width(m_indices);
+            si.dp_du = dr::TwoPi<Float> * dr::cross(axis, si.p - c);
+            si.dp_dv = segment_count *
+                       ((p1 - p0) + (c1.w() - c0.w()) * rad_vec_normalized);
+
+            si.sh_frame.n = si.n;
+            si.sh_frame.s = si.dp_du;
         }
 
         si.prim_index = pi.prim_index;
         si.shape    = this;
-        si.instance = nullptr;
+        si.instance_index = 0;
 
         return si;
     }
@@ -425,44 +343,11 @@ public:
     MI_DECLARE_CLASS(LinearCurve)
 
 private:
-    template <bool Negate, ScalarSize N>
-    void advance(const char **start_, const char *end, const char (&delim)[N]) {
-        const char *start = *start_;
-
-        while (true) {
-            bool is_delim = false;
-            for (ScalarSize i = 0; i < N; ++i)
-                if (*start == delim[i])
-                    is_delim = true;
-            if ((is_delim ^ Negate) || start == end)
-                break;
-            ++start;
-        }
-
-        *start_ = start;
-    }
-
     void recompute_bbox() {
-        m_bbox.reset();
-        if (m_control_point_count == 0)
-            return;
-
-        if constexpr (dr::is_jit_v<Float>) {
-            m_bbox = device_reduce_bbox<ScalarPoint3f>(
-                m_control_points, m_control_point_count, 4, /* radius_offset = */ 3);
-        } else {
-            const InputFloat *ptr = m_control_points.data();
-            for (ScalarSize i = 0; i < m_control_point_count; ++i) {
-                ScalarPoint3f p(ptr[4 * i + 0], ptr[4 * i + 1], ptr[4 * i + 2]);
-                ScalarFloat r(ptr[4 * i + 3]);
-                m_bbox.expand(p + r * ScalarVector3f(-1, 0, 0));
-                m_bbox.expand(p + r * ScalarVector3f(1, 0, 0));
-                m_bbox.expand(p + r * ScalarVector3f(0, -1, 0));
-                m_bbox.expand(p + r * ScalarVector3f(0, 1, 0));
-                m_bbox.expand(p + r * ScalarVector3f(0, 0, -1));
-                m_bbox.expand(p + r * ScalarVector3f(0, 0, 1));
-            }
-        }
+        m_bbox = reduce_bbox<
+            /* Type = */ ScalarPoint3f,
+            /* Stride = */ 4,
+            /* RadiusOffset = */ 3>(m_control_points, m_control_point_count);
     }
 
     std::tuple<Vector3f, Vector3f>

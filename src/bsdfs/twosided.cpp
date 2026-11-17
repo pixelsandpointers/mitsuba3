@@ -99,13 +99,37 @@ public:
             m_flags = m_flags | m_components.back();
         }
 
-        if (!props.get<bool>("allow_transmission", false) && has_flag(m_flags, BSDFFlags::Transmission))
+        if (!props.get<bool>("allow_transmission", false) && this->has_flag(BSDFFlags::Transmission))
             Throw("Only materials without a transmission component can be nested!");
     }
 
     void traverse(TraversalCallback *cb) override {
         cb->put("brdf_0", m_brdf[0], ParamFlags::Differentiable);
         cb->put("brdf_1", m_brdf[1], ParamFlags::Differentiable);
+    }
+
+    /// Geometric normal in the shading frame, flipped to the side of the
+    /// shading normal
+    static Vector3f local_normal(const SurfaceInteraction3f &si) {
+        Vector3f n = si.to_local(si.n);
+        return dr::mulsign(n, n.z());
+    }
+
+    /// Test via the geometric normal if ``si.wi`` arrives on the back side.
+    static Mask on_back_side(const SurfaceInteraction3f &si, const Vector3f &n) {
+        return dr::dot(n, si.wi) < 0.f;
+    }
+
+    static void to_front(SurfaceInteraction3f &si) {
+        si.wi.z() = dr::abs(si.wi.z());
+    }
+
+    /// Do ``si.wi`` and ``wo`` lie on the same geometric side? Always true
+    /// when the nested model transmits.
+    Mask same_side(const Vector3f &n, const Vector3f &wo, Mask back) const {
+        if (this->has_flag(BSDFFlags::Transmission))
+            return true;
+        return (dr::dot(n, wo) < 0.f) == back;
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx_,
@@ -120,14 +144,15 @@ public:
         SurfaceInteraction3f si(si_);
         BSDFContext ctx(ctx_);
         Result result = dr::zeros<Result>();
+        Vector3f n = local_normal(si);
+        Mask back = on_back_side(si, n);
+        to_front(si);
 
         if (m_brdf[0] == m_brdf[1]) {
-            si.wi.z() = dr::abs(si.wi.z());
             result = m_brdf[0]->sample(ctx, si, sample1, sample2, active);
-            result.first.wo.z() = dr::mulsign(result.first.wo.z(), si_.wi.z());
         } else {
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
+            Mask front_side = !back && active,
+                 back_side  = back && active;
 
             if (dr::any_or<true>(front_side))
                 dr::masked(result, front_side) =
@@ -137,12 +162,17 @@ public:
                 if (ctx.component != (uint32_t) -1)
                     ctx.component -= (uint32_t) m_brdf[0]->component_count();
 
-                si.wi.z() *= -1.f;
                 dr::masked(result, back_side) =
                     m_brdf[1]->sample(ctx, si, sample1, sample2, back_side);
-                dr::masked(result.first.wo.z(), back_side) *= -1.f;
             }
         }
+
+        // Directions sampled on the back leave through the back
+        dr::masked(result.first.wo.z(), back) *= -1.f;
+
+        Mask invalid = active && !same_side(n, result.first.wo, back);
+        dr::masked(result.first.pdf, invalid) = 0.f;
+        dr::masked(result.second, invalid) = 0.f;
 
         return result;
     }
@@ -155,14 +185,18 @@ public:
         BSDFContext ctx(ctx_);
         Vector3f wo(wo_);
         Spectrum result = 0.f;
+        Vector3f n = local_normal(si);
+        Mask back = on_back_side(si, n),
+             valid = same_side(n, wo_, back);
+        active &= valid;
+        to_front(si);
+        dr::masked(wo.z(), back) *= -1.f;
 
         if (m_brdf[0] == m_brdf[1]) {
-            wo.z() = dr::mulsign(wo.z(), si.wi.z());
-            si.wi.z() = dr::abs(si.wi.z());
             result = m_brdf[0]->eval(ctx, si, wo, active);
         } else {
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
+            Mask front_side = !back && active,
+                 back_side  = back && active;
 
             if (dr::any_or<true>(front_side))
                 result = m_brdf[0]->eval(ctx, si, wo, front_side);
@@ -171,15 +205,12 @@ public:
                 if (ctx.component != (uint32_t) -1)
                     ctx.component -= (uint32_t) m_brdf[0]->component_count();
 
-                si.wi.z() *= -1.f;
-                wo.z() *= -1.f;
-
                 dr::masked(result, back_side) =
                     m_brdf[1]->eval(ctx, si, wo, back_side);
             }
         }
 
-        return result;
+        return dr::select(valid, result, Spectrum(0.f));
     }
 
     Float pdf(const BSDFContext &ctx_, const SurfaceInteraction3f &si_,
@@ -190,14 +221,18 @@ public:
         BSDFContext ctx(ctx_);
         Vector3f wo(wo_);
         Float result = 0.f;
+        Vector3f n = local_normal(si);
+        Mask back = on_back_side(si, n),
+             valid = same_side(n, wo_, back);
+        active &= valid;
+        to_front(si);
+        dr::masked(wo.z(), back) *= -1.f;
 
         if (m_brdf[0] == m_brdf[1]) {
-            wo.z() = dr::mulsign(wo.z(), si.wi.z());
-            si.wi.z() = dr::abs(si.wi.z());
             result = m_brdf[0]->pdf(ctx, si, wo, active);
         } else {
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
+            Mask front_side = !back && active,
+                 back_side  = back && active;
 
             if (dr::any_or<true>(front_side))
                 result = m_brdf[0]->pdf(ctx, si, wo, front_side);
@@ -206,14 +241,11 @@ public:
                 if (ctx.component != (uint32_t) -1)
                     ctx.component -= (uint32_t) m_brdf[0]->component_count();
 
-                si.wi.z() *= -1.f;
-                wo.z() *= -1.f;
-
                 dr::masked(result, back_side) = m_brdf[1]->pdf(ctx, si, wo, back_side);
             }
         }
 
-        return result;
+        return dr::select(valid, result, Float(0.f));
     }
 
     std::pair<Spectrum, Float> eval_pdf(const BSDFContext &ctx_,
@@ -228,14 +260,18 @@ public:
 
         Spectrum value = 0.f;
         Float pdf = 0.f;
+        Vector3f n = local_normal(si);
+        Mask back = on_back_side(si, n),
+             valid = same_side(n, wo_, back);
+        active &= valid;
+        to_front(si);
+        dr::masked(wo.z(), back) *= -1.f;
 
         if (m_brdf[0] == m_brdf[1]) {
-            wo.z() = dr::mulsign(wo.z(), si.wi.z());
-            si.wi.z() = dr::abs(si.wi.z());
             std::tie(value, pdf) = m_brdf[0]->eval_pdf(ctx, si, wo, active);
         } else {
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
+            Mask front_side = !back && active,
+                 back_side  = back && active;
 
             if (dr::any_or<true>(front_side))
                 std::tie(value, pdf) = m_brdf[0]->eval_pdf(ctx, si, wo, front_side);
@@ -244,9 +280,6 @@ public:
                 if (ctx.component != (uint32_t) -1)
                     ctx.component -= (uint32_t) m_brdf[0]->component_count();
 
-                si.wi.z() *= -1.f;
-                wo.z() *= -1.f;
-
                 auto [back_value, back_pdf] = m_brdf[1]->eval_pdf(ctx, si, wo, back_side);
 
                 dr::masked(value, back_side) = back_value;
@@ -254,56 +287,52 @@ public:
             }
         }
 
-        return { value, pdf };
+        return { dr::select(valid, value, Spectrum(0.f)),
+                 dr::select(valid, pdf, Float(0.f)) };
     }
 
-    Spectrum eval_null_transmission(const SurfaceInteraction3f &si_, Mask active) const override {
+    /// Evaluate a side-dependent quantity of the nested models
+    template <typename Result, typename Func>
+    Result per_side(const SurfaceInteraction3f &si_, Mask active,
+                    Func &&func) const {
         SurfaceInteraction3f si(si_);
+        Mask back = on_back_side(si, local_normal(si));
+        to_front(si);
 
-        if (m_brdf[0] == m_brdf[1]) {
-            si.wi.z() = dr::abs(si.wi.z());
-            return m_brdf[0]->eval_null_transmission(si, active);
-        } else {
-            Spectrum result = 0.f;
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
+        if (m_brdf[0] == m_brdf[1])
+            return func(m_brdf[0], si, active);
 
-            if (dr::any_or<true>(front_side))
-                result = m_brdf[0]->eval_null_transmission(si, front_side);
+        Result result = dr::zeros<Result>();
+        Mask front_side = !back && active,
+             back_side  = back && active;
 
-            if (dr::any_or<true>(back_side)) {
-                si.wi.z() *= -1.f;
-                dr::masked(result, back_side) =
-                    m_brdf[1]->eval_null_transmission(si, back_side);
-            }
+        if (dr::any_or<true>(front_side))
+            result = func(m_brdf[0], si, front_side);
 
-            return result;
-        }
+        if (dr::any_or<true>(back_side))
+            dr::masked(result, back_side) = func(m_brdf[1], si, back_side);
+
+        return result;
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si_,
-                                      Mask active) const override {
-        SurfaceInteraction3f si(si_);
+    Spectrum eval_null(const SurfaceInteraction3f &si, Mask active) const override {
+        return per_side<Spectrum>(si, active,
+            [](const Base *bsdf, const SurfaceInteraction3f &si, Mask active) {
+                return bsdf->eval_null(si, active);
+            });
+    }
 
-        if (m_brdf[0] == m_brdf[1]) {
-            si.wi.z() = dr::abs(si.wi.z());
-            return m_brdf[0]->eval_diffuse_reflectance(si, active);
-        } else {
-            Spectrum result = 0.f;
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
-
-            if (dr::any_or<true>(front_side))
-                result = m_brdf[0]->eval_diffuse_reflectance(si, front_side);
-
-            if (dr::any_or<true>(back_side)) {
-                si.wi.z() *= -1.f;
-                dr::masked(result, back_side) =
-                    m_brdf[1]->eval_diffuse_reflectance(si, back_side);
-            }
-
-            return result;
-        }
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        BSDFFeatures3f features = per_side<BSDFFeatures3f>(si, active,
+            [](const Base *bsdf, const SurfaceInteraction3f &si, Mask active) {
+                return bsdf->eval_features(si, active);
+            });
+        // The nested BSDF saw the back side mirrored to the front
+        Vector3f n = si.sh_frame.n;
+        dr::masked(features.wt, on_back_side(si, local_normal(si))) =
+            dr::fmadd(n, -2.f * dr::dot(features.wt, n), features.wt);
+        return features;
     }
 
     Mask has_attribute(const std::string &name, Mask active) const override {
@@ -315,78 +344,30 @@ public:
     }
 
     UnpolarizedSpectrum eval_attribute(const std::string &name,
-                                       const SurfaceInteraction3f &si_,
+                                       const SurfaceInteraction3f &si,
                                        Mask active) const override {
-        SurfaceInteraction3f si(si_);
-        if (m_brdf[0] == m_brdf[1]) {
-            si.wi.z() = dr::abs(si.wi.z());
-            return m_brdf[0]->eval_attribute(name, si, active);
-        } else {
-            UnpolarizedSpectrum result = 0.f;
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
-
-            if (dr::any_or<true>(front_side))
-                result = m_brdf[0]->eval_attribute(name, si, front_side);
-
-            if (dr::any_or<true>(back_side)) {
-                si.wi.z() *= -1.f;
-                dr::masked(result, back_side) =
-                    m_brdf[1]->eval_attribute(name, si, back_side);
-            }
-
-            return result;
-        }
+        return per_side<UnpolarizedSpectrum>(si, active,
+            [&name](const Base *bsdf, const SurfaceInteraction3f &si, Mask active) {
+                return bsdf->eval_attribute(name, si, active);
+            });
     }
 
     Float eval_attribute_1(const std::string &name,
-                           const SurfaceInteraction3f &si_,
+                           const SurfaceInteraction3f &si,
                            Mask active) const override {
-        SurfaceInteraction3f si(si_);
-        if (m_brdf[0] == m_brdf[1]) {
-            si.wi.z() = dr::abs(si.wi.z());
-            return m_brdf[0]->eval_attribute_1(name, si, active);
-        } else {
-            Float result = 0.f;
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
-
-            if (dr::any_or<true>(front_side))
-                result = m_brdf[0]->eval_attribute_1(name, si, front_side);
-
-            if (dr::any_or<true>(back_side)) {
-                si.wi.z() *= -1.f;
-                dr::masked(result, back_side) =
-                    m_brdf[1]->eval_attribute_1(name, si, back_side);
-            }
-
-            return result;
-        }
+        return per_side<Float>(si, active,
+            [&name](const Base *bsdf, const SurfaceInteraction3f &si, Mask active) {
+                return bsdf->eval_attribute_1(name, si, active);
+            });
     }
 
     Color3f eval_attribute_3(const std::string &name,
-                            const SurfaceInteraction3f &si_,
+                            const SurfaceInteraction3f &si,
                             Mask active) const override {
-        SurfaceInteraction3f si(si_);
-        if (m_brdf[0] == m_brdf[1]) {
-            si.wi.z() = dr::abs(si.wi.z());
-            return m_brdf[0]->eval_attribute_3(name, si, active);
-        } else {
-            Color3f result = 0.f;
-            Mask front_side = Frame3f::cos_theta(si.wi) > 0.f && active,
-                 back_side  = Frame3f::cos_theta(si.wi) < 0.f && active;
-
-            if (dr::any_or<true>(front_side))
-                result = m_brdf[0]->eval_attribute_3(name, si, front_side);
-
-            if (dr::any_or<true>(back_side)) {
-                si.wi.z() *= -1.f;
-                dr::masked(result, back_side) =
-                    m_brdf[1]->eval_attribute_3(name, si, back_side);
-            }
-
-            return result;
-        }
+        return per_side<Color3f>(si, active,
+            [&name](const Base *bsdf, const SurfaceInteraction3f &si, Mask active) {
+                return bsdf->eval_attribute_3(name, si, active);
+            });
     }
 
     std::string to_string() const override {

@@ -11,6 +11,7 @@
 #include <drjit/texture.h>
 #include <mitsuba/render/fwd.h>
 #include <mitsuba/core/fstream.h>
+#include "portal.h"
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -40,8 +41,8 @@ Environment emitter (:monosp:`envmap`)
    - |exposed|, |differentiable|
 
  * - to_world
-   - |transform|
-   - Specifies an optional emitter-to-world transformation.  (Default: none, i.e. emitter space = world space)
+   - |transform| or |animation|
+   - Specifies an optional emitter-to-world transformation (can be animated).  (Default: none, i.e. emitter space = world space)
    - |exposed|
 
  * - mis_compensation
@@ -49,6 +50,11 @@ Environment emitter (:monosp:`envmap`)
    - Compensate sampling for the presence of other Monte Carlo techniques that
      will be combined using multiple importance sampling (MIS)? This is
      extremely cheap to do and can slightly reduce variance. (Default: false)
+
+ * - visibility
+   - |string|
+   - Which rays see the emitter (see the :ref:`visibility section
+     <sec-shape-visibility>`). (Default: ``all``)
 
  * - data
    - |tensor|
@@ -80,6 +86,10 @@ High quality free light probes are available on
 `Bernhard Vogl's <http://dativ.at/lightprobes/>`_ website or
 `Polyhaven <https://polyhaven.com/hdris>`_.
 
+When the scene contains light portals (see the :ref:`portal <emitter-portal>`
+plugin), this emitter samples directions through them with the probability
+given by the scene's :monosp:`portal_weight` parameter.
+
 .. tabs::
     .. code-tab:: xml
         :name: envmap-light
@@ -98,7 +108,8 @@ High quality free light probes are available on
 template <typename Float, typename Spectrum>
 class EnvironmentMapEmitter final : public Emitter<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Emitter, m_flags, m_to_world)
+    MI_IMPORT_BASE(Emitter, m_flags, m_to_world, world_transform,
+                   traverse_world_transform)
     MI_IMPORT_TYPES(Scene, Shape, Texture)
 
     using Warp = Hierarchical2D<Float, 0>;
@@ -174,7 +185,7 @@ public:
                     // is 50%, which generally yields a fairly smooth spectrum.
                     ScalarFloat scale = dr::max(rgb) * 2.f;
                     ScalarColor3f rgb_norm = rgb / dr::maximum(1e-8f, scale);
-                    coeff = dr::concat((ScalarColor3f) srgb_model_fetch(rgb_norm),
+                    coeff = dr::concat((ScalarColor3f) SRGBModel<Float, Spectrum>::fetch(rgb_norm),
                                        dr::Array<ScalarFloat, 1>(scale));
                 }
 
@@ -186,13 +197,12 @@ public:
 
         refresh_halo((ScalarFloat *) bitmap_2->data(), m_res);
 
-        size_t shape[3] = { (size_t) m_res.y(), (size_t) sw, (size_t) PixelWidth };
-        TensorXf tensor(bitmap_2->data(), 3, shape);
+        TensorXf tensor(bitmap_2->data(), { (size_t) m_res.y(), (size_t) sw,
+                                            (size_t) PixelWidth });
         m_texture = Tex(tensor, /* use_accel = */ true,
-                        /* migrate = */ dr::is_jit_v<Float>,
                         dr::FilterMode::Linear, dr::WrapMode::Clamp);
 
-        m_scale = props.get<ScalarFloat>("scale", 1.f);
+        m_scale = dr::opaque<Float>(props.get<ScalarFloat>("scale", 1.f));
         m_mis_compensation = props.get<bool>("mis_compensation", false);
         m_d65 = Texture::D65(1.f);
         m_flags = EmitterFlags::Infinite | EmitterFlags::SpatiallyVarying;
@@ -204,7 +214,7 @@ public:
         Base::traverse(cb);
         cb->put("scale",     m_scale,               ParamFlags::Differentiable);
         cb->put("data",      m_texture.tensor(),    ParamFlags::Differentiable | ParamFlags::Discontinuous);
-        cb->put("to_world",  m_to_world,            ParamFlags::NonDifferentiable);
+        traverse_world_transform(cb);
     }
 
     void parameters_changed(const std::vector<std::string> &keys = {}) override {
@@ -240,8 +250,9 @@ public:
                 dr::scatter(corrected, dr::gather<PixelData>(array, row + 1u),
                             row + (m_res.x() + 1u));
 
-                size_t shape[3] = { (size_t) m_res.y(), (size_t) sw, (size_t) PixelWidth };
-                m_texture.set_tensor(TensorXf(corrected, 3, shape), /* migrate */ true);
+                m_texture.set_tensor(
+                    TensorXf(corrected, { (size_t) m_res.y(), (size_t) sw,
+                                          (size_t) PixelWidth }));
             } else {
                 refresh_halo((ScalarFloat *) tensor.array().data(), m_res);
                 m_texture.update_inplace();
@@ -253,6 +264,7 @@ public:
 
             rebuild_distribution((ScalarFloat *) data.data());
         }
+        dr::make_opaque(m_scale);
         Base::parameters_changed(keys);
     }
 
@@ -270,12 +282,13 @@ public:
         }
 
         dr::make_opaque(m_bsphere.center, m_bsphere.radius);
+        m_portals.set_scene(scene);
     }
 
     Spectrum eval(const SurfaceInteraction3f &si, Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
 
-        Vector3f v = m_to_world.value().inverse() * (-si.wi);
+        Vector3f v = world_transform(si.time).inverse() * (-si.wi);
 
         Point2f uv = direction_to_uv(v);
 
@@ -301,8 +314,8 @@ public:
         Vector3f d = uv_to_direction(uv, inv_sin_theta);
         pdf *= inv_sin_theta * dr::InvTwoPi<Float> * dr::InvPi<Float>;
 
-        // Unlike \ref sample_direction, ray goes from the envmap toward the scene
-        Vector3f d_global = m_to_world.value() * -d;
+        // Unlike `sample_direction()`, ray goes from the envmap toward the scene
+        Vector3f d_global = world_transform(time) * -d;
 
         // Compute ray origin
         Vector3f perpendicular_offset =
@@ -331,29 +344,38 @@ public:
                      Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleDirection, active);
 
-        auto [uv, pdf] = m_warp.sample(sample, nullptr, active);
+        auto choice = m_portals.choose(it.p, sample);
+        auto [uv, pdf] = m_warp.sample(choice.sample, nullptr, active);
         uv.x() += half_texel();
-        active &= pdf > 0.f;
 
         Float inv_sin_theta;
         Vector3f d = uv_to_direction(uv, inv_sin_theta);
+        pdf *= inv_sin_theta * (1.f / (2.f * dr::square(dr::Pi<Float>)));
+
+        AffineTransform4f to_world = world_transform(it.time);
+        d = to_world * d;
+
+        if (!m_portals.empty()) {
+            Vector3f d_portal = m_portals.sample(it.p, choice),
+                     d_local  = to_world.inverse() * d_portal;
+            dr::masked(d, choice.use_portal)   = d_portal;
+            dr::masked(uv, choice.use_portal)  = direction_to_uv(d_local);
+            dr::masked(pdf, choice.use_portal) = eval_pdf(d_local);
+            pdf = m_portals.pdf(it.p, d, pdf);
+        }
+
+        active &= pdf > 0.f;
 
         // Needed when the reference point is on the sensor, which is not part of the bbox
         Float radius = dr::maximum(m_bsphere.radius, dr::norm(it.p - m_bsphere.center));
         Float dist = 2.f * radius;
-
-        d = m_to_world.value() * d;
 
         DirectionSample3f ds;
         ds.p       = it.p + d * dist;
         ds.n       = -d;
         ds.uv      = uv;
         ds.time    = it.time;
-        ds.pdf     = dr::select(
-            active,
-            pdf * inv_sin_theta * (1.f / (2.f * dr::square(dr::Pi<Float>))),
-            0.f
-        );
+        ds.pdf     = dr::select(active, pdf, 0.f);
         ds.delta   = false;
         ds.emitter = this;
         ds.d       = d;
@@ -366,20 +388,12 @@ public:
         return { ds, weight & active };
     }
 
-    Float pdf_direction(const Interaction3f & /*it*/, const DirectionSample3f &ds,
+    Float pdf_direction(const Interaction3f &it, const DirectionSample3f &ds,
                         Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::EndpointEvaluate, active);
 
-        Vector3f d = m_to_world.value().inverse() * ds.d;
-
-        Point2f uv = direction_to_uv(d);
-        uv.x() -= half_texel();
-        uv -= dr::floor(uv);
-
-        Float inv_sin_theta = dr::safe_rsqrt(dr::maximum(
-            dr::square(d.x()) + dr::square(d.z()), dr::square(dr::Epsilon<Float>)));
-
-        return m_warp.eval(uv) * inv_sin_theta * (1.f / (2.f * dr::square(dr::Pi<Float>)));
+        Float pdf = eval_pdf(world_transform(ds.time).inverse() * ds.d);
+        return m_portals.empty() ? pdf : m_portals.pdf(it.p, ds.d, pdf);
     }
 
     Spectrum eval_direction(const Interaction3f &it,
@@ -445,10 +459,22 @@ protected:
         return Vector3f(sin_phi * sin_theta, cos_theta, -cos_phi * sin_theta);
     }
 
-    /// Inverse of \ref uv_to_direction (latitude-longitude texture coordinates)
+    /// Inverse of `uv_to_direction()` (latitude-longitude texture coordinates)
     Point2f direction_to_uv(const Vector3f &d) const {
         return Point2f(dr::atan2(d.x(), -d.z()) * dr::InvTwoPi<Float>,
                        dr::safe_acos(d.y()) * dr::InvPi<Float>);
+    }
+
+    /// Solid angle pdf of the importance map for a local-frame direction
+    Float eval_pdf(const Vector3f &d) const {
+        Point2f uv = direction_to_uv(d);
+        uv.x() -= half_texel();
+        uv -= dr::floor(uv);
+
+        Float inv_sin_theta = dr::safe_rsqrt(dr::maximum(
+            dr::square(d.x()) + dr::square(d.z()), dr::square(dr::Epsilon<Float>)));
+
+        return m_warp.eval(uv) * inv_sin_theta * (1.f / (2.f * dr::square(dr::Pi<Float>)));
     }
 
     /// Copy the real edge columns into the halo columns of a host-resident
@@ -601,8 +627,9 @@ protected:
     ref<Texture> m_d65;
     Float m_scale;
     bool m_mis_compensation;
+    PortalSampler<Float, Spectrum> m_portals;
 
-    MI_TRAVERSE_CB(Base, m_bsphere, m_texture, m_warp, m_d65, m_scale)
+    MI_TRAVERSE_CB(Base, m_bsphere, m_texture, m_warp, m_d65, m_scale, m_portals)
 };
 
 MI_EXPORT_PLUGIN(EnvironmentMapEmitter)

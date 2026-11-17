@@ -78,7 +78,8 @@ public:
         m_delta = props.get_unbounded_texture<Texture>("delta", 90.f);
         m_transmittance = props.get_texture<Texture>("transmittance", 1.f);
 
-        m_flags = BSDFFlags::FrontSide | BSDFFlags::BackSide | BSDFFlags::Null;
+        m_flags = BSDFFlags::FrontSide | BSDFFlags::BackSide | BSDFFlags::Null |
+                  BSDFFlags::Anisotropic;
         m_components.push_back(m_flags);
     }
 
@@ -116,13 +117,13 @@ public:
             // Get standard Mueller matrix for a linear polarizer.
             Spectrum M = mueller::linear_retarder(delta);
 
-            /* Rotate optical element by specified angle. The angle is flipped if
-               the element is intersected from the backside. */
+            // Rotate optical element by specified angle. The angle is flipped if
+            // the element is intersected from the backside.
             M = mueller::rotated_element(dr::sign(cos_theta) * theta, M);
 
-            /* The `forward` direction here is always along the direction that
-               light travels. This is needed for the coordinate system rotation
-               below. */
+            // The `forward` direction here is always along the direction that
+            // light travels. This is needed for the coordinate system rotation
+            // below.
             Vector3f forward = ctx.mode == TransportMode::Radiance ? si.wi : -si.wi;
 
             // Rotate in/out basis of M s.t. it aligns with BSDF coordinate frame
@@ -149,7 +150,7 @@ public:
         return 0.f;
     }
 
-    Spectrum eval_null_transmission(const SurfaceInteraction3f &si, Mask active) const override {
+    Spectrum eval_null(const SurfaceInteraction3f &si, Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::BSDFEvaluate, active);
 
         UnpolarizedSpectrum transmittance = m_transmittance->eval(si, active);
@@ -168,13 +169,13 @@ public:
             // Get standard Mueller matrix for a linear polarizer.
             Spectrum M = mueller::linear_retarder(delta);
 
-            /* Rotate optical element by specified angle. The angle is flipped if
-               the element is intersected from the backside. */
+            // Rotate optical element by specified angle. The angle is flipped if
+            // the element is intersected from the backside.
             M = mueller::rotated_element(dr::sign(cos_theta) * theta, M);
 
-            /* The `forward` direction here is always along the direction that
-               light travels. This is needed for the coordinate system rotation
-               below. */
+            // The `forward` direction here is always along the direction that
+            // light travels. This is needed for the coordinate system rotation
+            // below.
             Vector3f forward = si.wi;   // Note: Should be reversed for TransportMode::Importance.
 
             // Rotate in/out basis of M s.t. it aligns with BSDF coordinate frame

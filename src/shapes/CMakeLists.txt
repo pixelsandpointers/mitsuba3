@@ -2,7 +2,7 @@ set(MI_PLUGIN_PREFIX "shapes")
 
 add_plugin(obj          obj.cpp)
 add_plugin(ply          ply.cpp)
-add_plugin(blender      blender.cpp)
+add_plugin(packed       packed.cpp)
 add_plugin(serialized   serialized.cpp)
 
 add_plugin(cylinder     cylinder.cpp)
@@ -17,6 +17,7 @@ add_plugin(linearcurve  linearcurve.cpp)
 add_plugin(shapegroup   shapegroup.cpp)
 add_plugin(instance     instance.cpp)
 add_plugin(merge        merge.cpp)
+add_plugin(displace     displace.cpp)
 
 add_plugin(ellipsoids ellipsoids.cpp)
 add_plugin(ellipsoidsmesh ellipsoidsmesh.cpp)

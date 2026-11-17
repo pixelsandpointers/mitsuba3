@@ -60,6 +60,15 @@ Rough dielectric material (:monosp:`roughdielectric`)
      focuses computation on the visible parts of the microfacet normal distribution, considerably
      reducing variance in some cases. (Default: |true|, i.e. use visible normal sampling)
 
+ * - eta_scale
+   - |bool|
+   - Refraction compresses the solid angle of a ray bundle, which scales the radiance
+     crossing the interface by the squared ratio of the refractive indices. The plugin
+     applies this factor when tracing radiance. Some production renderers (incorrectly)
+     omit this scale, which can lead to inconsistencies, e.g., when rendering glass
+     panels with only one sheet. Set this flag to :monosp:`false` to emulate their
+     behavior. (Default: |true|)
+
  * - eta
    - |float|
    - Relative index of refraction from the exterior to the interior
@@ -196,6 +205,7 @@ public:
         }
 
         m_sample_visible = props.get<bool>("sample_visible", true);
+        m_eta_scale = props.get<bool>("eta_scale", true);
 
         if (props.has_property("alpha_u") || props.has_property("alpha_v")) {
             if (!props.has_property("alpha_u") || !props.has_property("alpha_v"))
@@ -209,20 +219,39 @@ public:
             m_alpha_u = m_alpha_v = props.get_unbounded_texture<Texture>("alpha", 0.1f);
         }
 
-        BSDFFlags extra = (m_alpha_u != m_alpha_v) ? BSDFFlags::Anisotropic : BSDFFlags(0);
+        uint32_t extra =
+            (m_alpha_u != m_alpha_v) ? (uint32_t) BSDFFlags::Anisotropic : 0u;
         m_components.push_back(BSDFFlags::GlossyReflection | BSDFFlags::FrontSide |
                                BSDFFlags::BackSide | extra);
-        m_components.push_back(BSDFFlags::GlossyTransmission | BSDFFlags::FrontSide |
-                               BSDFFlags::BackSide | BSDFFlags::NonSymmetric | extra);
+        uint32_t f = BSDFFlags::GlossyTransmission | BSDFFlags::FrontSide |
+                     BSDFFlags::BackSide | extra;
+        if (m_eta_scale)
+            f = f | BSDFFlags::NonSymmetric;
+        m_components.push_back(f);
         m_flags = m_components[0] | m_components[1];
 
         parameters_changed();
     }
 
+    /// Microfacet distribution matching the roughness at the surface position
+    MicrofacetDistribution distribution(const SurfaceInteraction3f &si,
+                                        Mask active) const {
+        if (m_uniform_alpha)
+            return m_distr;
+
+        Float alpha_u = m_alpha_u->eval_1(si, active);
+        if (m_alpha_u == m_alpha_v)
+            return MicrofacetDistribution(m_type, alpha_u, m_sample_visible);
+
+        return MicrofacetDistribution(m_type, alpha_u,
+                                      m_alpha_v->eval_1(si, active),
+                                      m_sample_visible);
+    }
+
     void traverse(TraversalCallback *cb) override {
         cb->put("eta", m_eta, ParamFlags::Differentiable | ParamFlags::Discontinuous);
 
-        if (!has_flag(m_flags, BSDFFlags::Anisotropic))
+        if (!this->has_flag(BSDFFlags::Anisotropic))
             cb->put("alpha", m_alpha_u, ParamFlags::Differentiable | ParamFlags::Discontinuous);
         else {
             cb->put("alpha_u", m_alpha_u, ParamFlags::Differentiable | ParamFlags::Discontinuous);
@@ -237,6 +266,16 @@ public:
     void parameters_changed(const std::vector<std::string> &/*keys*/ = {}) override {
         m_inv_eta = dr::rcp(m_eta);
         dr::make_opaque(m_eta, m_inv_eta);
+
+        // Uniform roughness yields a single distribution for the whole
+        // surface. Precomputing it keeps the reciprocals and normalization
+        // constant out of the rendering kernels.
+        m_uniform_alpha = false;
+        if (!m_alpha_u->is_spatially_varying() && !m_alpha_v->is_spatially_varying()) {
+            m_distr = distribution(dr::zeros<SurfaceInteraction3f>(), true);
+            dr::make_opaque(m_distr);
+            m_uniform_alpha = true;
+        }
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
@@ -257,15 +296,12 @@ public:
         // Ignore perfectly grazing configurations
         active &= cos_theta_i != 0.f;
 
-        /* Construct the microfacet distribution matching the roughness values at the current surface position. */
-        MicrofacetDistribution distr(m_type,
-                                     m_alpha_u->eval_1(si, active),
-                                     m_alpha_v->eval_1(si, active),
-                                     m_sample_visible);
+        // Construct the microfacet distribution matching the roughness values at the current surface position.
+        MicrofacetDistribution distr = distribution(si, active);
 
-        /* Trick by Walter et al.: slightly scale the roughness values to
-           reduce importance sampling weights. Not needed for the
-           Heitz and D'Eon sampling technique. */
+        // Trick by Walter et al.: slightly scale the roughness values to
+        // reduce importance sampling weights. Not needed for the
+        // Heitz and D'Eon sampling technique.
         MicrofacetDistribution sample_distr(distr);
         if (unlikely(!m_sample_visible))
             sample_distr.scale_alpha(1.2f - .2f * dr::sqrt(dr::abs(cos_theta_i)));
@@ -277,7 +313,7 @@ public:
         active &= bs.pdf != 0.f;
 
         auto [F, cos_theta_t, eta_it, eta_ti] =
-            fresnel(dr::dot(si.wi, m), m_eta);
+            fresnel(dr::dot(si.wi, m), m_eta, m_inv_eta);
 
         // Select the lobe to be sampled
         UnpolarizedSpectrum weight;
@@ -285,8 +321,8 @@ public:
         if (likely(has_reflection && has_transmission)) {
             selected_r = sample1 <= F && active;
             weight = 1.f;
-            /* For differentiable variants, lobe choice has to be detached to avoid bias.
-                Sampling weights should be computed accordingly. */
+            // For differentiable variants, lobe choice has to be detached to avoid bias.
+            // Sampling weights should be computed accordingly.
             if constexpr (dr::is_diff_v<Float>) {
                 if (dr::grad_enabled(F)) {
                     Float r_diff = dr::replace_grad(Float(1.f), F / dr::detach(F));
@@ -306,7 +342,9 @@ public:
 
         selected_t = !selected_r && active;
 
-        bs.eta               = dr::select(selected_r, Float(1.f), eta_it);
+        bs.eta               = m_eta_scale
+                                   ? dr::select(selected_r, Float(1.f), eta_it)
+                                   : Float(1.f);
         bs.sampled_component = dr::select(selected_r, UInt32(0), UInt32(1));
         bs.sampled_type      = dr::select(selected_r,
                                       UInt32(+BSDFFlags::GlossyReflection),
@@ -331,9 +369,10 @@ public:
             // Perfect specular transmission based on the microfacet normal
             bs.wo[selected_t]  = refract(si.wi, m, cos_theta_t, eta_ti);
 
-            /* For transmission, radiance must be scaled to account for the solid
-               angle compression that occurs when crossing the interface. */
-            UnpolarizedSpectrum factor = (ctx.mode == TransportMode::Radiance) ? dr::square(eta_ti) : Float(1.f);
+            // For transmission, radiance must be scaled to account for the solid
+            // angle compression that occurs when crossing the interface.
+            UnpolarizedSpectrum factor =
+                (ctx.mode == TransportMode::Radiance && m_eta_scale) ? dr::square(eta_ti) : Float(1.f);
 
             if (m_specular_transmittance)
                 factor *= m_specular_transmittance->eval(si, selected_t);
@@ -342,8 +381,8 @@ public:
 
             // Jacobian of the half-direction mapping
             dr::masked(dwh_dwo, selected_t) =
-                (dr::square(bs.eta) * dr::dot(bs.wo, m)) /
-                 dr::square(dr::dot(si.wi, m) + bs.eta * dr::dot(bs.wo, m));
+                (dr::square(eta_it) * dr::dot(bs.wo, m)) /
+                 dr::square(dr::dot(si.wi, m) + eta_it * dr::dot(bs.wo, m));
         }
 
         if (likely(m_sample_visible))
@@ -383,18 +422,15 @@ public:
         // Ensure that the half-vector points into the same hemisphere as the macrosurface normal
         m = dr::mulsign(m, Frame3f::cos_theta(m));
 
-        /* Construct the microfacet distribution matching the
-           roughness values at the current surface position. */
-        MicrofacetDistribution distr(m_type,
-                                     m_alpha_u->eval_1(si, active),
-                                     m_alpha_v->eval_1(si, active),
-                                     m_sample_visible);
+        // Construct the microfacet distribution matching the
+        // roughness values at the current surface position.
+        MicrofacetDistribution distr = distribution(si, active);
 
         // Evaluate the microfacet normal distribution
         Float D = distr.eval(m);
 
         // Fresnel factor
-        Float F = std::get<0>(fresnel(dr::dot(si.wi, m), m_eta));
+        Float F = std::get<0>(fresnel(dr::dot(si.wi, m), m_eta, m_inv_eta));
 
         // Smith's shadow-masking function
         Float G = distr.G(si.wi, wo, m);
@@ -414,10 +450,11 @@ public:
         }
 
         if (dr::any_or<true>(eval_t)) {
-            /* Missing term in the original paper: account for the solid angle
-               compression when tracing radiance -- this is necessary for
-               bidirectional methods. */
-            Float scale = (ctx.mode == TransportMode::Radiance) ? dr::square(inv_eta) : Float(1.f);
+            // Missing term in the original paper: account for the solid angle
+            // compression when tracing radiance -- this is necessary for
+            // bidirectional methods.
+            Float scale = (ctx.mode == TransportMode::Radiance && m_eta_scale)
+                              ? dr::square(inv_eta) : Float(1.f);
 
             // Compute the total amount of transmission
             UnpolarizedSpectrum value = dr::abs(
@@ -460,10 +497,10 @@ public:
         // Ensure that the half-vector points into the same hemisphere as the macrosurface normal
         m = dr::mulsign(m, Frame3f::cos_theta(m));
 
-        /* Filter cases where the micro/macro-surface don't agree on the side.
-           This logic is evaluated in smith_g1() called as part of the eval()
-           and sample() methods and needs to be replicated in the probability
-           density computation as well. */
+        // Filter cases where the micro/macro-surface don't agree on the side.
+        // This logic is evaluated in smith_g1() called as part of the eval()
+        // and sample() methods and needs to be replicated in the probability
+        // density computation as well.
         active &= dr::dot(si.wi, m) * Frame3f::cos_theta(si.wi) > 0.f &&
                   dr::dot(wo,    m) * Frame3f::cos_theta(wo)    > 0.f;
 
@@ -472,18 +509,13 @@ public:
                                (eta * eta * dr::dot(wo, m)) /
                                    dr::square(dr::dot(si.wi, m) + eta * dr::dot(wo, m)));
 
-        /* Construct the microfacet distribution matching the
-           roughness values at the current surface position. */
-        MicrofacetDistribution sample_distr(
-            m_type,
-            m_alpha_u->eval_1(si, active),
-            m_alpha_v->eval_1(si, active),
-            m_sample_visible
-        );
+        // Construct the microfacet distribution matching the
+        // roughness values at the current surface position.
+        MicrofacetDistribution sample_distr = distribution(si, active);
 
-        /* Trick by Walter et al.: slightly scale the roughness values to
-           reduce importance sampling weights. Not needed for the
-           Heitz and D'Eon sampling technique. */
+        // Trick by Walter et al.: slightly scale the roughness values to
+        // reduce importance sampling weights. Not needed for the
+        // Heitz and D'Eon sampling technique.
         if (unlikely(!m_sample_visible))
             sample_distr.scale_alpha(1.2f - .2f * dr::sqrt(dr::abs(Frame3f::cos_theta(si.wi))));
 
@@ -491,7 +523,7 @@ public:
         Float prob = sample_distr.pdf(dr::mulsign(si.wi, Frame3f::cos_theta(si.wi)), m);
 
         if (likely(has_transmission && has_reflection)) {
-            Float F = std::get<0>(fresnel(dr::dot(si.wi, m), m_eta));
+            Float F = std::get<0>(fresnel(dr::dot(si.wi, m), m_eta, m_inv_eta));
             prob *= dr::select(reflect, F, 1.f - F);
         }
 
@@ -532,25 +564,22 @@ public:
         Float dot_wi_m = dr::dot(si.wi, m),
               dot_wo_m = dr::dot(wo   , m);
 
-        /* Filter cases where the micro/macro-surface don't agree on the side.
-           This logic is evaluated in smith_g1() called as part of the eval()
-           and sample() methods and needs to be replicated in the probability
-           density computation as well. */
+        // Filter cases where the micro/macro-surface don't agree on the side.
+        // This logic is evaluated in smith_g1() called as part of the eval()
+        // and sample() methods and needs to be replicated in the probability
+        // density computation as well.
         active &= dot_wi_m * cos_theta_i > 0.f &&
                   dot_wo_m * cos_theta_o > 0.f;
 
-        /* Construct the microfacet distribution matching the
-           roughness values at the current surface position. */
-        MicrofacetDistribution distr(m_type,
-                                     m_alpha_u->eval_1(si, active),
-                                     m_alpha_v->eval_1(si, active),
-                                     m_sample_visible);
+        // Construct the microfacet distribution matching the
+        // roughness values at the current surface position.
+        MicrofacetDistribution distr = distribution(si, active);
 
         // Evaluate the microfacet normal distribution
         Float D = distr.eval(m);
 
         // Fresnel factor
-        Float F = std::get<0>(fresnel(dot_wi_m, m_eta));
+        Float F = std::get<0>(fresnel(dot_wi_m, m_eta, m_inv_eta));
 
         // Smith's shadow-masking function
         Float G = distr.G(si.wi, wo, m);
@@ -570,10 +599,11 @@ public:
         }
 
         if (dr::any_or<true>(eval_t)) {
-            /* Missing term in the original paper: account for the solid angle
-               compression when tracing radiance -- this is necessary for
-               bidirectional methods. */
-            Float scale = (ctx.mode == TransportMode::Radiance) ? dr::square(inv_eta) : Float(1.f);
+            // Missing term in the original paper: account for the solid angle
+            // compression when tracing radiance -- this is necessary for
+            // bidirectional methods.
+            Float scale = (ctx.mode == TransportMode::Radiance && m_eta_scale)
+                              ? dr::square(inv_eta) : Float(1.f);
 
             // Compute the total amount of transmission
             UnpolarizedSpectrum value = dr::abs(
@@ -586,9 +616,9 @@ public:
             result[eval_t] = value;
         }
 
-        /* Trick by Walter et al.: slightly scale the roughness values to
-           reduce importance sampling weights. Not needed for the
-           Heitz and D'Eon sampling technique. */
+        // Trick by Walter et al.: slightly scale the roughness values to
+        // reduce importance sampling weights. Not needed for the
+        // Heitz and D'Eon sampling technique.
         if (unlikely(!m_sample_visible))
             distr.scale_alpha(1.2f - .2f * dr::sqrt(dr::abs(cos_theta_i)));
 
@@ -607,13 +637,33 @@ public:
                  dr::select(active, pdf * dr::abs(dwh_dwo), 0.f) };
     }
 
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        // The Fresnel term at the macrosurface normal approximates how the
+        // lobes split the energy
+        auto [r, cos_theta_t, eta_it, eta_ti] =
+            fresnel(Frame3f::cos_theta(si.wi), m_eta, m_inv_eta);
+        UnpolarizedSpectrum reflectance = r, transmittance = 1.f - r;
+        if (m_specular_reflectance)
+            reflectance *= m_specular_reflectance->eval(si, active);
+        if (m_specular_transmittance)
+            transmittance *= m_specular_transmittance->eval(si, active);
+        // Total internal reflection leaves no transmitted direction
+        Vector3f wt = dr::select(r < 1.f, refract(si.wi, cos_theta_t, eta_ti),
+                                 Vector3f(0.f));
+        MicrofacetDistribution distr = distribution(si, active);
+        return { 0.f, reflectance, transmittance, si.sh_frame,
+                 dr::maximum(distr.alpha_u(), distr.alpha_v()),
+                 si.to_world(wt) };
+    }
+
     std::string to_string() const override {
         std::ostringstream oss;
         oss << "RoughDielectric[" << std::endl
             << "  distribution = "           << m_type           << "," << std::endl
             << "  sample_visible = "         << (int) m_sample_visible << "," << std::endl;
 
-        if (!has_flag(m_flags, BSDFFlags::Anisotropic)) {
+        if (!this->has_flag(BSDFFlags::Anisotropic)) {
             oss << "  alpha = "                  << string::indent(m_alpha_v) << "," << std::endl;
         } else {
             oss << "  alpha_u = "                << string::indent(m_alpha_u) << "," << std::endl
@@ -639,9 +689,13 @@ private:
     ref<Texture> m_alpha_u, m_alpha_v;
     Float m_eta, m_inv_eta;
     bool m_sample_visible;
+    bool m_eta_scale;
+    /// Precomputed distribution, valid when both roughness textures are uniform
+    MicrofacetDistribution m_distr;
+    bool m_uniform_alpha = false;
 
     MI_TRAVERSE_CB(Base, m_specular_reflectance, m_specular_transmittance,
-                   m_alpha_u, m_alpha_v, m_eta, m_inv_eta)
+                   m_alpha_u, m_alpha_v, m_eta, m_inv_eta, m_distr)
 };
 
 MI_EXPORT_PLUGIN(RoughDielectric)

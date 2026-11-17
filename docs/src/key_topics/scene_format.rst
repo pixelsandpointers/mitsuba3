@@ -98,8 +98,8 @@ more complex example:
 
         <!-- Add another mesh, this time, stored using Mitsuba's own
              (compact) binary representation -->
-        <shape type="serialized">
-            <string name="filename" value="lightsource.serialized"/>
+        <shape type="packed">
+            <string name="filename" value="lightsource.packed"/>
             <transform name="to_world">
                 <translate x="5" y="-3" z="1"/>
             </transform>
@@ -145,6 +145,9 @@ the available object types:
         * - `integrator`
           - Integrators implement rendering techniques for solving the light transport equation
           - `path`, `direct`, `depth`
+        * - `postprocess`
+          - Post-processing filters transform the image developed by the `film`, e.g. to apply film response functions, bloom filters, etc.
+          - (Python plugins)
         * - `rfilter`
           - Reconstruction filters control how the `film` converts a set of samples into the output image
           - `box`, `gaussian`
@@ -156,7 +159,7 @@ the available object types:
           - `perspective`, `orthogonal`
         * - `shape`
           - Shape puglins define surfaces that mark transitions between different types of materials
-          - `obj`, `ply`, `serialized`
+          - `obj`, `ply`, `packed`
         * - `texture`
           - Texture plugins represent spatially varying signals on surfaces
           - `bitmap`, `checkerboard`
@@ -349,6 +352,27 @@ left-multiplied onto the current one. The following choices are available:
 
       <lookat origin="10, 50, -800" target="0, 0, 0" up="0, 1, 0"/>
 
+Animated Transformations
+************************
+
+Transformations can be animated over time to render motion blur. An animation
+replaces the ``<transform>`` tag with an ``<animation>`` tag, which contains one
+``<transform>`` per keyframe, each carrying a ``time`` attribute:
+
+.. code-block:: xml
+
+    <animation name="to_world">
+        <transform time="0.0">
+            <translate value="0, 0, 0"/>
+        </transform>
+        <transform time="1.0">
+            <translate value="1, 0, 0"/>
+        </transform>
+    </animation>
+
+An ``<animation>`` may carry an ``id`` so that several objects can share one set
+of keyframes via ``<ref>``.
+
 References
 ----------
 
@@ -434,6 +458,40 @@ without without having to touch the XML file:
 .. code-block:: xml
 
     <include filename="nested-scene-$version.xml"/>
+
+.. _sec-python-extensions:
+
+Python extensions
+-----------------
+
+A scene can ship the Python plugins it uses as ``.py`` files and declare them
+with ``import`` tags at the top level. This keeps the scene loadable when the
+package that originally provided the plugins changes or is not installed (see
+:ref:`sec-distributing-plugins` for the package-based alternative).
+
+.. code-block:: xml
+
+    <scene version="3.0.0">
+        <import filename="plugins/my_bsdf.py"/>
+        <bsdf type="my_bsdf"/>
+    </scene>
+
+The Python should register its plugins at module scope, e.g. by calling
+:py:func:`mitsuba.register_bsdf`. Mitsuba isolates extensions from each other
+so that multiple scenes referencing different versions of the same plugin can
+coexist within a process.
+
+Mitsuba treats the directory of an imported file as a package, so the file can
+share code with other files in the same directory via relative imports such
+as ``from .common import fresnel``.
+
+Such a scene needs a Python interpreter and therefore cannot be rendered by the
+``mitsuba`` C++ binary. Load it with :py:func:`mitsuba.load_file` or render it
+on the command line with
+
+.. code-block:: bash
+
+    python -m mitsuba scene.xml
 
 Aliases
 -------
@@ -533,7 +591,7 @@ constructed objects instead of nesting dictionaries:
     })
 
 Color/spectra
-*************
+-------------
 
 For convenience, a nested dictionary can be provided with a ``"type"`` entry
 equal to ``"rgb"`` or ``"spectrum"``. Similarly to the XML parser, the
@@ -614,7 +672,7 @@ The following example constructs a Mitsuba complete scene using
     })
 
 References
-**********
+----------
 
 Like in the XML parser, it is possible to declare scene objects once and then
 reference them elsewhere.
@@ -652,9 +710,10 @@ However, if you are looking to refer to an object that was previously declared,
 you must use an explicit ID.
 
 For example, in the snippet below, the objects receive the following implicit IDs:
+
 - The shape: ``my_shape``
 - The material: ``my_shape.my_material``
-- The texture: ``my_shape.my_material.reflectance`
+- The texture: ``my_shape.my_material.reflectance``
 
 .. code-block:: python
 
@@ -680,7 +739,7 @@ For example, in the snippet below, the objects receive the following implicit ID
   references are fully supported.
 
 Search paths
-************
+------------
 
 As in the XML scene description, it is possible to add a path to the list of
 search paths. In the following example, the texture file can be found in the
@@ -698,4 +757,18 @@ relative or absolute.
                 "type": "bitmap",
                 "filename": "my_texture.exr", # relative to the folder defined above
         }
+    }
+
+Python extensions
+-----------------
+
+The equivalent of an XML ``<import>`` tag is an entry of type ``import`` at the
+root of the dictionary. Its key is arbitrary.
+
+.. code-block:: python
+
+    {
+        "type": "scene",
+        "ext": {"type": "import", "filename": "plugins/my_bsdf.py"},
+        "bsdf": {"type": "my_bsdf"}
     }

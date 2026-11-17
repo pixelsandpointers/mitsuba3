@@ -164,6 +164,31 @@ void Bitmap::clear() {
     memset(m_data.get(), 0, buffer_size());
 }
 
+static const std::pair<const char *, Bitmap::PixelFormat> channel_formats[] = {
+    { "Y",     Bitmap::PixelFormat::Y     }, { "AY",    Bitmap::PixelFormat::YA    },
+    { "BGR",   Bitmap::PixelFormat::RGB   }, { "ABGR",  Bitmap::PixelFormat::RGBA  },
+    { "BGRW",  Bitmap::PixelFormat::RGBW  }, { "ABGRW", Bitmap::PixelFormat::RGBAW },
+    { "XYZ",   Bitmap::PixelFormat::XYZ   }, { "AXYZ",  Bitmap::PixelFormat::XYZA  }
+};
+
+Bitmap::PixelFormat Bitmap::pixel_format_from_channels(const std::vector<std::string> &channels) {
+    // Sort the single-letter names into a key that ignores the channel order
+    std::string key;
+    for (const std::string &name : channels) {
+        if (name.size() != 1)
+            return PixelFormat::MultiChannel;
+        key += name;
+    }
+
+    std::sort(key.begin(), key.end());
+
+    for (auto [sorted, format] : channel_formats)
+        if (key == sorted)
+            return format;
+
+    return PixelFormat::MultiChannel;
+}
+
 void Bitmap::rebuild_struct(size_t channel_count, const std::vector<std::string> &channel_names) {
     std::vector<std::string> channels;
 
@@ -227,6 +252,14 @@ void Bitmap::rebuild_struct(size_t channel_count, const std::vector<std::string>
 
 size_t Bitmap::buffer_size() const {
     return pixel_count() * bytes_per_pixel();
+}
+
+std::vector<std::string> Bitmap::channel_names() const {
+    std::vector<std::string> result;
+    result.reserve(m_struct.size());
+    for (const sj::Field &field : m_struct)
+        result.push_back(field.name);
+    return result;
 }
 
 size_t Bitmap::bytes_per_pixel() const {
@@ -651,49 +684,20 @@ std::vector<std::pair<std::string, ref<Bitmap>>> Bitmap::split() const {
         std::string prefix = it->first;
         auto range = fields.equal_range(prefix);
 
-        bool has_rgb = true,
-             has_xyz = true,
-             has_y   = false,
-             has_a   = false,
-             has_w   = false;
-
         std::vector<std::string> field_names;
-        for (auto it2 = range.first; it2 != range.second; ++it2) {
-            if (it2->second.first == "Y")
-                has_y = true;
-            else if (it2->second.first == "A")
-                has_a = true;
-            else if (it2->second.first == "W")
-                has_w = true;
-            else if (std::string("RGB").find(it2->second.first) == std::string::npos)
-                has_rgb = false;
-            else if (std::string("XYZ").find(it2->second.first) == std::string::npos)
-                has_xyz = false;
+        for (auto it2 = range.first; it2 != range.second; ++it2)
             field_names.push_back(it2->second.first);
-        }
 
+        bool has_w = std::find(field_names.begin(), field_names.end(), "W") !=
+                     field_names.end();
         if (has_w && prefix != "<root>")
             Throw("Bitmap::split: Unexpected weight channel in image '%s'", prefix);
-        if (has_w && !has_a)
-            Throw("Bitmap::split: presence of weight channel implies alpha channel!");
 
-        size_t extra_ch = 0;
-        extra_ch += has_a ? 1 : 0;
-        extra_ch += has_w ? 1 : 0;
-
-        has_rgb &= field_names.size() == 3 + extra_ch;
-        has_xyz &= field_names.size() == 3 + extra_ch;
-        has_y   &= !has_xyz && field_names.size() == 1 + extra_ch;
+        PixelFormat format = pixel_format_from_channels(field_names);
 
         ref<Bitmap> target;
-        if (has_xyz || has_rgb || has_y) {
-            target = new Bitmap(
-                has_rgb
-                    ? (has_w ? (has_a ? PixelFormat::RGBAW : PixelFormat::RGBW)
-                             : (has_a ? PixelFormat::RGBA : PixelFormat::RGB))
-                    : (has_xyz ? (has_a ? PixelFormat::XYZA : PixelFormat::XYZ)
-                               : (has_a ? PixelFormat::YA : PixelFormat::Y)),
-                m_component_format, m_size);
+        if (format != PixelFormat::MultiChannel) {
+            target = new Bitmap(format, m_component_format, m_size);
         } else {
             target = new Bitmap (
                 PixelFormat::MultiChannel,
@@ -783,7 +787,30 @@ Bitmap::FileFormat Bitmap::detect_file_format(Stream *stream) {
     return format;
 }
 
+/// Determine the file format that the extension of ``path`` implies
+static Bitmap::FileFormat format_from_extension(const fs::path &path) {
+    std::string extension = string::to_lower(path.extension().string());
+    if (extension == ".exr")
+        return Bitmap::FileFormat::OpenEXR;
+    else if (extension == ".png")
+        return Bitmap::FileFormat::PNG;
+    else if (extension == ".jpg" || extension == ".jpeg")
+        return Bitmap::FileFormat::JPEG;
+    else if (extension == ".hdr" || extension == ".rgbe")
+        return Bitmap::FileFormat::RGBE;
+    else if (extension == ".pfm")
+        return Bitmap::FileFormat::PFM;
+    else if (extension == ".ppm")
+        return Bitmap::FileFormat::PPM;
+    else
+        Throw("Bitmap::write(): unsupported bitmap file extension \"%s\"",
+              extension);
+}
+
 void Bitmap::write(const fs::path &path, FileFormat format, int quality) const {
+    // Resolve the format before opening the file, which would truncate it
+    if (format == FileFormat::Auto)
+        format = format_from_extension(path);
     ref<FileStream> fs = new FileStream(path, FileStream::ETruncReadWrite);
     write(fs, format, quality);
 }
@@ -795,22 +822,7 @@ void Bitmap::write(Stream *stream, FileFormat format, int quality) const {
         if (!fs)
             Throw("Bitmap::write(): can't decide file format based on filename "
                   "since the target stream is not a file stream");
-        std::string extension = string::to_lower(fs->path().extension().string());
-        if (extension == ".exr")
-            format = FileFormat::OpenEXR;
-        else if (extension == ".png")
-            format = FileFormat::PNG;
-        else if (extension == ".jpg" || extension == ".jpeg")
-            format = FileFormat::JPEG;
-        else if (extension == ".hdr" || extension == ".rgbe")
-            format = FileFormat::RGBE;
-        else if (extension == ".pfm")
-            format = FileFormat::PFM;
-        else if (extension == ".ppm")
-            format = FileFormat::PPM;
-        else
-            Throw("Bitmap::write(): unsupported bitmap file extension \"%s\"",
-                  extension);
+        format = format_from_extension(fs->path());
     }
 
     Log(Debug, "Writing %s file \"%s\" (%ix%i, %s, %s) ..",
@@ -955,7 +967,7 @@ private:
 class EXRThreadPool : public IlmThread::ThreadPoolProvider {
 public:
     int numThreads() const override {
-        return std::max(1, (int) pool_size());
+        return (int) pool_size();
     }
 
     void setNumThreads(int) override {
@@ -969,7 +981,8 @@ public:
             delete task;
             group->finishOneTask();
         });
-        if (pool_size() == 0)
+        // Without worker threads, the task must run on the calling thread
+        if (pool_size() == 1)
             task_wait_and_release(t);
         else
             task_release(t);
@@ -1476,21 +1489,37 @@ void Bitmap::write_exr(Stream *stream, int quality) const {
 //   JPEG bitmap I/O
 // -----------------------------------------------------------------------------
 
+/// Identify a stream in a log message, preferably by file name
+static std::string stream_name(const Stream *stream) {
+    if (const FileStream *fs = dynamic_cast<const FileStream *>(stream))
+        return fs->path().string();
+    return std::string(stream->class_name());
+}
+
+static const size_t jpeg_buffer_size = 0x8000;
+
+typedef struct {
+    struct jpeg_source_mgr mgr;
+    JOCTET * buffer;
+    Stream *stream;
+} jbuf_in_t;
+
+typedef struct {
+    struct jpeg_destination_mgr mgr;
+    JOCTET * buffer;
+    Stream *stream;
+} jbuf_out_t;
+
+typedef struct {
+    struct jpeg_error_mgr mgr;
+    Stream *stream;
+} jerr_t;
+
+static std::string jpeg_stream_name(j_common_ptr cinfo) {
+    return stream_name(((jerr_t *) cinfo->err)->stream);
+}
+
 extern "C" {
-    static const size_t jpeg_buffer_size = 0x8000;
-
-    typedef struct {
-        struct jpeg_source_mgr mgr;
-        JOCTET * buffer;
-        Stream *stream;
-    } jbuf_in_t;
-
-    typedef struct {
-        struct jpeg_destination_mgr mgr;
-        JOCTET * buffer;
-        Stream *stream;
-    } jbuf_out_t;
-
     METHODDEF(void) jpeg_init_source(j_decompress_ptr cinfo) {
         jbuf_in_t *p = (jbuf_in_t *) cinfo->src;
         p->buffer = new JOCTET[jpeg_buffer_size];
@@ -1561,20 +1590,28 @@ extern "C" {
     METHODDEF(void) jpeg_error_exit(j_common_ptr cinfo) {
         char msg[JMSG_LENGTH_MAX];
         (*cinfo->err->format_message) (cinfo, msg);
-        Throw("Critical libjpeg error: %s", msg);
+        Throw("Critical libjpeg error in \"%s\": %s", jpeg_stream_name(cinfo), msg);
     }
-};
+
+    METHODDEF(void) jpeg_output_message(j_common_ptr cinfo) {
+        char msg[JMSG_LENGTH_MAX];
+        (*cinfo->err->format_message) (cinfo, msg);
+        Log(Warn, "libjpeg warning in \"%s\": %s", jpeg_stream_name(cinfo), msg);
+    }
+}
 
 void Bitmap::read_jpeg(Stream *stream) {
     ScopedPhase phase(ProfilerPhase::BitmapRead);
     struct jpeg_decompress_struct cinfo;
-    struct jpeg_error_mgr jerr;
+    jerr_t jerr;
     jbuf_in_t jbuf;
 
     memset(&jbuf, 0, sizeof(jbuf_in_t));
 
-    cinfo.err = jpeg_std_error(&jerr);
-    jerr.error_exit = jpeg_error_exit;
+    cinfo.err = jpeg_std_error(&jerr.mgr);
+    jerr.stream = stream;
+    jerr.mgr.error_exit = jpeg_error_exit;
+    jerr.mgr.output_message = jpeg_output_message;
     jpeg_create_decompress(&cinfo);
     cinfo.src = (struct jpeg_source_mgr *) &jbuf;
     jbuf.mgr.init_source = jpeg_init_source;
@@ -1630,7 +1667,7 @@ void Bitmap::read_jpeg(Stream *stream) {
 void Bitmap::write_jpeg(Stream *stream, int quality) const {
     ScopedPhase phase(ProfilerPhase::BitmapWrite);
     struct jpeg_compress_struct cinfo;
-    struct jpeg_error_mgr jerr;
+    jerr_t jerr;
     jbuf_out_t jbuf;
 
     int components = 0;
@@ -1646,8 +1683,10 @@ void Bitmap::write_jpeg(Stream *stream, int quality) const {
               m_component_format, sj::Type::UInt8);
 
     memset(&jbuf, 0, sizeof(jbuf_out_t));
-    cinfo.err = jpeg_std_error(&jerr);
-    jerr.error_exit = jpeg_error_exit;
+    cinfo.err = jpeg_std_error(&jerr.mgr);
+    jerr.stream = stream;
+    jerr.mgr.error_exit = jpeg_error_exit;
+    jerr.mgr.output_message = jpeg_output_message;
     jpeg_create_compress(&cinfo);
 
     cinfo.dest = (struct jpeg_destination_mgr *) &jbuf;
@@ -1703,14 +1742,18 @@ static void png_write_data(png_structp png_ptr, png_bytep data, png_size_t lengt
     ((Stream *) write_io_ptr)->write(data, length);
 }
 
-static void png_error_func(png_structp, png_const_charp msg) {
-    Throw("Fatal libpng error: %s\n", msg);
+static std::string png_stream_name(png_structp png_ptr) {
+    return stream_name((const Stream *) png_get_error_ptr(png_ptr));
 }
 
-static void png_warn_func(png_structp, png_const_charp msg) {
+static void png_error_func(png_structp png_ptr, png_const_charp msg) {
+    Throw("Fatal libpng error in \"%s\": %s", png_stream_name(png_ptr), msg);
+}
+
+static void png_warn_func(png_structp png_ptr, png_const_charp msg) {
     if (strstr(msg, "iCCP: known incorrect sRGB profile") != nullptr)
         return;
-    Log(Warn, "libpng warning: %s\n", msg);
+    Log(Warn, "libpng warning in \"%s\": %s", png_stream_name(png_ptr), msg);
 }
 
 void Bitmap::read_png(Stream *stream) {
@@ -1719,7 +1762,7 @@ void Bitmap::read_png(Stream *stream) {
 
     // Create buffers
     png_structp png_ptr = png_create_read_struct(
-        PNG_LIBPNG_VER_STRING, nullptr, &png_error_func, &png_warn_func);
+        PNG_LIBPNG_VER_STRING, stream, &png_error_func, &png_warn_func);
     if (png_ptr == nullptr)
         Throw("read_png(): Unable to create PNG data structure");
 
@@ -1842,7 +1885,7 @@ void Bitmap::write_png(Stream *stream, int compression) const {
             return;
     }
 
-    png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr,
+    png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, stream,
                                       &png_error_func, &png_warn_func);
     if (png_ptr == nullptr)
         Throw("Error while creating PNG data structure");
@@ -1991,15 +2034,15 @@ void Bitmap::write_ppm(Stream *stream) const {
 /* The following is based on code by Bruce Walter */
 namespace {
     inline void rgbe_from_float(float *data, uint8_t rgbe[4]) {
-        /* Find the largest contribution */
+        // Find the largest contribution
         float max = std::max(std::max(data[0], data[1]), data[2]);
         if (max < 1e-32f) {
             rgbe[0] = rgbe[1] = rgbe[2] = rgbe[3] = 0;
         } else {
             int e;
-            /* Extract exponent and convert the fractional part into
-               the [0..255] range. Afterwards, divide by max so that
-               any color component multiplied by the result will be in [0,255] */
+            // Extract exponent and convert the fractional part into
+            // the [0..255] range. Afterwards, divide by max so that
+            // any color component multiplied by the result will be in [0,255]
             max = std::frexp(max, &e) * 256.f / max;
             rgbe[0] = (uint8_t) (data[0] * max);
             rgbe[1] = (uint8_t) (data[1] * max);
@@ -2240,8 +2283,8 @@ void Bitmap::write_rgbe(Stream *stream) const {
             data += m_pixel_format == PixelFormat::RGB ? 3 : 4;
         }
 
-        /* Write out each of the four channels separately run length encoded.
-           First red, then green, then blue, then exponent */
+        // Write out each of the four channels separately run length encoded.
+        // First red, then green, then blue, then exponent
         for (size_t i = 0; i < 4; i++)
             rgbe_write_rle(stream, buffer.get() + i * m_size.x(), m_size.x());
     }
@@ -2338,8 +2381,8 @@ void Bitmap::write_pfm(Stream *stream) const {
             stream->write(data + scanline * (m_size.y() - 1 - y),
                           scanline * sizeof(float));
     } else {
-        /* For convenience: also handle images with an alpha
-           channel, but strip it out while saving the data */
+        // For convenience: also handle images with an alpha
+        // channel, but strip it out while saving the data
         size_t scanline = (size_t) m_size.x() * ch;
         float *temp = (float *) alloca(scanline * sizeof(float));
 

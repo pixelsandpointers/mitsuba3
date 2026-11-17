@@ -1,4 +1,4 @@
-.. _sec-file-format:
+.. _sec-differences:
 
 Differences to previous versions
 ================================
@@ -93,9 +93,6 @@ an overview of the main missing features:
     previous generation of Mitsuba. We do not currently plan to port these and
     recommend that you stick with Mitsuba 0.6 if your application depends on
     them.
-
-- **Animation**: specification and handling of temporally varying
-  transformations, e.g., for motion blur is not yet implemented.
 
 - **Diffusion-based subsurface scattering**: currently missing,
   status undecided.

@@ -3,6 +3,30 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/optional.h>
 
+template <typename RayCone>
+void bind_ray_cone(nb::module_ &m, const char *name) {
+    using Float = typename RayCone::Float;
+    using Mask  = dr::mask_t<Float>;
+
+    MI_PY_CHECK_ALIAS(RayCone, name) {
+        auto cone = nb::class_<RayCone>(m, name, D(RayCone))
+            .def(nb::init<>(), "Create a zero ray cone")
+            .def(nb::init<const RayCone &>(), "Copy constructor", "other"_a)
+            .def(nb::init<const Float &, const Float &>(),
+                 "width"_a, "spread"_a, D(RayCone, RayCone))
+            .def("propagate", &RayCone::propagate, "t"_a, D(RayCone, propagate))
+            .def("scale", &RayCone::scale, "s"_a, D(RayCone, scale))
+            .def_field(RayCone, width,  D(RayCone, width))
+            .def_field(RayCone, spread, D(RayCone, spread))
+            .def_field(RayCone, scale_factor, D(RayCone, scale_factor))
+            .def_repr(RayCone);
+
+        if constexpr (dr::is_jit_v<Float>) {
+            MI_PY_DRJIT_STRUCT(cone, RayCone, width, spread, scale_factor);
+        }
+    }
+}
+
 template<typename Ray>
 void bind_ray(nb::module_ &m, const char *name) {
     MI_PY_IMPORT_TYPES()
@@ -40,10 +64,11 @@ void bind_ray(nb::module_ &m, const char *name) {
             .def_field(Ray, maxt,        D(Ray, maxt))
             .def_field(Ray, time,        D(Ray, time))
             .def_field(Ray, wavelengths, D(Ray, wavelengths))
+            .def_field(Ray, cone,        D(Ray, cone))
             .def_repr(Ray);
 
         if constexpr (dr::is_jit_v<RayFloat>) {
-            MI_PY_DRJIT_STRUCT(ray, Ray, o, d, maxt, time, wavelengths);
+            MI_PY_DRJIT_STRUCT(ray, Ray, o, d, maxt, time, wavelengths, cone);
         }
     }
 }
@@ -51,36 +76,13 @@ void bind_ray(nb::module_ &m, const char *name) {
 MI_PY_EXPORT(Ray) {
     MI_PY_IMPORT_TYPES()
 
+    bind_ray_cone<RayCone<Float>>(m, "RayCone");
+    bind_ray_cone<RayCone<ScalarFloat>>(m, "ScalarRayCone");
+
     bind_ray<Ray<Point2f, Spectrum>>(m, "Ray2f");
-    bind_ray<Ray<Point2d, Spectrum>>(m, "Ray2d");
     bind_ray<Ray3f>(m, "Ray3f");
-    bind_ray<Ray<Point3d, Spectrum>>(m, "Ray3d");
 
     using ScalarSpectrum = scalar_spectrum_t<Spectrum>;
     bind_ray<Ray<ScalarPoint2f, ScalarSpectrum>>(m, "ScalarRay2f");
-    bind_ray<Ray<ScalarPoint2d, ScalarSpectrum>>(m, "ScalarRay2d");
     bind_ray<Ray<ScalarPoint3f, ScalarSpectrum>>(m, "ScalarRay3f");
-    bind_ray<Ray<ScalarPoint3d, ScalarSpectrum>>(m, "ScalarRay3d");
-
-    {
-        auto raydiff = nb::class_<RayDifferential3f, Ray3f>(m, "RayDifferential3f", D(RayDifferential))
-            .def(nb::init_implicit<Ray3f>())
-            .def(nb::init<>(), "Create an uninitialized ray")
-            .def(nb::init<const Ray3f &>(), "ray"_a)
-            .def(nb::init<Point3f, Vector3f, Float, const Wavelength &>(),
-                 "Initialize without differentials.",
-                 "o"_a, "d"_a, "time"_a=(ScalarFloat) 0.0, "wavelengths"_a=Wavelength())
-            .def("scale_differential", &RayDifferential3f::scale_differential,
-                 "amount"_a, D(RayDifferential, scale_differential))
-            .def_field(RayDifferential3f, o_x, D(RayDifferential, o_x))
-            .def_field(RayDifferential3f, o_y, D(RayDifferential, o_y))
-            .def_field(RayDifferential3f, d_x, D(RayDifferential, d_x))
-            .def_field(RayDifferential3f, d_y, D(RayDifferential, d_y))
-            .def_field(RayDifferential3f, has_differentials, D(RayDifferential, has_differentials));
-
-        MI_PY_DRJIT_STRUCT(raydiff, RayDifferential3f, o, d, maxt, time,
-                            wavelengths, o_x, o_y, d_x, d_y)
-    }
-
-    nb::implicitly_convertible<Ray3f, RayDifferential3f>();
 }

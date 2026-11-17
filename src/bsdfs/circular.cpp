@@ -92,9 +92,9 @@ public:
             Spectrum M = m_left_handed ? mueller::left_circular_polarizer<Float>()
                                        : mueller::right_circular_polarizer<Float>();
 
-            /* The `forward` direction here is always along the direction that
-               light travels. This is needed for the coordinate system rotation
-               below. */
+            // The `forward` direction here is always along the direction that
+            // light travels. This is needed for the coordinate system rotation
+            // below.
             Vector3f forward = ctx.mode == TransportMode::Radiance ? si.wi : -si.wi;
 
             // Rotate in/out basis of M s.t. it aligns with BSDF coordinate frame
@@ -121,7 +121,7 @@ public:
         return 0.f;
     }
 
-    Spectrum eval_null_transmission(const SurfaceInteraction3f &si, Mask active) const override {
+    Spectrum eval_null(const SurfaceInteraction3f &si, Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::BSDFEvaluate, active);
 
         UnpolarizedSpectrum transmittance = m_transmittance->eval(si, active);
@@ -130,9 +130,9 @@ public:
             Spectrum M = m_left_handed ? mueller::left_circular_polarizer<Float>()
                                        : mueller::right_circular_polarizer<Float>();
 
-            /* The `forward` direction here is always along the direction that
-               light travels. This is needed for the coordinate system rotation
-               below. */
+            // The `forward` direction here is always along the direction that
+            // light travels. This is needed for the coordinate system rotation
+            // below.
             Vector3f forward = si.wi;   // Note: Should be reversed for TransportMode::Importance.
 
             // Rotate in/out basis of M s.t. it alignes with BSDF coordinate frame
@@ -149,9 +149,10 @@ public:
         }
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si,
-                                      Mask active) const override {
-        return m_transmittance->eval(si, active);
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        return { 0.f, 0.f, m_transmittance->eval(si, active), si.sh_frame, 0.f,
+                 -si.to_world(si.wi) };
     }
 
     std::string to_string() const override {

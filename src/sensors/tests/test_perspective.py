@@ -86,8 +86,8 @@ def test02_sample_ray(variants_vec_spectral, origin, direction):
 
 @pytest.mark.parametrize("origin", origins)
 @pytest.mark.parametrize("direction", directions)
-def test03_sample_ray_differential(variants_vec_spectral, origin, direction):
-    """Check the correctness of the sample_ray_differential() method"""
+def test03_sample_ray(variants_vec_spectral, origin, direction):
+    """Check the correctness of the sample_ray() method"""
     near_clip = 1.0
     camera = create_camera(origin, direction, near_clip=near_clip)
 
@@ -95,7 +95,7 @@ def test03_sample_ray_differential(variants_vec_spectral, origin, direction):
     wav_sample = [0.5, 0.33, 0.1]
     pos_sample = [[0.2, 0.1, 0.2], [0.6, 0.9, 0.2]]
 
-    ray, spec_weight = camera.sample_ray_differential(time, wav_sample, pos_sample, 0)
+    ray, spec_weight = camera.sample_ray(time, wav_sample, pos_sample, 0)
 
     # Importance sample wavelength and weight
     wav, spec = mi.sample_rgb_spectrum(mi.sample_shifted(wav_sample))
@@ -108,27 +108,10 @@ def test03_sample_ray_differential(variants_vec_spectral, origin, direction):
     o = mi.Point3f(origin) + near_clip * inv_z * mi.Vector3f(ray.d)
     assert dr.allclose(ray.o, o, atol=1e-4)
 
-
-    # Check that the derivatives are orthogonal
-    assert dr.allclose(dr.dot(ray.d_x - ray.d, ray.d_y - ray.d), 0, atol=1e-7)
-
     # Check that a [0.5, 0.5] position_sample generates a ray
     # that points in the camera direction
-    ray_center, _ = camera.sample_ray_differential(0, 0, [0.5, 0.5], 0)
+    ray_center, _ = camera.sample_ray(0, 0, [0.5, 0.5], 0)
     assert dr.allclose(ray_center.d, direction, atol=1e-7)
-
-    # Check correctness of the ray derivatives
-
-    # Deltas in screen space
-    dx = 1.0 / camera.film().crop_size().x
-    dy = 1.0 / camera.film().crop_size().y
-
-    # Sample the rays by offsetting the position_sample with the deltas
-    ray_dx, _ = camera.sample_ray_differential(0, 0, [0.5 + dx, 0.5], 0)
-    ray_dy, _ = camera.sample_ray_differential(0, 0, [0.5, 0.5 + dy], 0)
-
-    assert dr.allclose(ray_dx.d, ray_center.d_x)
-    assert dr.allclose(ray_dy.d, ray_center.d_y)
 
 
 @pytest.mark.parametrize("origin", [[1.0, 0.0, 1.5]])
@@ -198,3 +181,152 @@ def test05_spectrum_sampling(variants_vec_spectral):
                 }
             }
         })
+
+
+def test06_ray_cone(variants_all_backends_once):
+    import math
+
+    camera = mi.load_dict({
+        'type': 'perspective', 'fov': 90, 'fov_axis': 'x', 'near_clip': 0.5,
+        'film': {'type': 'hdrfilm', 'width': 100, 'height': 50}
+    })
+
+    # On the optical axis, the cone spreads by the angle one pixel subtends.
+    # The ray starts on the near plane, where the cone already has the width
+    # that it accumulated since the pinhole.
+    ray, _ = camera.sample_ray(0, 0.5, [0.5, 0.5], [0.5, 0.5])
+    spread = 2 * math.tan(math.radians(45)) / 100
+    assert dr.allclose(ray.cone.spread, spread, rtol=1e-5)
+    assert dr.allclose(ray.cone.width, 0.5 * spread, rtol=1e-5)
+    assert dr.allclose(ray.cone.propagate(4 - 0.5).width, 4 * spread, rtol=1e-5)
+
+    # At the edge of a 90 degree frame the pixel subtends cos(45)^1.5 less,
+    # and the near plane lies 1/cos(45) farther along the ray
+    ray, _ = camera.sample_ray(0, 0.5, [0.0, 0.5], [0.5, 0.5])
+    cos_theta = math.cos(math.radians(45))
+    assert dr.allclose(ray.cone.spread, spread * cos_theta ** 1.5, rtol=1e-4)
+    assert dr.allclose(ray.cone.width, ray.cone.spread * 0.5 / cos_theta, rtol=1e-4)
+
+
+def test07_jitter(variants_all_backends_once):
+    import numpy as np
+
+    # Without jitter, every ray passes through the pixel center and the
+    # sample count no longer matters. The scene has a depth edge in the
+    # middle of every pixel column so that jittered renders differ.
+    def render(jitter, spp):
+        scene = mi.load_dict({
+            'type': 'scene',
+            'integrator': {'type': 'depth'},
+            'sensor': {
+                'type': 'perspective', 'fov': 90,
+                'jitter': jitter,
+                'film': {'type': 'hdrfilm', 'width': 8, 'height': 8,
+                         'rfilter': {'type': 'box'}},
+            },
+            'near': {'type': 'rectangle',
+                     'to_world': mi.ScalarAffineTransform4f().translate([0, 0, 2]).scale([0.25, 10, 1])},
+            'far': {'type': 'rectangle',
+                    'to_world': mi.ScalarAffineTransform4f().translate([0, 0, 5]).scale([10, 10, 1])},
+        })
+        return np.array(mi.render(scene, spp=spp, seed=0))
+
+    assert np.allclose(render(False, 1), render(False, 16))
+    assert not np.allclose(render(True, 1), render(True, 16))
+
+
+def test08_animated_transform(variant_scalar_rgb):
+    """Camera rays and world_transform() follow an animated to_world"""
+    t = mi.AnimatedTransform4f({
+        0.0: mi.Transform4f().translate([0, 0, 0]),
+        1.0: mi.Transform4f().translate([0, 0, 1])
+    })
+    sensor = mi.load_dict({
+        'type': 'perspective',
+        'to_world': t,
+    })
+
+    ray, _ = sensor.sample_ray(0.5, 0, [0.5, 0.5], 0)
+    assert dr.allclose(ray.o, mi.Point3f(0, 0, 0.5), atol=0.01)
+
+    # world_transform() defaults to time = 0
+    assert dr.allclose(sensor.world_transform().translation(), [0, 0, 0])
+    # world_transform(time) evaluates at time
+    assert dr.allclose(sensor.world_transform(0.5).translation(), [0, 0, 0.5])
+    assert dr.allclose(sensor.world_transform_scalar(0.5).translation(), [0, 0, 0.5])
+    # world_transform_anim() returns the AnimatedTransform object
+    awt = sensor.world_transform_anim()
+    assert isinstance(awt, mi.AnimatedTransform4f)
+
+
+def test09_camera_shear_rejection(variant_scalar_rgb):
+    """Sensors must reject scale factors and shear in to_world."""
+    from mitsuba import ScalarTransform4f as T
+
+    # Non-uniform scale in static transform
+    with pytest.raises(RuntimeError, match="Scale factors in the camera-to-world transformation are not allowed!"):
+        mi.load_dict({
+            'type': 'perspective',
+            'to_world': T().scale([1.0, 2.0, 1.0])
+        })
+
+    # Scale in animated transform
+    with pytest.raises(RuntimeError, match="Scale factors in the camera-to-world transformation are not allowed!"):
+        mi.load_dict({
+            'type': 'perspective',
+            'to_world': mi.AnimatedTransform4f({
+                0.0: T().scale([1, 1, 1]),
+                1.0: T().scale([1, 2, 1])
+            })
+        })
+
+    # Sheared static transform is rejected by perspective sensor
+    with pytest.raises(RuntimeError, match="Scale factors in the camera-to-world transformation are not allowed!"):
+        sheared = T([[1, 1, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        mi.load_dict({
+            'type': 'perspective',
+            'to_world': sheared
+        })
+
+
+def test10_sensor_to_world_transform_parameter_update(variant_scalar_rgb):
+    """Updating sensor.to_world should take effect and reject illegal scale."""
+    from mitsuba import ScalarTransform4f as T
+
+    sensor = mi.load_dict({'type': 'perspective'})
+    params = mi.traverse(sensor)
+    assert 'to_world' in params
+
+    # Update to valid translation
+    params['to_world'] = T().translate([0, 0, 5])
+    params.update()
+    ray, _ = sensor.sample_ray(0.0, 0, [0.5, 0.5], 0)
+    assert dr.allclose(ray.o, mi.Point3f(0, 0, 5), atol=0.01)
+
+    # Update to invalid scaled transform via dotted key must be rejected
+    params['to_world'] = T().scale([2, 1, 1])
+    with pytest.raises(RuntimeError, match="Scale factors in the camera-to-world transformation are not allowed!"):
+        params.update()
+
+
+def test11_animation_xml(variant_scalar_rgb):
+    """An <animation> in XML animates the sensor"""
+    xml = """
+    <scene version="3.0.0">
+        <sensor type="perspective">
+            <animation name="to_world">
+                <transform time="0">
+                    <translate x="0" y="0" z="0"/>
+                </transform>
+                <transform time="1">
+                    <translate x="0" y="0" z="1"/>
+                </transform>
+            </animation>
+        </sensor>
+    </scene>
+    """
+    scene = mi.load_string(xml)
+    sensor = scene.sensors()[0]
+    ray, _ = sensor.sample_ray(0.5, 0, [0.5, 0.5], 0)
+    assert dr.allclose(ray.o, mi.Point3f(0, 0, 0.5), atol=0.01)
+

@@ -3,6 +3,7 @@
 #include <mitsuba/core/util.h>
 #include <mitsuba/core/fresolver.h>
 #include <mitsuba/core/profiler.h>
+#include <mitsuba/core/packed.h>
 #include <mitsuba/python/python.h>
 
 
@@ -18,6 +19,7 @@ MI_PY_DECLARE(Formatter);
 MI_PY_DECLARE(FileResolver);
 MI_PY_DECLARE(Logger);
 MI_PY_DECLARE(MemoryMappedFile);
+MI_PY_DECLARE(PackedFile);
 MI_PY_DECLARE(Stream);
 MI_PY_DECLARE(DummyStream);
 MI_PY_DECLARE(FileStream);
@@ -28,6 +30,7 @@ MI_PY_DECLARE(rfilter);
 MI_PY_DECLARE(Thread);
 MI_PY_DECLARE(Timer);
 MI_PY_DECLARE(Properties);
+MI_PY_DECLARE(ParameterTable);
 MI_PY_DECLARE(parser);
 MI_PY_DECLARE(misc);
 
@@ -40,8 +43,8 @@ MI_PY_DECLARE(PhaseFunctionExtras);
 MI_PY_DECLARE(Spiral);
 MI_PY_DECLARE(Sensor);
 MI_PY_DECLARE(VolumeGrid);
-MI_PY_DECLARE(FilmFlags);
 MI_PY_DECLARE(DiscontinuityFlags);
+MI_PY_DECLARE(VertexFlags);
 
 NB_MODULE(mitsuba_ext, m) {
     // Temporarily change the module name (for pydoc)
@@ -53,6 +56,7 @@ NB_MODULE(mitsuba_ext, m) {
     m.attr("MI_VERSION_MAJOR") = MI_VERSION_MAJOR;
     m.attr("MI_VERSION_MINOR") = MI_VERSION_MINOR;
     m.attr("MI_VERSION_PATCH") = MI_VERSION_PATCH;
+    m.attr("MI_VERSION_DEV")   = MI_VERSION_DEV;
     m.attr("MI_YEAR")          = MI_YEAR;
     m.attr("MI_AUTHORS")       = MI_AUTHORS;
 
@@ -91,28 +95,24 @@ NB_MODULE(mitsuba_ext, m) {
                 return;
 
             nb::gil_scoped_acquire guard;
-            Py_DECREF(o);
+            if (guard.is_valid())
+                Py_DECREF(o);
         }
     );
 
     m.def("set_log_level", [](mitsuba::LogLevel level) {
-        if (!mitsuba::logger()) {
-            Throw("No Logger instance is set on the current thread! This is likely due to "
-                  "set_log_level being called from a non-Mitsuba thread. You can manually set a "
-                  "thread's ThreadEnvironment (which includes the logger) using "
-                  "ScopedSetThreadEnvironment e.g.\n"
-                  "# Main thread\n"
-                  "env = mi.ThreadEnvironment()\n"
-                  "# Secondary thread\n"
-                  "with mi.ScopedSetThreadEnvironment(env):\n"
-                  "   mi.set_log_level(mi.LogLevel.Info)\n"
-                  "   mi.Log(mi.LogLevel.Info, 'Message')\n");
+        Logger *logger = mitsuba::logger();
+        if (!logger) {
+            Throw("Could not set log level, global Logger instance is null!");
         }
-
-        mitsuba::logger()->set_log_level(level);
+        logger->set_log_level(level);
     }, "Sets the log level.");
     m.def("log_level", []() {
-        return mitsuba::logger()->log_level();
+        Logger *logger = mitsuba::logger();
+        if (!logger) {
+            Throw("Could not get log level, global Logger instance is null!");
+        }
+        return logger->log_level();
     }, "Returns the current log level.");
 
     Thread::static_initialization();
@@ -145,6 +145,7 @@ NB_MODULE(mitsuba_ext, m) {
     MI_PY_IMPORT(FileResolver);
     MI_PY_IMPORT(Logger);
     MI_PY_IMPORT(MemoryMappedFile);
+    MI_PY_IMPORT(PackedFile);
     MI_PY_IMPORT(DummyStream);
     MI_PY_IMPORT(FileStream);
     MI_PY_IMPORT(MemoryStream);
@@ -153,6 +154,7 @@ NB_MODULE(mitsuba_ext, m) {
     MI_PY_IMPORT(Thread);
     MI_PY_IMPORT(Timer);
     MI_PY_IMPORT(Properties);
+    MI_PY_IMPORT(ParameterTable);
     MI_PY_IMPORT(parser);
     MI_PY_IMPORT(misc);
 
@@ -163,11 +165,11 @@ NB_MODULE(mitsuba_ext, m) {
     MI_PY_IMPORT(PhaseFunctionExtras);
     MI_PY_IMPORT(Spiral);
     MI_PY_IMPORT(Sensor);
-    MI_PY_IMPORT(FilmFlags);
     MI_PY_IMPORT(DiscontinuityFlags);
+    MI_PY_IMPORT(VertexFlags);
 
-    /* Register a cleanup callback function to wait for pending tasks (this is
-     * called before all Python variables are cleaned up */
+    // Register a cleanup callback function to wait for pending tasks (this is
+    // called before all Python variables are cleaned up
     auto atexit = nb::module_::import_("atexit");
     atexit.attr("register")(nb::cpp_function([]() {
         {
@@ -179,17 +181,18 @@ NB_MODULE(mitsuba_ext, m) {
         PluginManager::instance()->release_all();
 
         struct_jit::clear_cache();
+        PackedFile::clear_cache();
         Profiler::static_shutdown();
         Bitmap::static_shutdown();
         Logger::static_shutdown();
         Thread::static_shutdown();
     }));
 
-    /* Make this a package, thus allowing statements such as:
-     * `from mitsuba.test.util import function`
-     * For that `__path__` needs to be populated. We do it by using the
-     * `__file__` attribute of a Python file which is located in the same
-     * directory as this module */
+    // Make this a package, thus allowing statements such as:
+    // `from mitsuba.test.util import function`
+    // For that `__path__` needs to be populated. We do it by using the
+    // `__file__` attribute of a Python file which is located in the same
+    // directory as this module
     nb::module_ os = nb::module_::import_("os");
     nb::module_ cfg = nb::module_::import_("mitsuba.config");
     nb::object cfg_path = os.attr("path").attr("realpath")(cfg.attr("__file__"));

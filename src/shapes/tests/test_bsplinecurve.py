@@ -99,7 +99,8 @@ def test05_ray_intersect(variant_scalar_rgb):
                     ray = mi.Ray3f(o=[x, y, -10], d=[0, 0, 1],
                                 time=0.0, wavelengths=[])
 
-                    si = s.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.dNSdUV, True)
+                    si = s.ray_intersect(
+                        ray, mi.RayFlags.Default | mi.RayFlags.NormalPartials, True)
                     ray_u = mi.Ray3f(ray)
                     ray_v = mi.Ray3f(ray)
                     eps = 1e-4
@@ -169,7 +170,7 @@ def test07_differentiable_surface_interaction_ray_forward_follow_shape(variant_l
     )
     params.update()
     pi = scene.ray_intersect_preliminary(ray)
-    si = pi.compute_surface_interaction(ray, mi.RayFlags.All | mi.RayFlags.DetachShape)
+    si = scene.compute_surface_interaction(ray, pi, mi.RayFlags.Default | mi.RayFlags.DetachShape)
 
     dr.forward(theta)
 
@@ -193,7 +194,7 @@ def test07_differentiable_surface_interaction_ray_forward_follow_shape(variant_l
     params.update()
 
     pi = scene.ray_intersect_preliminary(ray)
-    si = pi.compute_surface_interaction(ray, mi.RayFlags.All)
+    si = scene.compute_surface_interaction(ray, pi, mi.RayFlags.Default)
 
     dr.forward(theta)
 
@@ -217,7 +218,7 @@ def test07_differentiable_surface_interaction_ray_forward_follow_shape(variant_l
     params.update()
 
     pi = scene.ray_intersect_preliminary(ray)
-    si = pi.compute_surface_interaction(ray, mi.RayFlags.All | mi.RayFlags.FollowShape)
+    si = scene.compute_surface_interaction(ray, pi, mi.RayFlags.Default | mi.RayFlags.FollowShape)
 
     dr.forward(theta)
 
@@ -243,7 +244,7 @@ def test08_eval_parameterization(variants_vec_rgb):
     ray = mi.Ray3f(mi.Vector3f(x, y, 2), mi.Vector3f(0, 0, -1))
 
     pi = scene.ray_intersect_preliminary(ray)
-    si = pi.compute_surface_interaction(ray, mi.RayFlags.All | mi.RayFlags.DetachShape)
+    si = scene.compute_surface_interaction(ray, pi, mi.RayFlags.Default | mi.RayFlags.DetachShape)
 
     curve = scene.shapes()[0]
     eval_param_si = curve.eval_parameterization(si.uv, active=si.is_valid())
@@ -562,3 +563,85 @@ def test21_shape_type(variant_scalar_rgb):
         "filename" : "resources/data/common/meshes/curve.txt",
     })
     assert curve.shape_type() == mi.ShapeType.BSplineCurve.value;
+
+
+def read_text_curves(filename):
+    """Parse a curve text file into (control points, offsets) arrays"""
+    import numpy as np
+    points, offsets, new_curve = [], [], True
+    for line in open(str(mi.file_resolver().resolve(filename))):
+        if not line.strip():
+            new_curve = True
+            continue
+        if new_curve:
+            offsets.append(len(points))
+            new_curve = False
+        points.append([float(v) for v in line.split()])
+    offsets.append(len(points))
+    return (np.array(points, dtype=np.float32),
+            np.array(offsets, dtype=np.uint32))
+
+
+def write_packed_curves(filename, entries):
+    """Write ``entries`` (name -> (control points, offsets)) to a container"""
+    import struct
+    pf = mi.PackedFile(filename)
+    for name, (points, offsets) in entries.items():
+        pf.begin(name)
+        pf.stream().write(b'CURV' + struct.pack('<III', 1, len(offsets) - 1,
+                                                len(points)))
+        pf.write_array(offsets.tobytes())
+        pf.write_array(points.tobytes())
+    pf.close()
+
+
+@fresolver_append_path
+def test22_packed_container(variants_all_rgb, tmp_path):
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    entries = {
+        'single': 'curve.txt',
+        'multiple': 'curve_6.txt',
+    }
+    filename = str(tmp_path / 'curves.packed')
+    write_packed_curves(filename, {
+        name: read_text_curves(f'resources/data/common/meshes/{text}')
+        for name, text in entries.items()})
+
+    T = mi.ScalarTransform4f
+    to_world = T().translate([1, 2, 3]) @ T().scale(2)
+    for index, (name, text) in enumerate(entries.items()):
+        for selector in ({'index': index}, {'name': name}):
+            packed = mi.load_dict({
+                'type': 'bsplinecurve',
+                'filename': filename,
+                'to_world': to_world,
+                **selector,
+            })
+            reference = mi.load_dict({
+                'type': 'bsplinecurve',
+                'filename': f'resources/data/common/meshes/{text}',
+                'to_world': to_world,
+            })
+            assert packed.primitive_count() == reference.primitive_count()
+            p1 = mi.traverse(packed)
+            p2 = mi.traverse(reference)
+            assert dr.allclose(p1['control_points'], p2['control_points'])
+            assert dr.all(p1['segment_indices'] == p2['segment_indices'])
+            assert dr.allclose(packed.bbox().min, reference.bbox().min)
+            assert dr.allclose(packed.bbox().max, reference.bbox().max)
+
+    with pytest.raises(RuntimeError, match='no entry named'):
+        mi.load_dict({'type': 'bsplinecurve', 'filename': filename,
+                      'name': 'missing'})
+    with pytest.raises(RuntimeError, match='out of range'):
+        mi.load_dict({'type': 'bsplinecurve', 'filename': filename,
+                      'index': 2})
+
+    # Curves that are too short for a B-spline are rejected
+    points, _ = read_text_curves('resources/data/common/meshes/curve.txt')
+    write_packed_curves(filename, {
+        'short': (points[:3], np.array([0, 3], dtype=np.uint32))})
+    with pytest.raises(RuntimeError, match='at least 4 control points'):
+        mi.load_dict({'type': 'bsplinecurve', 'filename': filename})

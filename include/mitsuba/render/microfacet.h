@@ -4,7 +4,7 @@
 #include <mitsuba/core/logger.h>
 #include <mitsuba/core/math.h>
 #include <mitsuba/core/properties.h>
-#include <mitsuba/core/quad.h>
+#include <drjit/quad.h>
 #include <mitsuba/core/spectrum.h>
 #include <mitsuba/core/string.h>
 #include <mitsuba/core/warp.h>
@@ -37,67 +37,67 @@ MI_INLINE std::ostream &operator<<(std::ostream &os, MicrofacetType tp) {
 }
 
 /**
- * \brief Implementation of the Beckman and GGX / Trowbridge-Reitz microfacet
+ * Implementation of the Beckmann and GGX / Trowbridge-Reitz microfacet
  * distributions and various useful sampling routines
  *
- * Based on the papers
+ * Based on the following papers:
  *
- *   "Microfacet Models for Refraction through Rough Surfaces"
- *    by Bruce Walter, Stephen R. Marschner, Hongsong Li, and Kenneth E. Torrance
+ * - Walter et al. :cite:`Walter07Microfacet`
  *
- * and
+ * - Heitz and d'Eon :cite:`Heitz1014Importance`
  *
- *   "Importance Sampling Microfacet-Based BSDFs using the Distribution of Visible Normals"
- *    by Eric Heitz and Eugene D'Eon
+ * - "An Improved Visible Normal Sampling Routine for the Beckmann
+ *   Distribution" by Wenzel Jakob
  *
- * The visible normal sampling code was provided by Eric Heitz and Eugene D'Eon.
- * An improvement of the Beckmann model sampling routine is discussed in
+ * - "A Simpler and Exact Sampling Routine for the GGX Distribution of Visible
+ *   Normals" by Eric Heitz
  *
- *   "An Improved Visible Normal Sampling Routine for the Beckmann Distribution"
- *    by Wenzel Jakob
- *
- * An improvement of the GGX model sampling routine is discussed in
- *    "A Simpler and Exact Sampling Routine for the GGX Distribution of Visible Normals"
- *     by Eric Heitz
+ * The visible normal sampling code was provided by Eric Heitz and Eugene
+ * D'Eon. The last two papers improve the sampling routines of the Beckmann
+ * and GGX models, respectively.
  */
 template <typename Float, typename Spectrum>
-class MicrofacetDistribution : drjit::TraversableBase {
+class MicrofacetDistribution {
 public:
     MI_IMPORT_TYPES()
+
+    /// Create an uninitialized distribution, to be assigned later
+    MicrofacetDistribution() = default;
 
     /**
      * Create an isotropic microfacet distribution of the specified type
      *
-     * \param type
-     *     The desired type of microfacet distribution
-     * \param alpha
-     *     The surface roughness
+     * Args:
+     *     type: The desired type of microfacet distribution
+     *
+     *     alpha: The surface roughness
      */
     MicrofacetDistribution(MicrofacetType type, Float alpha, bool sample_visible = true)
-        : m_type(type), m_alpha_u(alpha), m_alpha_v(alpha),
-          m_sample_visible(sample_visible) {
+        : m_type(type), m_isotropic(true), m_sample_visible(sample_visible),
+          m_alpha_u(alpha), m_alpha_v(alpha) {
         configure();
     }
 
     /**
      * Create an anisotropic microfacet distribution of the specified type
      *
-     * \param type
-     *     The desired type of microfacet distribution
-     * \param alpha_u
-     *     The surface roughness in the tangent direction
-     * \param alpha_v
-     *     The surface roughness in the bitangent direction
+     * Args:
+     *     type: The desired type of microfacet distribution
+     *
+     *     alpha_u: The surface roughness in the tangent direction
+     *
+     *     alpha_v: The surface roughness in the bitangent direction
      */
     MicrofacetDistribution(MicrofacetType type, Float alpha_u, Float alpha_v,
                            bool sample_visible = true)
-        : m_type(type), m_alpha_u(alpha_u), m_alpha_v(alpha_v),
-          m_sample_visible(sample_visible) {
+        : m_type(type), m_isotropic(same_alpha(alpha_u, alpha_v)),
+          m_sample_visible(sample_visible), m_alpha_u(alpha_u),
+          m_alpha_v(alpha_v) {
         configure();
     }
 
     /**
-     * \brief Create a microfacet distribution from a Property data
+     * Create a microfacet distribution from a `Properties` data
      * structure
      */
     MicrofacetDistribution(const Properties &props,
@@ -139,6 +139,7 @@ public:
                 "Please use the corresponding smooth reflectance model to get zero roughness.");
 
         m_sample_visible = props.get<bool>("sample_visible", sample_visible);
+        m_isotropic = same_alpha(m_alpha_u, m_alpha_v);
 
         configure();
     }
@@ -160,46 +161,40 @@ public:
     bool sample_visible() const { return m_sample_visible; }
 
     /// Is this an isotropic microfacet distribution?
-    bool is_isotropic() const {
-        if constexpr (dr::is_jit_v<Float>)
-            return m_alpha_u.index() == m_alpha_v.index();
-        else
-            return dr::all(m_alpha_u == m_alpha_v);
-    }
+    bool is_isotropic() const { return m_isotropic; }
 
     /// Is this an anisotropic microfacet distribution?
-    bool is_anisotropic() const { return dr::all(m_alpha_u != m_alpha_v); }
+    bool is_anisotropic() const { return !m_isotropic; }
 
     /// Scale the roughness values by some constant
     void scale_alpha(Float value) {
         m_alpha_u *= value;
         m_alpha_v *= value;
+        update_derived();
     }
 
     /**
-     * \brief Evaluate the microfacet distribution function
+     * Evaluate the microfacet distribution function
      *
-     * \param m
-     *     The microfacet normal
+     * Args:
+     *     m: The microfacet normal
      */
     Float eval(const Vector3f &m) const {
-        Float alpha_uv = m_alpha_u * m_alpha_v,
-              cos_theta         = Frame3f::cos_theta(m),
-              cos_theta_2       = dr::square(cos_theta),
+        Float cos_theta   = Frame3f::cos_theta(m),
+              cos_theta_2 = dr::square(cos_theta),
+              x           = m.x() * m_inv_alpha_u,
+              y           = m.y() * m_inv_alpha_v,
               result;
 
         if (m_type == MicrofacetType::Beckmann) {
             // Beckmann distribution function for Gaussian random surfaces
-            result = dr::exp(-(dr::square(m.x() / m_alpha_u) +
-                               dr::square(m.y() / m_alpha_v)) /
-                             cos_theta_2) /
-                     (dr::Pi<Float> * alpha_uv * dr::square(cos_theta_2));
+            Float inv_cos_theta_2 = dr::rcp(cos_theta_2);
+            result = dr::exp(-dr::fmadd(x, x, dr::square(y)) * inv_cos_theta_2) *
+                     (m_norm * dr::square(inv_cos_theta_2));
         } else {
             // GGX / Trowbridge-Reitz distribution function
-            result =
-                dr::rcp(dr::Pi<Float> * alpha_uv *
-                        dr::square(dr::square(m.x() / m_alpha_u) +
-                                dr::square(m.y() / m_alpha_v) + dr::square(m.z())));
+            result = m_norm * dr::rcp(dr::square(
+                dr::fmadd(x, x, dr::fmadd(y, y, cos_theta_2))));
         }
 
         // Prevent potential numerical issues in other stages of the model
@@ -207,14 +202,13 @@ public:
     }
 
     /**
-     * \brief Returns the density function associated with
-     * the \ref sample() function.
+     * Returns the density function associated with
+     * the `sample()` function.
      *
-     * \param wi
-     *     The incident direction (only relevant if visible normal sampling is used)
+     * Args:
+     *     wi: The incident direction (only relevant if visible normal sampling is used)
      *
-     * \param m
-     *     The microfacet normal
+     *     m: The microfacet normal
      */
     Float pdf(const Vector3f &wi, const Vector3f &m) const {
         Float result = eval(m);
@@ -228,18 +222,18 @@ public:
     }
 
     /**
-     * \brief Draw a sample from the microfacet normal distribution
-     *  and return the associated probability density
+     * Draw a sample from the microfacet normal distribution
+     * and return the associated probability density
      *
-     * \param wi
-     *    The incident direction. Only used if
-     *    visible normal sampling is enabled.
+     * Args:
+     *     wi: The incident direction. Only used if
+     *         visible normal sampling is enabled.
      *
-     * \param sample
-     *    A uniformly distributed 2D sample
+     *     sample: A uniformly distributed 2D sample
      *
-     * \return A tuple consisting of the sampled microfacet normal
-     *         and the associated solid angle density
+     * Returns:
+     *     A tuple consisting of the sampled microfacet normal
+     *     and the associated solid angle density
      */
     std::pair<Normal3f, Float> sample(const Vector3f &wi,
                                       const Point2f &sample) const {
@@ -252,7 +246,7 @@ public:
 
                 alpha_2 = m_alpha_u * m_alpha_u;
             } else {
-                Float ratio  = m_alpha_v / m_alpha_u,
+                Float ratio  = m_alpha_v * m_inv_alpha_u,
                       tmp    = ratio * dr::tan((2.f * dr::Pi<Float>) * sample.y());
 
                 cos_phi = dr::rsqrt(dr::fmadd(tmp, tmp, 1.f));
@@ -260,29 +254,38 @@ public:
 
                 sin_phi = cos_phi * tmp;
 
-                alpha_2 = dr::rcp(dr::square(cos_phi / m_alpha_u) +
-                                  dr::square(sin_phi / m_alpha_v));
+                Float x = cos_phi * m_inv_alpha_u,
+                      y = sin_phi * m_inv_alpha_v;
+
+                alpha_2 = dr::rcp(dr::fmadd(x, x, dr::square(y)));
             }
 
             // Sample elevation component
+            Float s = 1.f - sample.x();
             if (m_type == MicrofacetType::Beckmann) {
-                // Beckmann distribution function for Gaussian random surfaces
-                cos_theta = dr::rsqrt(dr::fnmadd(alpha_2, dr::log(1.f - sample.x()), 1.f));
+                // Beckmann distribution function for Gaussian random surfaces.
+                // The upper bound on the reciprocal squared cosine keeps the
+                // density finite when 's' reaches zero.
+                Float inv_cos_theta_2 =
+                    dr::minimum(dr::fnmadd(alpha_2, dr::log(s), 1.f), 1e13f);
+
+                cos_theta = dr::rsqrt(inv_cos_theta_2);
                 cos_theta_2 = dr::square(cos_theta);
 
-                // Compute probability density of the sampled position
-                Float cos_theta_3 = dr::maximum(cos_theta_2 * cos_theta, 1e-20f);
-                pdf = (1.f - sample.x()) / (dr::Pi<Float> * m_alpha_u * m_alpha_v * cos_theta_3);
+                // Compute probability density of the sampled position, where
+                // the reciprocal cubed cosine equals 'inv_cos_theta_2^(3/2)'
+                pdf = s * m_norm * dr::square(inv_cos_theta_2) * cos_theta;
             } else {
-                // GGX / Trowbridge-Reitz distribution function
-                Float tan_theta_m_2 = alpha_2 * sample.x() / (1.f - sample.x());
-                cos_theta = dr::rsqrt(1.f + tan_theta_m_2);
-                cos_theta_2 = dr::square(cos_theta);
+                // GGX / Trowbridge-Reitz distribution function. The tangent of
+                // the sampled elevation satisfies 'tan_theta_2 = alpha_2 * x/s',
+                // hence the squared cosine below.
+                Float t = dr::fmadd(alpha_2, sample.x(), s);
+
+                cos_theta_2 = s / t;
+                cos_theta = dr::sqrt(cos_theta_2);
 
                 // Compute probability density of the sampled position
-                Float temp = 1.f + tan_theta_m_2 / alpha_2,
-                      cos_theta_3 = dr::maximum(cos_theta_2 * cos_theta, 1e-20f);
-                pdf = dr::rcp(dr::Pi<Float> * m_alpha_u * m_alpha_v * cos_theta_3 * dr::square(temp));
+                pdf = m_norm * dr::square(t) * cos_theta;
             }
 
             Float sin_theta = dr::sqrt(1.f - cos_theta_2);
@@ -331,12 +334,12 @@ public:
     }
 
     /**
-     * \brief Smith's shadowing-masking function for a single direction
+     * Smith's shadowing-masking function for a single direction
      *
-     * \param v
-     *     An arbitrary direction
-     * \param m
-     *     The microfacet normal
+     * Args:
+     *     v: An arbitrary direction
+     *
+     *     m: The microfacet normal
      */
     Float smith_g1(const Vector3f &v, const Vector3f &m) const {
         Float xy_alpha_2 = dr::square(m_alpha_u * v.x()) + dr::square(m_alpha_v * v.y()),
@@ -345,8 +348,8 @@ public:
 
         if (m_type == MicrofacetType::Beckmann) {
             Float a = dr::rsqrt(tan_theta_alpha_2), a_sqr = dr::square(a);
-            /* Use a fast and accurate (<0.35% rel. error) rational
-               approximation to the shadowing-masking function */
+            // Use a fast and accurate (<0.35% rel. error) rational
+            // approximation to the shadowing-masking function
             result = dr::select(a >= 1.6f, 1.f,
                                 (3.535f * a + 2.181f * a_sqr) /
                                     (1.f + 2.276f * a + 2.577f * a_sqr));
@@ -357,32 +360,31 @@ public:
         // Perpendicular incidence -- no shadowing/masking
         dr::masked(result, xy_alpha_2 == 0.f) = 1.f;
 
-        /* Ensure consistent orientation (can't see the back
-           of the microfacet from the front and vice versa) */
+        // Ensure consistent orientation (can't see the back
+        // of the microfacet from the front and vice versa)
         dr::masked(result, dr::dot(v, m) * Frame3f::cos_theta(v) <= 0.f) = 0.f;
 
         return result;
     }
 
-    /// \brief Visible normal sampling code for the alpha=1 case
+    /// Visible normal sampling code for the alpha=1 case
     Vector2f sample_visible_11(Float cos_theta_i, Point2f sample) const {
         if (m_type == MicrofacetType::Beckmann) {
-            /* The original inversion routine from the paper contained
-               discontinuities, which causes issues for QMC integration
-               and techniques like Kelemen-style MLT. The following code
-               performs a numerical inversion with better behavior */
+            // The original inversion routine from the paper contained
+            // discontinuities, which causes issues for QMC integration
+            // and techniques like Kelemen-style MLT. The following code
+            // performs a numerical inversion with better behavior
 
-            Float tan_theta_i =
-                dr::safe_sqrt(dr::fnmadd(cos_theta_i, cos_theta_i, 1.f)) /
-                cos_theta_i;
-            Float cot_theta_i = dr::rcp(tan_theta_i);
+            Float cot_theta_i = cos_theta_i * dr::safe_rsqrt(
+                dr::fnmadd(cos_theta_i, cos_theta_i, 1.f));
+            Float tan_theta_i = dr::rcp(cot_theta_i);
 
-            /* Search interval -- everything is parameterized
-               in the erf() domain */
+            // Search interval -- everything is parameterized
+            // in the erf() domain
             Float maxval = dr::erf(cot_theta_i);
 
-            /* Start with a good initial guess (analytic solution for
-               theta_i = pi/2, which is the most nonlinear case) */
+            // Start with a good initial guess (analytic solution for
+            // theta_i = pi/2, which is the most nonlinear case)
             sample = dr::maximum(dr::minimum(sample, 1.f - 1e-6f), 1e-6f);
             Float x = maxval - (maxval + 1.f) * dr::erf(dr::sqrt(-dr::log(sample.x())));
 
@@ -425,9 +427,26 @@ protected:
     void configure() {
         m_alpha_u = dr::maximum(m_alpha_u, 1e-4f);
         m_alpha_v = dr::maximum(m_alpha_v, 1e-4f);
+        update_derived();
     }
 
-    /// Compute the squared 1D roughness along direction \c v
+    /// Recompute the quantities that depend on the roughness values
+    void update_derived() {
+        m_inv_alpha_u = dr::rcp(m_alpha_u);
+        m_inv_alpha_v = dr::rcp(m_alpha_v);
+        m_norm = dr::InvPi<Float> * m_inv_alpha_u * m_inv_alpha_v;
+    }
+
+    /// Do both roughness values denote the same quantity? Two separately
+    /// differentiable parameters can share a primal, hence the combined index.
+    static bool same_alpha(const Float &alpha_u, const Float &alpha_v) {
+        if constexpr (dr::is_jit_v<Float>)
+            return alpha_u.index_combined() == alpha_v.index_combined();
+        else
+            return dr::all(alpha_u == alpha_v);
+    }
+
+    /// Compute the squared 1D roughness along direction ``v``
     Float project_roughness_2(const Vector3f &v) const {
         if (is_isotropic())
             return dr::square(m_alpha_u);
@@ -439,11 +458,18 @@ protected:
     }
 
 protected:
-    MicrofacetType m_type;
-    Float m_alpha_u, m_alpha_v;
-    bool  m_sample_visible;
+    MicrofacetType m_type = MicrofacetType::Beckmann;
+    bool  m_isotropic = true;
+    bool  m_sample_visible = true;
 
-    MI_TRAVERSE_CB(drjit::TraversableBase, m_alpha_u, m_alpha_v)
+public:
+    /// Roughness values and derived constants, exposed for traversal
+    Float m_alpha_u = 0.f, m_alpha_v = 0.f;
+    Float m_inv_alpha_u = 0.f, m_inv_alpha_v = 0.f;
+    Float m_norm = 0.f;
+
+    DRJIT_TRAVERSE(MicrofacetDistribution, m_alpha_u, m_alpha_v,
+                   m_inv_alpha_u, m_inv_alpha_v, m_norm)
 };
 
 template <typename Float, typename Spectrum>
@@ -473,7 +499,7 @@ Float eval_reflectance(const MicrofaceDistributionP &distr,
     int res = eta > 1 ? 32 : 128;
 
     using FloatX = dr::DynamicArray<dr::scalar_t<Float>>;
-    auto [nodes, weights] = quad::gauss_legendre<FloatX>(res);
+    auto [nodes, weights] = dr::quad::gauss_legendre<FloatX>(res);
     Float result = dr::zeros<Float>(dr::width(wi));
 
     auto [nodes_x, nodes_y]     = dr::meshgrid(nodes, nodes);
@@ -526,7 +552,7 @@ Float eval_transmittance(const MicrofaceDistributionP &distr,
 
     using ScalarFloat = dr::scalar_t<Float>;
     using FloatX = dr::DynamicArray<ScalarFloat>;
-    auto [nodes, weights] = quad::gauss_legendre<FloatX>(res);
+    auto [nodes, weights] = dr::quad::gauss_legendre<FloatX>(res);
     Float result = dr::zeros<Float>(dr::width(wi));
 
     auto [nodes_x, nodes_y]     = dr::meshgrid(nodes, nodes);

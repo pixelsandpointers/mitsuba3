@@ -14,11 +14,11 @@ Perspective camera with a thin lens (:monosp:`thinlens`)
 --------------------------------------------------------
 
 .. pluginparameters::
- :extra-rows: 8
+ :extra-rows: 9
 
  * - to_world
-   - |transform|
-   - Specifies an optional camera-to-world transformation.
+   - |transform| or |animation|
+   - Specifies an optional camera-to-world transformation (can be animated).
      (Default: none (i.e. camera space = world space))
    - |exposed|
 
@@ -62,6 +62,11 @@ Perspective camera with a thin lens (:monosp:`thinlens`)
    - |float|
    - Distance to the near/far clip planes. (Default: :monosp:`near_clip=1e-2` (i.e. :monosp:`0.01`)
      and :monosp:`far_clip=1e4` (i.e. :monosp:`10000`))
+   - |exposed|
+
+ * - principal_point_offset_x, principal_point_offset_y
+   - |float|
+   - Specifies the position of the camera's principal point relative to the center of the film.
    - |exposed|
 
  * - srf
@@ -144,9 +149,12 @@ The exact camera position and orientation is most easily expressed using the
 template <typename Float, typename Spectrum>
 class ThinLensCamera final : public ProjectiveCamera<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(ProjectiveCamera, m_to_world, m_needs_sample_3, m_film, m_sampler,
-                    m_resolution, m_shutter_open, m_shutter_open_time, m_near_clip,
-                    m_far_clip, m_focus_distance, sample_wavelengths)
+    MI_IMPORT_BASE(ProjectiveCamera, m_needs_sample_3, m_film, m_sampler,
+                    m_resolution, m_shutter_open, m_shutter_open_time,
+                    m_near_clip, m_far_clip, m_focus_distance, m_cone_scale,
+                    sample_wavelengths, world_transform,
+                    traverse_world_transform, world_transform_string,
+                    check_to_world, position_bounds)
     MI_IMPORT_TYPES()
 
     ThinLensCamera(const Properties &props) : Base(props) {
@@ -160,8 +168,12 @@ public:
             m_aperture_radius = dr::Epsilon<Float>;
         }
 
-        if (m_to_world.scalar().has_scale())
-            Throw("Scale factors in the camera-to-world transformation are not allowed!");
+        check_to_world();
+
+        m_principal_point_offset = ScalarPoint2f(
+            props.get<ScalarFloat>("principal_point_offset_x", 0.f),
+            props.get<ScalarFloat>("principal_point_offset_y", 0.f)
+        );
 
         update_camera_transforms();
 
@@ -173,16 +185,16 @@ public:
         cb->put("aperture_radius", m_aperture_radius, ParamFlags::NonDifferentiable);
         cb->put("focus_distance",  m_focus_distance,  ParamFlags::NonDifferentiable);
         cb->put("x_fov",           m_x_fov,           ParamFlags::NonDifferentiable);
-        cb->put("to_world",        m_to_world,        ParamFlags::NonDifferentiable);
+        cb->put("principal_point_offset_x", m_principal_point_offset.x(), ParamFlags::NonDifferentiable);
+        cb->put("principal_point_offset_y", m_principal_point_offset.y(), ParamFlags::NonDifferentiable);
+        traverse_world_transform(cb);
     }
 
     void parameters_changed(const std::vector<std::string> &keys) override {
         Base::parameters_changed(keys);
-        if (keys.empty() || string::contains(keys, "to_world")) {
-            if (m_to_world.scalar().has_scale())
-                Throw("Scale factors in the camera-to-world transformation are not allowed!");
-            m_to_world = m_to_world.value().update();
-        }
+
+        if (keys.empty() || string::contains(keys, "to_world"))
+            check_to_world();
 
         update_camera_transforms();
     }
@@ -192,14 +204,8 @@ public:
             m_film->size(), m_film->crop_size(), m_film->crop_offset(),
             m_x_fov, Float(m_near_clip), Float(m_far_clip)).inverse();
 
-        // Position differentials on the near plane
-        m_dx = m_sample_to_camera * Point3f(1.f / m_resolution.x(), 0.f, 0.f)
-             - m_sample_to_camera * Point3f(0.f);
-        m_dy = m_sample_to_camera * Point3f(0.f, 1.f / m_resolution.y(), 0.f)
-             - m_sample_to_camera * Point3f(0.f);
-
-        /* Precompute some data for importance(). Please
-           look at that function for further details. */
+        // Precompute some data for importance(). Please
+        // look at that function for further details.
         Point3f pmin(m_sample_to_camera * Point3f(0.f, 0.f, 0.f)),
                 pmax(m_sample_to_camera * Point3f(1.f, 1.f, 0.f));
 
@@ -208,12 +214,25 @@ public:
         m_image_rect.expand(Point2f(pmax.x(), pmax.y()) / pmax.z());
         m_normalization = 1.f / m_image_rect.volume();
 
-        dr::make_opaque(m_sample_to_camera, m_dx, m_dy,
-                        m_x_fov, m_image_rect, m_normalization);
+        // Angle subtended by a pixel on the optical axis (see sample_ray())
+        m_pixel_spread = m_image_rect.extents().x() / m_resolution.x() * m_cone_scale;
+
+        // Principal point offset expressed in crop window coordinates
+        m_scaled_principal_point_offset =
+            m_principal_point_offset *
+            Vector2f(ScalarVector2f(m_film->size()) /
+                     ScalarVector2f(m_film->crop_size()));
+
+        dr::make_opaque(m_sample_to_camera, m_x_fov, m_image_rect,
+                        m_normalization, m_pixel_spread, m_principal_point_offset,
+                        m_scaled_principal_point_offset);
     }
 
     ProjectiveTransform4f projection_transform() const override {
-        return m_sample_to_camera.inverse();
+        return ProjectiveTransform4f::translate(
+                   Vector3f(-m_scaled_principal_point_offset.x(),
+                            -m_scaled_principal_point_offset.y(), 0.f)) *
+               m_sample_to_camera.inverse();
     }
 
     std::pair<Ray3f, Spectrum> sample_ray(Float time, Float wavelength_sample,
@@ -232,7 +251,9 @@ public:
 
         // Compute the sample position on the near plane (local camera space).
         Point3f near_p = m_sample_to_camera *
-                        Point3f(position_sample.x(), position_sample.y(), 0.f);
+                         Point3f(position_sample.x() + m_scaled_principal_point_offset.x(),
+                                 position_sample.y() + m_scaled_principal_point_offset.y(),
+                                 0.f);
 
         // Aperture position
         Point2f tmp = m_aperture_radius * warp::square_to_uniform_disk_concentric(aperture_sample);
@@ -244,8 +265,9 @@ public:
         // Convert into a normalized ray direction; adjust the ray interval accordingly.
         Vector3f d = dr::normalize(Vector3f(focus_p - aperture_p));
 
-        ray.o = m_to_world.value() * aperture_p;
-        ray.d = m_to_world.value() * d;
+        auto to_world = world_transform(time);
+        ray.o = to_world * aperture_p;
+        ray.d = to_world * d;
 
         Float inv_z = dr::rcp(d.z());
         Float near_t = m_near_clip * inv_z,
@@ -253,54 +275,12 @@ public:
         ray.o += ray.d * near_t;
         ray.maxt = far_t - near_t;
 
-        return { ray, wav_weight };
-    }
-
-    std::pair<RayDifferential3f, Spectrum>
-    sample_ray_differential_impl(Float time, Float wavelength_sample,
-                                 const Point2f &position_sample, const Point2f &aperture_sample,
-                                 Mask active) const {
-        MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleRay, active);
-
-        auto [wavelengths, wav_weight] =
-            sample_wavelengths(dr::zeros<SurfaceInteraction3f>(),
-                               wavelength_sample,
-                               active);
-        RayDifferential3f ray;
-        ray.time = time;
-        ray.wavelengths = wavelengths;
-
-        // Compute the sample position on the near plane (local camera space).
-        Point3f near_p = m_sample_to_camera *
-                        Point3f(position_sample.x(), position_sample.y(), 0.f);
-
-        // Aperture position
-        Point2f tmp = m_aperture_radius * warp::square_to_uniform_disk_concentric(aperture_sample);
-        Point3f aperture_p(tmp.x(), tmp.y(), 0.f);
-
-        // Sampled position on the focal plane
-        Float f_dist = m_focus_distance / near_p.z();
-        Point3f focus_p   = near_p          * f_dist,
-                focus_p_x = (near_p + m_dx) * f_dist,
-                focus_p_y = (near_p + m_dy) * f_dist;
-
-        // Convert into a normalized ray direction; adjust the ray interval accordingly.
-        Vector3f d = dr::normalize(Vector3f(focus_p - aperture_p));
-
-        ray.o = m_to_world.value() * aperture_p;
-        ray.d = m_to_world.value() * d;
-
-        Float inv_z = dr::rcp(d.z());
-        Float near_t = m_near_clip * inv_z,
-              far_t  = m_far_clip * inv_z;
-        ray.o += ray.d * near_t;
-        ray.maxt = far_t - near_t;
-
-        ray.o_x = ray.o_y = ray.o;
-
-        ray.d_x = m_to_world.value() * dr::normalize(Vector3f(focus_p_x - aperture_p));
-        ray.d_y = m_to_world.value() * dr::normalize(Vector3f(focus_p_y - aperture_p));
-        ray.has_differentials = true;
+        // The cone is that of a pinhole camera placed at the sampled aperture
+        // position: it ignores the aperture and is exact on the focal plane.
+        // See the perspective camera for the off-axis cosine term and the
+        // initial width at the near plane.
+        ray.cone.spread = m_pixel_spread * d.z() * dr::sqrt(d.z());
+        ray.cone.width  = ray.cone.spread * near_t;
 
         return { ray, wav_weight };
     }
@@ -309,11 +289,12 @@ public:
     sample_direction(const Interaction3f &it, const Point2f &sample,
                      Mask active) const override {
         // Transform the reference point into the local coordinate system
-        AffineTransform4f trafo = m_to_world.value();
+        AffineTransform4f trafo = world_transform(it.time);
         Point3f ref_p = trafo.inverse() * it.p;
 
         // Check if it is outside of the clip range
         DirectionSample3f ds = dr::zeros<DirectionSample3f>();
+        ds.time = it.time;
         ds.pdf = 0.f;
         active &= (ref_p.z() >= m_near_clip) && (ref_p.z() <= m_far_clip);
         if (dr::none_or<false>(active))
@@ -332,7 +313,7 @@ public:
         // Compute importance value
         Float ct     = Frame3f::cos_theta(local_d),
               inv_ct = dr::rcp(ct);
-        Point3f scr = m_sample_to_camera.inverse() *
+        Point3f scr = projection_transform() *
             (aperture_p + local_d * (m_focus_distance * inv_ct));
         Mask valid = dr::all(scr >= 0.f) && dr::all(scr <= 1.f);
         Float value = dr::select(valid, m_normalization * inv_ct * inv_ct * inv_ct, 0.f);
@@ -353,10 +334,7 @@ public:
     }
 
 
-    ScalarBoundingBox3f bbox() const override {
-        ScalarPoint3f p = m_to_world.scalar() * ScalarPoint3f(0.f);
-        return ScalarBoundingBox3f(p, p);
-    }
+    ScalarBoundingBox3f bbox() const override { return position_bounds(); }
 
     std::string to_string() const override {
         using string::indent;
@@ -372,7 +350,7 @@ public:
             << "  resolution = " << m_resolution << "," << std::endl
             << "  shutter_open = " << m_shutter_open << "," << std::endl
             << "  shutter_open_time = " << m_shutter_open_time << "," << std::endl
-            << "  to_world = " << indent(m_to_world)  << std::endl
+            << "  to_world = " << indent(world_transform_string())  << std::endl
             << "]";
         return oss.str();
     }
@@ -384,7 +362,12 @@ private:
     Float m_aperture_radius;
     Float m_normalization;
     Float m_x_fov;
-    Vector3f m_dx, m_dy;
+    Float m_pixel_spread;
+    Vector2f m_principal_point_offset, m_scaled_principal_point_offset;
+
+    MI_TRAVERSE_CB(Base, m_sample_to_camera, m_image_rect, m_aperture_radius,
+                   m_normalization, m_x_fov, m_pixel_spread, m_principal_point_offset,
+                   m_scaled_principal_point_offset)
 };
 
 MI_EXPORT_PLUGIN(ThinLensCamera)

@@ -3,7 +3,7 @@ from __future__ import annotations # Delayed parsing of type annotations
 import drjit as dr
 import mitsuba as mi
 
-from .common import PSIntegrator, mis_weight, solid_angle_to_area_jacobian
+from .common import PSIntegrator, mis_weight, reattach_wi, reattach_wo
 
 class DirectProjectiveIntegrator(PSIntegrator):
     r"""
@@ -18,8 +18,8 @@ class DirectProjectiveIntegrator(PSIntegrator):
        - |int|
        - Number of samples per pixel used to estimate the continuous
          derivatives. Unless it is zero, this parameter is overriden by the
-         `spp` argument of the `render()` method. If neither this parameter nor
-         the `spp` argument are defined, the `sample_count` of the film's
+         ``spp`` argument of the `mitsuba.render()` method. If neither this parameter nor
+         the ``spp`` argument are defined, the ``sample_count`` of the film's
          sampler will be used.
 
      * - sppp
@@ -27,17 +27,17 @@ class DirectProjectiveIntegrator(PSIntegrator):
        - Number of samples per pixel used to to estimate the gradients resulting
          from primary visibility changes (on the first segment of the light
          path: from the sensor to the first bounce) derivatives. Unless it is
-         zero, this parameter is overriden by the `spp` argument of the
-         `render()` method. If neither this parameter nor the `spp` argument are
-         defined, the `sample_count` of the film's sampler will be used.
+         zero, this parameter is overriden by the ``spp`` argument of the
+         `mitsuba.render()` method. If neither this parameter nor the ``spp`` argument are
+         defined, the ``sample_count`` of the film's sampler will be used.
 
      * - sppi
        - |int|
        - Number of samples per pixel used to to estimate the gradients resulting
          from indirect visibility changes  derivatives. Unless it is zero, this
-         parameter is overriden by the `spp` argument of the `render()` method.
-         If neither this parameter nor the `spp` argument are defined, the
-         `sample_count` of the film's sampler will be used.
+         parameter is overriden by the ``spp`` argument of the `mitsuba.render()` method.
+         If neither this parameter nor the ``spp`` argument are defined, the
+         ``sample_count`` of the film's sampler will be used.
 
      * - guiding
        - |string|
@@ -70,7 +70,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
     See the paper :cite:`Zhang2023Projective` for details on projective
     sampling, and guiding structures for indirect visibility discontinuities.
 
-    It is functionally equivalent with `prb_projective` when `max_depth` is set
+    It is functionally equivalent with ``prb_projective`` when ``max_depth`` is set
     to be 2.
 
     .. warning::
@@ -121,7 +121,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
                **kwargs # Absorbs unused arguments
     ) -> Tuple[mi.Spectrum, mi.Bool, List[mi.Float], Any]:
         """
-        See ``PSIntegrator.sample()`` for a description of this interface and
+        See `PSIntegrator.sample` for a description of this interface and
         the role of the various parameters and return values.
         """
         del depth, δL, state_in, kwargs  # Unused
@@ -145,64 +145,34 @@ class DirectProjectiveIntegrator(PSIntegrator):
             si = si_shade
         else:
             with dr.resume_grad(when=not primal):
-                si = scene.ray_intersect(ray, ray_flags=mi.RayFlags.All,
-                                         coherent=True, active=active)
+                # The camera mask hides emitters marked as invisible
+                si = scene.ray_intersect(
+                    ray, ray_flags=mi.RayFlags.Default, coherent=True,
+                    active=active,
+                    ray_mask=mi.RayMask.Primary)
 
-        # Hide the environment emitter if necessary
-        if not self.hide_emitters:
-            with dr.resume_grad(when=not primal):
-                L += si.emitter(scene).eval(si, active)
+        # The emitter lookup reuses the camera mask so that escaped rays
+        # ignore a hidden environment emitter
+        with dr.resume_grad(when=not primal):
+            emitter = si.emitter(scene, ray_mask=mi.RayMask.Primary, active=active)
+            L += emitter.eval(si, active)
 
         active_next = active & si.is_valid() & (self.max_depth > 1)
 
         # Get the BSDF
-        bsdf = si.bsdf(ray)
+        bsdf = si.bsdf()
 
         # ---------------------- Emitter sampling ----------------------
 
         # Is emitter sampling possible on the current vertex?
-        active_em_ = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+        active_em_ = active_next & bsdf.has_flag(mi.BSDFFlags.Smooth)
 
-        # If so, pick an emitter and sample a detached emitter direction
-        ds_em, emitter_val = scene.sample_emitter_direction(
-            si, sampler.next_2d(active_em_), test_visibility=True, active=active_em_)
-        active_em = active_em_ & (ds_em.pdf != 0.0)
-
+        # If so, sample an emitter. The sample is detached, and its weight
+        # is attached to the emitter and to the motion of 'si'.
         with dr.resume_grad(when=not primal):
-            # Re-compute some values with AD attached only in differentiable
-            # phase
-            if dr.hint(not primal, mode='scalar'):
-                is_surface = mi.has_flag(ds_em.emitter.flags(), mi.EmitterFlags.Surface)
-                is_infinite = mi.has_flag(ds_em.emitter.flags(), mi.EmitterFlags.Infinite)
-                is_spatially_varying = mi.has_flag(ds_em.emitter.flags(), mi.EmitterFlags.SpatiallyVarying)
-
-                # For textured area lights, we need to track UV changes on
-                # the emitter if it is moving
-                textured_area_em = active_em & is_surface & is_spatially_varying
-                ray_em = si.spawn_ray_to(ds_em.p)
-                # Move ray origin closer, visibibliy is already accounted for
-                ray_em.o = dr.fma(ray_em.d, ray_em.maxt, ray_em.o)
-                ray_em.maxt = dr.largest(ray_em.maxt)
-                si_em = scene.ray_intersect(ray_em, textured_area_em)
-
-                # Re-attach gradients for the the `ds_em` struct
-                ds_em_diff = mi.DirectionSample3f(scene, si_em, si)
-                ds_em_diff = dr.select(textured_area_em, ds_em_diff, dr.zeros(mi.DirectionSample3f))
-                ds_em_diff.d = dr.select(textured_area_em, ds_em_diff.d, dr.normalize(ds_em.p - si.p))
-                ds_em_diff.d = dr.select(~is_infinite, ds_em_diff.d, ds_em.d)
-                ds_em = dr.replace_grad(ds_em, ds_em_diff)
-
-                # to differentiate the solid angle to surface area
-                # reparameterization.
-                J = solid_angle_to_area_jacobian(
-                    si.p, dr.detach(ds_em.p), dr.detach(ds_em.n), active_em & is_surface
-                )
-
-                # Re-compute attached `emitter_val` to enable emitter optimization
-                spec_em = scene.eval_emitter_direction(si, ds_em, active_em)
-                inv_ds_pdf = dr.select(ds_em.pdf != 0, dr.rcp(ds_em.pdf), 0)
-                emitter_val = dr.replace_grad(emitter_val, spec_em * dr.detach(inv_ds_pdf))
-                emitter_val *= dr.relative_grad(J)
+            ds_em, emitter_val = scene.sample_emitter_direction(
+                si, sampler.next_2d(active_em_), test_visibility=True, active=active_em_)
+            active_em = active_em_ & (ds_em.pdf != 0.0)
 
             # Evaluate the BSDF (foreshortening term included)
             wo = si.to_local(ds_em.d)
@@ -219,43 +189,48 @@ class DirectProjectiveIntegrator(PSIntegrator):
         sample_bsdf, weight_bsdf = bsdf.sample(bsdf_ctx, si, sampler.next_1d(active_next),
                                                sampler.next_2d(active_next), active_next)
         active_bsdf = active_next & dr.any(mi.unpolarized_spectrum(weight_bsdf) != 0.0)
-        delta_bsdf = mi.has_flag(sample_bsdf.sampled_type, mi.BSDFFlags.Delta)
+        delta_bsdf = sample_bsdf.is_delta()
 
         # Construct the BSDF sampled ray
         ray_bsdf = si.spawn_ray(si.to_world(sample_bsdf.wo))
 
+        # A ray that leaves through a specular lobe, including a null one,
+        # remains a camera ray.
+        has_null = scene.has_null_shapes()
+        null = sample_bsdf.is_null() if has_null else mi.Bool(False)
+        ray_mask = dr.select(delta_bsdf, mi.RayMask.Primary,
+                             mi.RayMask.Secondary)
+
         with dr.resume_grad(when=not primal):
-            # Trace the BSDF sampled ray
-            si_bsdf = scene.ray_intersect(ray_bsdf, active=active_bsdf)
+            # Trace the BSDF sampled ray. Like shadow rays, it passes through
+            # null surfaces so that both strategies reach the same emitters.
+            si_bsdf, tr_bsdf = scene.ray_intersect_tr(
+                ray_bsdf, active=active_bsdf, ray_mask=ray_mask)
 
             if dr.hint(not primal, mode='scalar'):
-                si_bsdf_detached = dr.detach(si_bsdf)
-
-                # Re-compute `weight_bsdf` with AD attached only in
-                # differentiable phase
-                J = solid_angle_to_area_jacobian(
-                    si.p, si_bsdf_detached.p, si_bsdf_detached.n, active_next & si_bsdf.is_valid()
-                )
-
-                # Recompute 'wo' to propagate derivatives to cosine term
-                wo_world_diff = dr.normalize(si_bsdf_detached.p - si.p)
-                wo_world = dr.replace_grad(
-                    ray_bsdf.d,
-                    dr.select(si_bsdf.is_valid(), wo_world_diff, ray_bsdf.d)
-                )
-                wo = si.to_local(wo_world)
+                # Re-compute `weight_bsdf` with AD attached only in the
+                # differentiable phase. The direction to the next vertex and
+                # the geometry term account for the motion of 'si'.
+                wo, J = reattach_wo(si, si_bsdf, ray_bsdf, active_next)
 
                 bsdf_val, bsdf_pdf = bsdf.eval_pdf(bsdf_ctx, si, wo, active_bsdf)
+
+                # A null crossing continues with the null transmission instead
+                if dr.hint(has_null, mode='scalar'):
+                    null &= active_bsdf
+                    bsdf_val[null] = bsdf.eval_null(si, null)
+                    bsdf_pdf[null] = sample_bsdf.pdf
+
                 inv_bsdf_pdf = dr.select(bsdf_pdf != 0, dr.rcp(bsdf_pdf), 0)
                 weight_bsdf = dr.replace_grad(weight_bsdf, bsdf_val * dr.detach(inv_bsdf_pdf))
                 weight_bsdf *= dr.relative_grad(J)
 
-                # Re-attach si_bsdf.wi if si.p was moving
-                wi_global = dr.normalize(si.p - si_bsdf_detached.p)
-                si.wi = dr.replace_grad(si.wi, si_bsdf_detached.to_local(wi_global))
+                # Account for the motion of 'si' in the incident direction
+                # at the next vertex
+                reattach_wi(si_bsdf, si.p)
 
             # Evaluate the emitter
-            L_bsdf = si_bsdf.emitter(scene, active_bsdf).eval(si_bsdf, active_bsdf)
+            L_bsdf = si_bsdf.emitter(scene, ray_mask=ray_mask, active=active_bsdf).eval(si_bsdf, active_bsdf)
 
             # Compute the detached MIS weight for the BSDF sample
             ds_bsdf = mi.DirectionSample3f(scene, si=si_bsdf, ref=si)
@@ -263,7 +238,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
                 ref=si, ds=ds_bsdf, active=active_bsdf & ~delta_bsdf)
             mis_bsdf = dr.select(delta_bsdf, 1.0, mis_weight(sample_bsdf.pdf, pdf_emitter))
 
-            L[active_bsdf] += L_bsdf * weight_bsdf * mis_bsdf
+            L[active_bsdf] += weight_bsdf * tr_bsdf * L_bsdf * mis_bsdf
 
         # ---------------------- Seed rays for projection ----------------------
 
@@ -278,7 +253,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
             elif self.project_seed == "emitter":
                 # Return emitter sampling rays including the ones that fail
                 # `test_visibility`
-                ray_em = si.spawn_ray_to(ds_em.p)
+                ray_em = si.spawn_ray_to(ds_em)
                 ray_em.maxt = dr.largest(mi.Float)
 
                 # Directions towards the interior have no contribution for
@@ -288,7 +263,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
                 guide_seed = [dr.detach(ray_em), mi.Bool(active_guide)]
             elif self.project_seed == "both":
                 # By default we use the emitter sample as the seed ray
-                ray_seed = si.spawn_ray_to(ds_em.p)
+                ray_seed = si.spawn_ray_to(ds_em)
                 ray_seed.maxt = dr.largest(mi.Float)
                 active_guide = active_em_ & (dr.dot(si.n, ray_seed.d) > 0)
 
@@ -307,9 +282,10 @@ class DirectProjectiveIntegrator(PSIntegrator):
 
             # ----------- Estimate the radiance of the background -----------
 
+            # The ray passes through null surfaces like a BSDF-sampled ray
             ray_bg = ss.spawn_ray(wavelengths)
-            si_bg = scene.ray_intersect(ray_bg, active=active)
-            radiance_bg = si_bg.emitter(scene).eval(si_bg, active)
+            si_bg, tr_bg = scene.ray_intersect_tr(ray_bg, active=active)
+            radiance_bg = tr_bg * si_bg.emitter(scene).eval(si_bg, active)
 
             # ----------- Estimate the radiance of the foreground -----------
 
@@ -330,8 +306,8 @@ class DirectProjectiveIntegrator(PSIntegrator):
 
             # The ray origin is wrong, but this is fine if we only need the primal
             # radiance
-            si_fg = pi_fg.compute_surface_interaction(
-                dummy_ray, mi.RayFlags.All, active)
+            si_fg = scene.compute_surface_interaction(
+                dummy_ray, pi_fg, mi.RayFlags.Default, active)
 
             # We know the incident direction is valid since this is the
             # foreground interaction. Overwrite the incident direction to avoid
@@ -361,8 +337,8 @@ class DirectProjectiveIntegrator(PSIntegrator):
 
             # The ray origin is wrong, but this is fine if we only need the primal
             # radiance
-            si_fg = pi_fg.compute_surface_interaction(
-                dummy_ray, mi.RayFlags.All, active)
+            si_fg = scene.compute_surface_interaction(
+                dummy_ray, pi_fg, mi.RayFlags.Default, active)
 
             # If smooth normals are used, it is possible that the computed
             # shading normal near visibility silhouette points to the wrong side
@@ -411,7 +387,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
         ss_importance.d = -ss_importance.d
         ray_boundary = ss_importance.spawn_ray(wavelengths)
         si_boundary = scene.ray_intersect(ray_boundary,
-                                          ray_flags=mi.RayFlags.All,
+                                          ray_flags=mi.RayFlags.Default,
                                           coherent=False,
                                           reorder=True,
                                           active=active)
@@ -423,9 +399,11 @@ class DirectProjectiveIntegrator(PSIntegrator):
         sensor_ds, sensor_weight = sensor.sample_direction(it, sampler.next_2d(active), active)
         active &= (sensor_ds.pdf != 0)
 
-        # Visibility to sensor
+        # Transmittance towards the sensor (zero when occluded)
         cam_test_ray = si_boundary.spawn_ray_to(sensor_ds.p)
-        active &= ~scene.ray_test(cam_test_ray, active)
+        tr = scene.ray_test_tr(cam_test_ray, active=active,
+                               ray_mask=mi.RayMask.Primary)
+        active &= dr.any(mi.unpolarized_spectrum(tr) != 0)
 
         # Evaluate the BSDF
         bsdf_ctx = mi.BSDFContext(mi.TransportMode.Importance)
@@ -434,7 +412,7 @@ class DirectProjectiveIntegrator(PSIntegrator):
             bsdf_ctx, si_boundary, wo_local, active)
         active &= (dr.max(bsdf_val) != 0)
 
-        importance = bsdf_val * sensor_weight
+        importance = bsdf_val * sensor_weight * tr
         return importance, sensor_ds.uv, mi.UInt32(2), active
 
 mi.register_integrator("direct_projective", lambda props: DirectProjectiveIntegrator(props))

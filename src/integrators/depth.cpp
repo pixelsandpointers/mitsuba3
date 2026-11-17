@@ -36,14 +36,13 @@ public:
 
     std::pair<Spectrum, Mask> sample(const Scene *scene,
                                      Sampler * /* sampler */,
-                                     const RayDifferential3f &ray,
+                                     const Ray3f &ray,
                                      const Medium * /* medium */,
-                                     Float * /* aovs */,
                                      Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
 
         PreliminaryIntersection3f pi = scene->ray_intersect_preliminary(
-            ray, /* coherent = */ true, /* reorder = */ false, 0, 0, active);
+            ray, /* coherent = */ true, +RayMask::Primary, active);
 
         return {
             dr::select(pi.is_valid(), pi.t, 0.f),

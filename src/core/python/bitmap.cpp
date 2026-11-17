@@ -16,17 +16,16 @@ struct fp16 {
 };
 static_assert(sizeof(fp16) == 2);
 
-namespace nanobind {
-    template <> struct ndarray_traits<fp16> {
-        static constexpr bool is_complex = false;
-        static constexpr bool is_float   = true;
-        static constexpr bool is_bool    = false;
-        static constexpr bool is_int     = false;
-        static constexpr bool is_signed  = true;
+namespace nanobind::detail {
+    template <> struct dtype_traits<fp16> {
+        static constexpr dlpack::dtype value{
+            (uint8_t) dlpack::dtype_code::Float, 16, 1
+        };
+        static constexpr auto name = const_name("float16");
     };
 }
 
-using ContigCpuNdArray = nb::ndarray<nb::device::cpu, nb::c_contig>;
+using ContigCpuNdArray = nb::ndarray<nb::ro, nb::device::cpu, nb::c_contig>;
 
 void from_cpu_dlpack(Bitmap *b, ContigCpuNdArray data,
                      nb::object pixel_format_,
@@ -294,6 +293,8 @@ MI_PY_EXPORT(Bitmap) {
         .def("split", &Bitmap::split, D(Bitmap, split))
         .def_static("detect_file_format", &Bitmap::detect_file_format,
                     D(Bitmap, detect_file_format))
+        .def_static("pixel_format_from_channels", &Bitmap::pixel_format_from_channels,
+                    "channels"_a, D(Bitmap, pixel_format_from_channels))
         .def(
             "__dlpack__",
             [](Bitmap &bitmap, nb::object /*stream*/) {

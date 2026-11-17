@@ -7,7 +7,7 @@
 #if defined(MI_ENABLE_METAL)
 
 #include <mitsuba/core/logger.h>
-#include "metal/shapes.h"
+#include <mitsuba/core/transform.h>
 #include <drjit-core/metal.h>
 
 #include <algorithm>
@@ -20,20 +20,7 @@
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
 
-/// Precompiled intersection-function library (built from
-/// metal/intersection_functions.metal), embedded as a byte array by CMakeLists.
-extern "C" const unsigned char mi_metal_isect_metallib[];
-extern "C" const size_t mi_metal_isect_metallib_size;
-
 NAMESPACE_BEGIN(mitsuba)
-
-/// MSL function names, in MetalIntersectionFn order.
-static const char *const metal_isect_fn_names[] = {
-    "intersection_sphere",     "intersection_disk", "intersection_cylinder",
-    "intersection_ellipsoids", "intersection_sdfgrid"
-};
-static_assert(std::size(metal_isect_fn_names) == METAL_ISECT_FN_COUNT,
-              "metal_isect_fn_names must have one entry per MetalIntersectionFn.");
 
 /// Map a Dr.Jit device pointer back to its MTLBuffer + byte offset. Dr.Jit owns
 /// the retained object.
@@ -101,35 +88,14 @@ struct MetalAccelData {
     std::vector<id<MTLBuffer>> buffers;
     /// Dr.Jit-backed scene-resident buffers.
     std::vector<BufferAllocation> allocations;
+    /// Intersection function bindings of custom shapes
+    std::vector<JitIsectBinding *> bindings;
+
+    ~MetalAccelData() {
+        for (JitIsectBinding *binding : bindings)
+            jit_isect_unbind(binding);
+    }
 };
-
-/// Instantiate (once per device) the shared intersection-function library.
-/// Dr.Jit caches pipelines across scenes and resolves function handles against
-/// the linked library, so all scenes must share one library.
-static id<MTLLibrary> intersection_fn_library(id<MTLDevice> device) {
-    static std::mutex mutex;
-    static id<MTLDevice> cached_device = nil;
-    static id<MTLLibrary> cached_library = nil;
-    std::lock_guard<std::mutex> guard(mutex);
-    if (cached_library && cached_device == device)
-        return cached_library;
-
-    dispatch_data_t lib_data = dispatch_data_create(
-        mi_metal_isect_metallib, mi_metal_isect_metallib_size, nullptr,
-        DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-
-    NSError *error = nil;
-    id<MTLLibrary> library = [device newLibraryWithData: lib_data error: &error];
-    if (!library)
-        Throw("MetalAccel: failed to instantiate the precompiled intersection "
-              "function library: %s",
-              error ? error.localizedDescription.UTF8String
-                    : "no error information");
-
-    cached_device = device;
-    cached_library = library;
-    return library;
-}
 
 /// Allocate output + scratch storage for an acceleration structure and encode
 /// its build into \c enc. The scratch allocation is appended to
@@ -213,11 +179,46 @@ static void compact_blases(id<MTLDevice> device, id<MTLCommandQueue> queue,
     // The caller encodes the TLAS into this command buffer.
 }
 
+/// Convert a keyframe to ``MTLComponentTransform``
+static MTLComponentTransform to_component_transform(const KeyframeIR &kf) {
+    MTLComponentTransform ct = {};
+    ct.scale = MTLPackedFloat3Make(kf.scale[0], kf.scale[1], kf.scale[2]);
+    ct.pivot = MTLPackedFloat3Make(0.f, 0.f, 0.f);
+    ct.rotation = MTLPackedFloatQuaternionMake(kf.quat[0], kf.quat[1], kf.quat[2], kf.quat[3]);
+    ct.translation = MTLPackedFloat3Make(kf.trans[0], kf.trans[1], kf.trans[2]);
+    return ct;
+}
+
+/// Convert a column-major 3x4 instance matrix to ``MTLComponentTransform``.
+/// Metal motion acceleration structures also require this representation for
+/// static instances, whose matrices may contain shear.
+static MTLComponentTransform to_component_transform(const float to_world[12]) {
+    using Matrix4f = dr::Matrix<float, 4>;
+
+    Matrix4f m = dr::identity<Matrix4f>();
+    for (size_t col = 0; col < 4; ++col)
+        for (size_t row = 0; row < 3; ++row)
+            m(row, col) = to_world[col * 3 + row];
+
+    auto [S, H, Q, T] = dr::transform_decompose_qr(m);
+
+    MTLComponentTransform ct = {};
+    ct.scale = MTLPackedFloat3Make(S.x(), S.y(), S.z());
+    ct.shear = MTLPackedFloat3Make(H.x(), H.y(), H.z());
+    ct.pivot = MTLPackedFloat3Make(0.f, 0.f, 0.f);
+    ct.rotation = MTLPackedFloatQuaternionMake(Q.x(), Q.y(), Q.z(), Q.w());
+    ct.translation = MTLPackedFloat3Make(T.x(), T.y(), T.z());
+    return ct;
+}
+
 /// Build all Metal objects for the lowered scene and register a fresh Dr.Jit
 /// scene variable.
 static std::pair<MetalAccelData *, uint32_t>
-build_impl(const std::vector<BlasEntry> &blases,
-           const std::vector<InstanceEntry> &instances, bool compact) {
+build_impl(const SceneIR &sd, const std::vector<uint32_t> &user_ids,
+           bool compact) {
+    const std::vector<BlasEntry> &blases = sd.blases;
+    const std::vector<InstanceEntry> &instances = sd.instances;
+
     @autoreleasepool {
         id<MTLDevice> device = (__bridge id<MTLDevice>) jit_metal_context();
         id<MTLCommandQueue> queue =
@@ -232,25 +233,20 @@ build_impl(const std::vector<BlasEntry> &blases,
         // below. Any Throw before then frees them automatically.
         auto accel = std::make_unique<MetalAccelData>();
 
-        // Pre-pass: size one combined primitive-data buffer per custom shape
-        // type. The MSL intersection functions locate their slice via the
-        // (instance, geometry) lookup table built below.
-        size_t type_total[METAL_ISECT_FN_COUNT] = {};
-        size_t type_elem_size[METAL_ISECT_FN_COUNT] = {};
-        bool any_custom = false, any_curves = false;
+        // Pre-pass over the geometry kinds. Custom shapes are intersected by
+        // functions that Dr.Jit compiles from the shape's recorded
+        // ray_intersect_preliminary(). Each occupies one entry of the
+        // scene's intersection function table, in BLAS and geometry order.
+        bool any_curves = false;
         bool any_backface_culled_triangles = false;
         std::vector<bool> blas_backface_cull(blases.size(), false);
-
-        // SDFGrid data is variable-length: tracked by 16-byte-aligned byte
-        // offsets rather than element counts.
-        auto align16 = [](size_t v) { return (v + 15) & ~(size_t) 15; };
-        size_t sdf_total = 0;
-
-        // Total AABB count across custom geometries (see aabb_pool below).
+        std::vector<uint32_t> blas_ift_base(blases.size(), 0u);
+        uint32_t n_isect = 0;
         size_t aabb_total = 0;
 
         for (size_t blas_idx = 0; blas_idx < blases.size(); ++blas_idx) {
             const BlasEntry &blas = blases[blas_idx];
+            blas_ift_base[blas_idx] = n_isect;
             for (const ShapeIR &g : blas.geoms) {
                 if (g.kind == ShapeIR::Kind::BSplineCurve ||
                     g.kind == ShapeIR::Kind::LinearCurve)
@@ -259,71 +255,17 @@ build_impl(const std::vector<BlasEntry> &blases,
                     any_backface_culled_triangles = true;
                     blas_backface_cull[blas_idx] = true;
                 }
-                if (g.kind != ShapeIR::Kind::Custom)
-                    continue;
-                any_custom = true;
-                uint32_t fn = metal_fn_index(g.type);
-                if (fn >= METAL_ISECT_FN_COUNT)
-                    Throw("MetalAccel: shape type 0x%x has no intersection "
-                          "function.", (uint32_t) g.type);
-                aabb_total += g.prim_count;
-                size_t total = g.data_size_bytes();
-                if (fn == METAL_ISECT_FN_SDFGRID)
-                    sdf_total += align16(total);
-                else if (g.pdata_size > 0 && g.prim_count > 0) {
-                    // The combined buffer strides by a single per-type element
-                    // size, so all shapes of one type must agree on it.
-                    if (type_elem_size[fn] != 0 &&
-                        type_elem_size[fn] != g.pdata_size)
-                        Throw("MetalAccel: shapes of type 0x%x disagree on "
-                              "their per-primitive data size (%zu vs %zu).",
-                              (uint32_t) g.type, type_elem_size[fn],
-                              (size_t) g.pdata_size);
-                    type_total[fn] += g.prim_count;
-                    type_elem_size[fn] = g.pdata_size;
+                if (g.kind == ShapeIR::Kind::Custom) {
+                    n_isect++;
+                    if (!g.aabb_buffer)
+                        aabb_total += g.prim_count;
                 }
             }
-        }
-
-        id<MTLBuffer> combined_buf[METAL_ISECT_FN_COUNT] = {};
-        void *combined_ptr[METAL_ISECT_FN_COUNT] = {};
-        size_t type_cursor[METAL_ISECT_FN_COUNT] = {};
-        for (uint32_t t = 0; t < METAL_ISECT_FN_COUNT; ++t) {
-            if (type_total[t] == 0)
-                continue;
-            BufferAllocation alloc(type_total[t] * type_elem_size[t], true);
-            combined_ptr[t] = alloc.ptr;
-            combined_buf[t] = alloc.buffer();
-            accel->buffers.push_back(combined_buf[t]);
-            accel->allocations.push_back(std::move(alloc));
-        }
-
-        id<MTLBuffer> sdf_buf = nil;
-        void *sdf_ptr = nullptr;
-        size_t sdf_cursor = 0;
-        if (sdf_total > 0) {
-            BufferAllocation alloc(sdf_total, true);
-            sdf_ptr = alloc.ptr;
-            sdf_buf = alloc.buffer();
-            accel->buffers.push_back(sdf_buf);
-            accel->allocations.push_back(std::move(alloc));
         }
 
         // ------------------------------------------------------------------
         // Build one BLAS per IR entry.
         // ------------------------------------------------------------------
-
-        // IFT names follow bounding-box geometries in BLAS/geometry order.
-        std::vector<const char *> ift_names;
-
-        // Per-BLAS values consumed by the TLAS instance descriptors below
-        std::vector<uint32_t> blas_ift_base(blases.size(), 0u);
-
-        // Per-BLAS lookup records: one word per bounding-box geometry holding
-        // its slice in the type's combined data buffer (an element index, or a
-        // byte offset for SDFGrid). BLASes are single-kind, so a geometry's
-        // geometry_id is its position within these records.
-        std::vector<std::vector<uint32_t>> blas_lookup(blases.size());
 
         // One command buffer holds the BLAS builds and, unless compaction is
         // requested, the TLAS build.
@@ -352,8 +294,6 @@ build_impl(const std::vector<BlasEntry> &blases,
 
             NSMutableArray<MTLAccelerationStructureGeometryDescriptor *>
                 *geoms = [NSMutableArray arrayWithCapacity: blas.geoms.size()];
-            uint32_t local_ift_idx = 0;
-
             for (const ShapeIR &g : blas.geoms) {
                 switch (g.kind) {
                     case ShapeIR::Kind::Triangles:
@@ -369,11 +309,15 @@ build_impl(const std::vector<BlasEntry> &blases,
                         [blas_enc useResource: v_buf usage: MTLResourceUsageRead];
                         [blas_enc useResource: i_buf usage: MTLResourceUsageRead];
 
+                        // Metal has no index stride parameter; describe()
+                        // supplies a tightly packed buffer.
+                        Assert(g.index_stride == 3 * sizeof(uint32_t));
+
                         MTLAccelerationStructureTriangleGeometryDescriptor *gd =
                             [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
                         gd.vertexBuffer       = v_buf;
                         gd.vertexBufferOffset = v_off;
-                        gd.vertexStride       = 3 * sizeof(float);
+                        gd.vertexStride       = g.vertex_stride;
                         gd.vertexFormat       = MTLAttributeFormatFloat3;
                         gd.indexBuffer        = i_buf;
                         gd.indexBufferOffset  = i_off;
@@ -428,7 +372,9 @@ build_impl(const std::vector<BlasEntry> &blases,
                                                           ? MTLCurveBasisBSpline
                                                           : MTLCurveBasisLinear;
                         gd.curveType                = MTLCurveTypeRound;
-                        gd.curveEndCaps             = MTLCurveEndCapsSphere;
+                        gd.curveEndCaps             = bspline
+                                                          ? MTLCurveEndCapsNone
+                                                          : MTLCurveEndCapsSphere;
                         gd.opaque                   = YES;
                         [geoms addObject: gd];
 
@@ -438,52 +384,35 @@ build_impl(const std::vector<BlasEntry> &blases,
                     }
 
                     case ShapeIR::Kind::Custom: {
-                        uint32_t fn = metal_fn_index(g.type);
-                        size_t total = g.data_size_bytes();
-                        if (g.prim_count == 0 || total == 0)
+                        if (g.prim_count == 0)
                             Throw("MetalAccel: bounding-box geometry with "
-                                  "zero AABBs / no primitive data.");
+                                  "zero AABBs.");
 
-                        // This geometry's slice of the shared AABB pool.
-                        size_t aabb_off = aabb_cursor * 6 * sizeof(float);
-                        g.fill_aabbs(g.ctx,
-                                     (uint8_t *) aabb_pool_ptr + aabb_off);
-                        aabb_cursor += g.prim_count;
-
-                        // Write the primitive data and record the geometry's
-                        // slice in the lookup table (an element index for
-                        // fixed-size types, a byte offset for SDFGrid).
-                        uint32_t lookup_value = 0;
-                        if (fn == METAL_ISECT_FN_SDFGRID) {
-                            size_t offset = sdf_cursor;
-                            g.fill_data(g.ctx, (uint8_t *) sdf_ptr + offset);
-                            sdf_cursor += align16(total);
-                            lookup_value = (uint32_t) offset;
-                        } else if (combined_buf[fn]) {
-                            size_t elem = type_cursor[fn];
-                            uint8_t *dst =
-                                (uint8_t *) combined_ptr[fn] +
-                                elem * type_elem_size[fn];
-                            g.fill_data(g.ctx, dst);
-                            type_cursor[fn] += g.prim_count;
-                            lookup_value = (uint32_t) elem;
+                        // The shape's own device boxes, or its slice of the
+                        // shared AABB pool
+                        id<MTLBuffer> aabb_buf = aabb_pool;
+                        size_t aabb_off = 0;
+                        if (g.aabb_buffer) {
+                            aabb_buf = lookup_buffer(g.aabb_buffer, &aabb_off,
+                                                     "bounding box");
+                            [blas_enc useResource: aabb_buf usage: MTLResourceUsageRead];
+                        } else {
+                            aabb_off = aabb_cursor * 6 * sizeof(float);
+                            g.fill_aabbs(g.ctx, (uint8_t *) aabb_pool_ptr + aabb_off);
+                            aabb_cursor += g.prim_count;
                         }
-                        blas_lookup[blas_idx].push_back(lookup_value);
 
+                        // BLASes are single-kind, so the geometry's position
+                        // is its offset into the BLAS's slice of the table
                         MTLAccelerationStructureBoundingBoxGeometryDescriptor *gd =
                             [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
-                        gd.boundingBoxBuffer       = aabb_pool;
+                        gd.boundingBoxBuffer       = aabb_buf;
                         gd.boundingBoxBufferOffset = aabb_off;
                         gd.boundingBoxStride       = 6 * sizeof(float);
                         gd.boundingBoxCount        = g.prim_count;
-                        gd.intersectionFunctionTableOffset = local_ift_idx;
+                        gd.intersectionFunctionTableOffset = geoms.count;
                         gd.opaque                  = YES;
                         [geoms addObject: gd];
-
-                        if (local_ift_idx == 0)
-                            blas_ift_base[blas_idx] = (uint32_t) ift_names.size();
-                        ift_names.push_back(metal_isect_fn_names[fn]);
-                        ++local_ift_idx;
                         break;
                     }
 
@@ -508,72 +437,101 @@ build_impl(const std::vector<BlasEntry> &blases,
         if (compact)
             compact_blases(device, queue, cb, accel.get(), temp_allocations);
 
-        // Build the (instance, geometry) -> data-slice lookup table: the first
-        // n_instances words hold each instance's base into the per-BLAS records
-        // that follow (see intersection_functions.metal).
         if (instances.empty())
             Throw("MetalAccel: scene description contains no instances.");
-
-        id<MTLBuffer> lookup_buf = nil;
-        void *lookup_ptr = nullptr;
-        if (any_custom) {
-            size_t n_inst = instances.size();
-            std::vector<uint32_t> blas_lookup_base(blases.size(), 0u);
-            uint32_t cursor = (uint32_t) n_inst;
-            for (size_t b = 0; b < blases.size(); ++b) {
-                blas_lookup_base[b] = cursor;
-                cursor += (uint32_t) blas_lookup[b].size();
-            }
-
-            BufferAllocation alloc(cursor * sizeof(uint32_t), true);
-            lookup_ptr = alloc.ptr;
-            lookup_buf = alloc.buffer();
-            uint32_t *lookup = (uint32_t *) lookup_ptr;
-            for (size_t i = 0; i < n_inst; ++i)
-                lookup[i] = blas_lookup_base[instances[i].blas_index];
-            for (size_t b = 0; b < blases.size(); ++b)
-                std::copy(blas_lookup[b].begin(), blas_lookup[b].end(),
-                          lookup + blas_lookup_base[b]);
-            accel->buffers.push_back(lookup_buf);
-            accel->allocations.push_back(std::move(alloc));
-        }
 
         // ------------------------------------------------------------------
         // Build the TLAS over all instances
         // ------------------------------------------------------------------
-        // userID is recovered on the device as pi.instance: the owning
-        // Instance's registry id, or 0 (a null shape) for a top-level shape,
-        // matching the OptiX backend. [[instance_id]] stays the raw instance
-        // index the IFT lookup table is keyed by.
+        // userID is the entry's base index into the shape recovery table
+        // (see scene_metal.inl); the intersection function table offset is
+        // the BLAS's first entry in the scene's table.
         size_t n_inst = instances.size();
-        BufferAllocation inst_alloc(
-            n_inst * sizeof(MTLAccelerationStructureUserIDInstanceDescriptor),
-            true);
-        id<MTLBuffer> inst_buf = inst_alloc.buffer();
-        void *inst_ptr = inst_alloc.ptr;
-        auto *inst_descs =
-            (MTLAccelerationStructureUserIDInstanceDescriptor *) inst_ptr;
-        temp_allocations.push_back(std::move(inst_alloc));
-        for (size_t i = 0; i < n_inst; ++i) {
+
+        id<MTLBuffer> inst_buf = nil;
+        id<MTLBuffer> motion_transforms_buf = nil;
+        size_t total_motion_transforms = 0;
+
+        // Shared between both descriptor layouts.
+        auto fill_common = [&](auto &d, size_t i) {
             const InstanceEntry &inst = instances[i];
-            MTLAccelerationStructureUserIDInstanceDescriptor &d = inst_descs[i];
-            d = {};
-            for (int col = 0; col < 4; ++col)
-                d.transformationMatrix.columns[col] =
-                    MTLPackedFloat3Make(inst.to_world[col * 3 + 0],
-                                        inst.to_world[col * 3 + 1],
-                                        inst.to_world[col * 3 + 2]);
-            d.options                         = MTLAccelerationStructureInstanceOptionOpaque;
+            d.options = MTLAccelerationStructureInstanceOptionOpaque;
             if (any_backface_culled_triangles &&
                 !blas_backface_cull[inst.blas_index])
                 d.options |= MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
-            d.mask                            = 0xFFu;
+            d.mask                            = blases[inst.blas_index].visibility_mask;
             d.intersectionFunctionTableOffset = blas_ift_base[inst.blas_index];
             d.accelerationStructureIndex      = inst.blas_index;
-            d.userID                          =
-                inst.owner_registry_id == SCENE_IR_NO_OWNER
-                    ? 0u
-                    : inst.owner_registry_id;
+            d.userID                          = user_ids[i];
+        };
+
+        if (sd.has_motion) {
+            // Static instances still occupy one keyframe so that every entry
+            // has an addressable range in the shared transform buffer.
+            for (const InstanceEntry &inst : instances)
+                total_motion_transforms += std::max((size_t) 1, sd.keyframes(inst).size());
+
+            BufferAllocation inst_alloc(
+                n_inst * sizeof(MTLAccelerationStructureMotionInstanceDescriptor),
+                true);
+            inst_buf = inst_alloc.buffer();
+            auto *inst_descs =
+                (MTLAccelerationStructureMotionInstanceDescriptor *) inst_alloc.ptr;
+            temp_allocations.push_back(std::move(inst_alloc));
+
+            BufferAllocation motion_alloc(
+                total_motion_transforms * sizeof(MTLComponentTransform), true);
+            motion_transforms_buf = motion_alloc.buffer();
+            auto *motion_transforms = (MTLComponentTransform *) motion_alloc.ptr;
+            temp_allocations.push_back(std::move(motion_alloc));
+
+            size_t transform_index = 0;
+            for (size_t i = 0; i < n_inst; ++i) {
+                const InstanceEntry &inst = instances[i];
+                const std::vector<KeyframeIR> &keyframes = sd.keyframes(inst);
+                MTLAccelerationStructureMotionInstanceDescriptor &d = inst_descs[i];
+                d = {};
+                fill_common(d, i);
+
+                d.motionTransformsStartIndex = (uint32_t) transform_index;
+                d.motionStartBorderMode      = MTLMotionBorderModeClamp;
+                d.motionEndBorderMode        = MTLMotionBorderModeClamp;
+
+                if (keyframes.size() > 1) {
+                    d.motionTransformsCount = (uint32_t) keyframes.size();
+                    d.motionStartTime       = keyframes.front().time;
+                    d.motionEndTime         = keyframes.back().time;
+                    for (const KeyframeIR &kf : keyframes)
+                        motion_transforms[transform_index++] = to_component_transform(kf);
+                } else {
+                    // Static entries use a single key, clamped over the whole range.
+                    // A top-level BLAS has an identity 'to_world'.
+                    d.motionTransformsCount = 1;
+                    d.motionStartTime       = 0.f;
+                    d.motionEndTime         = 1.f;
+                    motion_transforms[transform_index++] =
+                        to_component_transform(inst.to_world);
+                }
+            }
+        } else {
+            BufferAllocation inst_alloc(
+                n_inst * sizeof(MTLAccelerationStructureUserIDInstanceDescriptor),
+                true);
+            inst_buf = inst_alloc.buffer();
+            auto *inst_descs =
+                (MTLAccelerationStructureUserIDInstanceDescriptor *) inst_alloc.ptr;
+            temp_allocations.push_back(std::move(inst_alloc));
+            for (size_t i = 0; i < n_inst; ++i) {
+                const InstanceEntry &inst = instances[i];
+                MTLAccelerationStructureUserIDInstanceDescriptor &d = inst_descs[i];
+                d = {};
+                for (int col = 0; col < 4; ++col)
+                    d.transformationMatrix.columns[col] =
+                        MTLPackedFloat3Make(inst.to_world[col * 3 + 0],
+                                            inst.to_world[col * 3 + 1],
+                                            inst.to_world[col * 3 + 2]);
+                fill_common(d, i);
+            }
         }
 
         NSMutableArray<id<MTLAccelerationStructure>> *blas_array =
@@ -586,8 +544,21 @@ build_impl(const std::vector<BlasEntry> &blases,
         tdesc.instancedAccelerationStructures = blas_array;
         tdesc.instanceDescriptorBuffer        = inst_buf;
         tdesc.instanceCount                   = n_inst;
-        tdesc.instanceDescriptorType =
-            MTLAccelerationStructureInstanceDescriptorTypeUserID;
+        if (sd.has_motion) {
+            tdesc.instanceDescriptorType =
+                MTLAccelerationStructureInstanceDescriptorTypeMotion;
+            tdesc.motionTransformBuffer = motion_transforms_buf;
+            tdesc.motionTransformCount  = total_motion_transforms;
+            tdesc.motionTransformType   = MTLTransformTypeComponent;
+            tdesc.motionTransformStride = sizeof(MTLComponentTransform);
+            tdesc.instanceDescriptorStride =
+                sizeof(MTLAccelerationStructureMotionInstanceDescriptor);
+        } else {
+            tdesc.instanceDescriptorType =
+                MTLAccelerationStructureInstanceDescriptorTypeUserID;
+            tdesc.instanceDescriptorStride =
+                sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
+        }
 
         // TLAS encoder, ordered after the BLAS builds via Metal's inter-encoder
         // resource tracking.
@@ -605,17 +576,14 @@ build_impl(const std::vector<BlasEntry> &blases,
         // ------------------------------------------------------------------
         // Register the scene with Dr.Jit
         // ------------------------------------------------------------------
-        // Per-device singleton library. The Dr.Jit scene retains its own ref.
-        id<MTLLibrary> isect_library =
-            any_custom ? intersection_fn_library(device) : nil;
-
-        // Bit 0: triangles, bit 1: bounding boxes, bit 2: curves, bit 3:
-        // triangle backface culling. Dr.Jit uses this to select the MSL
-        // intersector<...> template tags and culling mode.
+        // Bits 0 through 4 indicate triangles, bounding boxes, curves, triangle
+        // backface culling, and instance motion, respectively. Dr.Jit uses this
+        // to select the MSL intersector<...> template tags and culling mode.
         uint32_t geom_mask = 0x1u;
-        if (any_custom) geom_mask |= 0x2u;
+        if (n_isect) geom_mask |= 0x2u;
         if (any_curves) geom_mask |= 0x4u;
         if (any_backface_culled_triangles) geom_mask |= 0x8u;
+        if (sd.has_motion) geom_mask |= 0x10u;
 
         // Everything the TLAS references must be marked resident when a
         // kernel traces against this scene.
@@ -627,55 +595,39 @@ build_impl(const std::vector<BlasEntry> &blases,
             resources.push_back((__bridge void *) blas);
         resources.push_back((__bridge void *) accel->tlas);
 
-        // IFT buffer bindings (shared argument table): each present type's data
-        // buffer, plus the (instance, geometry) lookup table at slot
-        // METAL_ISECT_FN_COUNT. Bounded, so use fixed-size arrays.
-        void    *bind_buffers[METAL_ISECT_FN_COUNT + 1];
-        uint32_t bind_slots[METAL_ISECT_FN_COUNT + 1];
-        uint32_t bind_count = 0;
-        for (uint32_t t = 0; t < METAL_ISECT_FN_COUNT; ++t) {
-            id<MTLBuffer> buf =
-                t == METAL_ISECT_FN_SDFGRID ? sdf_buf : combined_buf[t];
-            if (buf) {
-                bind_buffers[bind_count] = (__bridge void *) buf;
-                bind_slots[bind_count]   = t;
-                ++bind_count;
-            }
-        }
-        if (lookup_buf) {
-            bind_buffers[bind_count] = (__bridge void *) lookup_buf;
-            bind_slots[bind_count]   = METAL_ISECT_FN_COUNT;
-            ++bind_count;
-        }
-
         uint32_t scene_index = jit_metal_configure_scene(
             (__bridge void *) accel->tlas,
             resources.data(), (uint32_t) resources.size(),
-            (__bridge void *) isect_library,
-            (uint32_t) ift_names.size(),
-            ift_names.empty() ? nullptr : ift_names.data(),
-            bind_count,
-            bind_count ? bind_buffers : nullptr,
-            bind_count ? bind_slots   : nullptr,
-            geom_mask);
+            n_isect, geom_mask);
 
         // Tie the Metal objects' lifetime to the scene variable. Pending
         // kernels or frozen recordings may outlive MetalAccel::release().
+        MetalAccelData *accel_p = accel.release();
         jit_metal_scene_set_cleanup(
-            scene_index, [](void *p) { delete (MetalAccelData *) p; }, accel.get());
+            scene_index, [](void *p) { delete (MetalAccelData *) p; }, accel_p);
+
+        // Bind the recorded intersection function of each custom shape to
+        // its table entry (see the pre-pass above for the numbering)
+        uint32_t ift_index = 0;
+        for (const BlasEntry &blas : blases)
+            for (const ShapeIR &g : blas.geoms)
+                if (g.kind == ShapeIR::Kind::Custom)
+                    accel_p->bindings.push_back(jit_isect_bind(
+                        g.isect_func, scene_index, ift_index++, nullptr));
 
         Log(Debug, "MetalAccel: built acceleration structures (%zu BLAS, "
-                   "%zu instances, %zu custom geometries%s)",
-            accel->blases.size(), instances.size(), ift_names.size(),
+                   "%zu instances, %u custom geometries%s)",
+            accel_p->blases.size(), instances.size(), n_isect,
             any_curves ? ", curves" : "");
 
-        return { accel.release(), scene_index };
+        return { accel_p, scene_index };
     }
 }
 
 std::pair<MetalAccelData *, uint32_t>
-build_metal_accel(const SceneIR &sd, bool compact) {
-    return build_impl(sd.blases, sd.instances, compact);
+build_metal_accel(const SceneIR &sd, const std::vector<uint32_t> &user_ids,
+                  bool compact) {
+    return build_impl(sd, user_ids, compact);
 }
 
 void release_metal_accel(MetalAccelData *accel, uint32_t scene_index) {

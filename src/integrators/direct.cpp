@@ -31,11 +31,6 @@ Direct illumination integrator (:monosp:`direct`)
      using the BSDF sampling strategies implemented by the scene's surfaces.
      (Default: set to the value of :monosp:`shading_samples`)
 
- * - hide_emitters
-   - |bool|
-   - Hide directly visible emitters.
-     (Default: no, i.e. |false|)
-
 .. subfigstart::
 .. subfigure:: ../../resources/data/docs/images/render/integrator_direct_bsdf.jpg
    :caption: (**a**) BSDF sampling only
@@ -80,7 +75,7 @@ or BSDF sampling-only integrator.
 template <typename Float, typename Spectrum>
 class DirectIntegrator : public SamplingIntegrator<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(SamplingIntegrator, m_hide_emitters)
+    MI_IMPORT_BASE(SamplingIntegrator)
     MI_IMPORT_TYPES(Scene, Sampler, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
 
     DirectIntegrator(const Properties &props) : Base(props) {
@@ -113,37 +108,24 @@ public:
 
     std::pair<Spectrum, Mask> sample(const Scene *scene,
                                      Sampler *sampler,
-                                     const RayDifferential3f &ray,
+                                     const Ray3f &ray,
                                      const Medium * /* medium */,
-                                     Float * /* aovs */,
                                      Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
 
         SurfaceInteraction3f si = scene->ray_intersect(
-            ray, +RayFlags::All, /* coherent = */ true, active);
+            ray, +RayFlags::Default, /* coherent = */ true, +RayMask::Primary,
+            active);
 
         Spectrum result(0.f);
 
         // ----------------------- Visible emitters -----------------------
 
-        if (m_hide_emitters) {
-            // Skip all area emitters along this ray
-            Mask skip_emitters =
-                si.is_valid() && (si.shape->emitter() != nullptr) && active;
-
-            if (dr::any_or<true>(skip_emitters)) {
-                Ray3f ray_skip = si.spawn_ray(ray.d);
-                PreliminaryIntersection3f pi =
-                    Base::skip_area_emitters(scene, ray_skip, true, skip_emitters);
-                SurfaceInteraction3f si_after_skip = pi.compute_surface_interaction(
-                        ray, +RayFlags::All, skip_emitters);
-                dr::masked(si, skip_emitters) = si_after_skip;
-            }
-        } else {
-            EmitterPtr emitter_vis = si.emitter(scene, active);
-            if (dr::any_or<true>(emitter_vis != nullptr))
-                result += emitter_vis->eval(si, active);
-        }
+        // The emitter lookup reuses the camera mask so that escaped rays
+        // ignore a hidden environment emitter
+        EmitterPtr emitter_vis = si.emitter(scene, +RayMask::Primary, active);
+        if (dr::any_or<true>(emitter_vis != nullptr))
+            result += emitter_vis->eval(si, active);
 
         Mask valid_ray = active && si.is_valid();
 
@@ -154,9 +136,8 @@ public:
         // ----------------------- Emitter sampling -----------------------
 
         BSDFContext ctx;
-        BSDFPtr bsdf = si.bsdf(ray);
-        auto flags = bsdf->flags();
-        Mask sample_emitter = active && has_flag(flags, BSDFFlags::Smooth);
+        BSDFPtr bsdf = si.bsdf();
+        Mask sample_emitter = active && bsdf->has_flag(BSDFFlags::Smooth);
 
         if (dr::any_or<true>(sample_emitter)) {
             for (size_t i = 0; i < m_emitter_samples; ++i) {
@@ -172,8 +153,8 @@ public:
                 // Query the BSDF for that emitter-sampled direction
                 Vector3f wo = si.to_local(ds.d);
 
-                /* Determine BSDF value and probability of having sampled
-                   that same direction using BSDF sampling. */
+                // Determine BSDF value and probability of having sampled
+                // that same direction using BSDF sampling.
                 auto [bsdf_val, bsdf_pdf] = bsdf->eval_pdf(ctx, si, wo, active_e);
                 bsdf_val = si.to_world_mueller(bsdf_val, -wo, si.wi);
 
@@ -185,6 +166,9 @@ public:
 
         // ------------------------ BSDF sampling -------------------------
 
+        // Null tests fold to literals in scenes without null shapes
+        bool has_null = scene->has_null_shapes();
+
         for (size_t i = 0; i < m_bsdf_samples; ++i) {
             auto [bs, bsdf_val] = bsdf->sample(ctx, si, sampler->next_1d(active),
                                                sampler->next_2d(active), active);
@@ -192,27 +176,47 @@ public:
 
             Mask active_b = active && dr::any(unpolarized_spectrum(bsdf_val) != 0.f);
 
-            // Trace the ray in the sampled direction and intersect against the scene
-            SurfaceInteraction3f si_bsdf =
-                scene->ray_intersect(si.spawn_ray(si.to_world(bs.wo)), active_b);
+            // Specular events leave the ray mask unchanged
+            UInt32 ray_mask = dr::select(bs.is_delta(), +RayMask::Primary,
+                                         +RayMask::Secondary);
+
+            Ray3f ray_b = si.spawn_ray(si.to_world(bs.wo));
+
+            // Differentiation requires a detached sample direction and a
+            // re-evaluation of the BSDF, as explained in the path tracer. A
+            // null crossing keeps the attached weight of the null lobe.
+            Mask null = has_null ? bs.is_null() : Mask(false);
+            if (dr::grad_enabled(ray_b)) {
+                ray_b = dr::detach(ray_b);
+                Vector3f wo_2 = si.to_local(ray_b.d);
+                auto [bsdf_val_2, bsdf_pdf_2] = bsdf->eval_pdf(ctx, si, wo_2);
+                bsdf_val[bsdf_pdf_2 > 0.f && !null] =
+                    bsdf_val_2 / dr::detach(bsdf_pdf_2);
+            }
+
+            // Trace a ray in the sampled direction and keep track of reduced
+            // transmittance due to null surfaces
+            auto [si_bsdf, tr] = scene->ray_intersect_tr(
+                ray_b, +RayFlags::Default, /* coherent = */ false, ray_mask,
+                active_b);
 
             // Retain only rays that hit an emitter
-            EmitterPtr emitter = si_bsdf.emitter(scene, active_b);
+            EmitterPtr emitter = si_bsdf.emitter(scene, ray_mask, active_b);
             active_b &= (emitter != nullptr);
 
             if (dr::any_or<true>(active_b)) {
                 Spectrum emitter_val = emitter->eval(si_bsdf, active_b);
-                Mask delta = has_flag(bs.sampled_type, BSDFFlags::Delta);
+                Mask delta = bs.is_delta();
 
-                /* Determine probability of having sampled that same
-                   direction using Emitter sampling. */
+                // Determine probability of having sampled that same
+                // direction using Emitter sampling.
                 DirectionSample3f ds(scene, si_bsdf, si);
 
                 Float emitter_pdf =
                     dr::select(delta, 0.f, scene->pdf_emitter_direction(si, ds, active_b));
 
                 result[active_b] +=
-                    bsdf_val * emitter_val *
+                    bsdf_val * tr * emitter_val *
                     mis_weight(bs.pdf * m_frac_bsdf, emitter_pdf * m_frac_lum) *
                     m_weight_bsdf;
             }
@@ -230,11 +234,12 @@ public:
         return oss.str();
     }
 
+    /// Compute a multiple importance sampling weight using the power heuristic
     Float mis_weight(Float pdf_a, Float pdf_b) const {
         pdf_a *= pdf_a;
         pdf_b *= pdf_b;
         Float w = pdf_a / (pdf_a + pdf_b);
-        return dr::select(dr::isfinite(w), w, 0.f);
+        return dr::detach(dr::select(dr::isfinite(w), w, 0.f));
     }
 
     MI_DECLARE_CLASS(DirectIntegrator)

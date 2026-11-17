@@ -1,7 +1,9 @@
 set(CORE_PY_V_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/drjit_v.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/animated_transform_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/bbox_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/bsphere_v.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/srect_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/distr_1d_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/distr_2d_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/distr_1d_cond_v.cpp
@@ -17,7 +19,6 @@ set(CORE_PY_V_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/transform_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vector_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/warp_v.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/quad_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/any.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/any.h
   PARENT_SCOPE
@@ -34,6 +35,7 @@ set(CORE_PY_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/logger.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/misc.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/mmap.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/packed.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/object.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/progress.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/rfilter.cpp
@@ -41,6 +43,7 @@ set(CORE_PY_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/struct.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/thread.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/timer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/traverse.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/properties.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/any.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/any.h

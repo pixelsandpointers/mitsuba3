@@ -14,6 +14,8 @@ NAMESPACE_BEGIN(mitsuba)
 MI_VARIANT Sensor<Float, Spectrum>::Sensor(const Properties &props) : Base(props, ObjectType::Sensor) {
     m_shutter_open      = props.get<ScalarFloat>("shutter_open", 0.f);
     m_shutter_open_time = props.get<ScalarFloat>("shutter_close", 0.f) - m_shutter_open;
+    m_jitter            = props.get<bool>("jitter", true);
+    m_cone_scale        = props.get<ScalarFloat>("cone_scale", 1.f);
 
     if (m_shutter_open_time < 0)
         Throw("Shutter opening time must be less than or equal to the shutter "
@@ -58,42 +60,14 @@ MI_VARIANT Sensor<Float, Spectrum>::Sensor(const Properties &props) : Base(props
         }
     }
 
-    if (has_flag(m_film->flags(), FilmFlags::Spectral)) {
+    if (const Texture *film_srf = m_film->sensor_response_function()) {
         if (m_srf != nullptr) {
             Throw("Sensor(): Spectral response function defined previously in sensor, "
                   "but another was found in film.");
         } else {
-            m_srf = m_film->sensor_response_function();
+            m_srf = film_srf;
         }
     }
-}
-
-MI_VARIANT std::pair<typename Sensor<Float, Spectrum>::RayDifferential3f, Spectrum>
-Sensor<Float, Spectrum>::sample_ray_differential(Float time, Float sample1, const Point2f &sample2,
-                                                 const Point2f &sample3, Mask active) const {
-    MI_MASKED_FUNCTION(ProfilerPhase::EndpointSampleRay, active);
-
-    auto [temp_ray, result_spec] = sample_ray(time, sample1, sample2, sample3, active);
-
-    RayDifferential3f result_ray(temp_ray);
-
-    Vector2f dx(1.f / m_resolution.x(), 0.f);
-    Vector2f dy(0.f, 1.f / m_resolution.y());
-
-    // Sample a result_ray for X+1
-    std::tie(temp_ray, std::ignore) = sample_ray(time, sample1, sample2 + dx, sample3, active);
-
-    result_ray.o_x = temp_ray.o;
-    result_ray.d_x = temp_ray.d;
-
-    // Sample a result_ray for Y+1
-    std::tie(temp_ray, std::ignore) = sample_ray(time, sample1, sample2 + dy, sample3, active);
-
-    result_ray.o_y = temp_ray.o;
-    result_ray.d_y = temp_ray.d;
-    result_ray.has_differentials = true;
-
-    return { result_ray, result_spec };
 }
 
 MI_VARIANT std::pair<typename Sensor<Float, Spectrum>::Wavelength, Spectrum>
@@ -119,11 +93,11 @@ Sensor<Float, Spectrum>::sample_wavelengths(const SurfaceInteraction3f& /*si*/, 
 
 MI_VARIANT ProjectiveCamera<Float, Spectrum>::ProjectiveCamera(const Properties &props)
     : Base(props) {
-    /* Distance to the near clipping plane */
+    // Distance to the near clipping plane
     m_near_clip = props.get<ScalarFloat>("near_clip", 1e-2f);
-    /* Distance to the far clipping plane */
+    // Distance to the far clipping plane
     m_far_clip = props.get<ScalarFloat>("far_clip", 1e4f);
-    /* Distance to the focal plane */
+    // Distance to the focal plane
     m_focus_distance = props.get<ScalarFloat>("focus_distance", (float) m_far_clip);
 
     if (m_near_clip <= 0.f)

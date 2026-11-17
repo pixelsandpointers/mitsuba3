@@ -95,7 +95,7 @@ public:
         dr::mask_t<Point2f> mask = (uv - dr::floor(uv)) > .5f;
         Float result = 0.f;
 
-        Mask m0 = (mask.x() != mask.y()),
+        Mask m0 = mask.x() == mask.y(),
              m1 = !m0;
 
         m0 &= active; m1 &= active;
@@ -107,10 +107,6 @@ public:
             dr::masked(result, m1) = m_color1->eval_1(it, m1);
 
         return result;
-    }
-
-    Float mean() const override {
-        return .5f * (m_color0->mean() + m_color1->mean());
     }
 
     bool is_spatially_varying() const override { return true; }

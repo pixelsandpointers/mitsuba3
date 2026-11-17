@@ -10,7 +10,7 @@ NAMESPACE_BEGIN(mitsuba)
 
 
 /**
- * \brief This list of flags is used to classify the different types of emitters.
+ * This list of flags is used to classify the different types of emitters.
  */
 enum class EmitterFlags : uint32_t {
     // =============================================================
@@ -26,21 +26,33 @@ enum class EmitterFlags : uint32_t {
     /// The emitter emits light in a single direction
     DeltaDirection       = 0x00002,
 
-    /// The emitter is placed at infinity (e.g. environment maps)
+    /// The emitter is placed at infinity (i.e., it is an environment map)
     Infinite             = 0x00004,
 
-    /// The emitter is attached to a surface (e.g. area emitters)
+    /// The emitter is attached to a surface (i.e., it is an area emitter)
     Surface              = 0x00008,
 
     // =============================================================
-    //!                   Other lobe attributes
+    //                    Other lobe attributes
     // =============================================================
 
     /// The emission depends on the UV coordinates
     SpatiallyVarying     = 0x00010,
 
+    /// The emitter is hidden from directly visible (camera) rays.
+    Invisible            = 0x00020,
+
+    /// Light portal (see ``Scene::portals()``), does not emit anything itself
+    Portal               = 0x00040,
+
+    /**
+     * The emitter importance samples a texture and maps the result onto
+     * the shape through ``Shape::eval_parameterization()``.
+     */
+    SamplesTexture       = 0x00080,
+
     // =============================================================
-    //!                 Compound lobe attributes
+    //                  Compound lobe attributes
     // =============================================================
 
     /// Delta function in either position or direction
@@ -61,11 +73,27 @@ public:
                !has_flag(m_flags, EmitterFlags::Delta);
     }
 
-    /// The emitter's sampling weight.
-    ScalarFloat sampling_weight() const { return m_sampling_weight; }
+    /// Is this a light portal? (see ``Scene::portals()``)
+    bool is_portal() const { return has_flag(m_flags, EmitterFlags::Portal); }
 
-    /// Flags for all components combined.
-    uint32_t flags(dr::mask_t<Float> /*active*/ = true) const { return m_flags; }
+    /// Relative weight of sampling this emitter. Zero when hidden from secondary rays.
+    ScalarFloat sampling_weight() const {
+        ShapeVisibility v = visibility();
+        return (v == ShapeVisibility::Secondary || v == ShapeVisibility::All)
+                   ? m_sampling_weight : 0.f;
+    }
+
+    /// Ray categories that can see this emitter
+    ShapeVisibility visibility() const {
+        return m_shape ? m_shape->visibility() : m_visibility;
+    }
+
+    /// Return the complete set of emitter flags
+    uint32_t flags() const {
+        ShapeVisibility v = visibility();
+        bool visible = v == ShapeVisibility::Primary || v == ShapeVisibility::All;
+        return m_flags | (visible ? 0u : (uint32_t) EmitterFlags::Invisible);
+    }
 
     void traverse(TraversalCallback *callback) override;
 
@@ -74,7 +102,7 @@ public:
     /// Return whether the emitter parameters have changed
     bool dirty() const { return m_dirty; }
 
-    /// Modify the emitter's "dirty" flag
+    /// Modify the emitter's ``dirty`` flag
     void set_dirty(bool dirty) { m_dirty = dirty; }
 
     /// This is both a class and the base of various Mitsuba plugins
@@ -90,8 +118,14 @@ protected:
     /// Sampling weight
     ScalarFloat m_sampling_weight;
 
+    /// Ray categories that can see the emitter
+    ShapeVisibility m_visibility;
+
     /// True if the emitter's parameters have changed
     bool m_dirty = false;
+
+private:
+    friend class mitsuba::Scene<Float, Spectrum>;
 
     MI_TRAVERSE_CB(Base)
 };
@@ -100,7 +134,7 @@ MI_EXTERN_CLASS(Emitter)
 NAMESPACE_END(mitsuba)
 
 // -----------------------------------------------------------------------
-//! @{ \name Enables vectorized method calls on Dr.Jit arrays of emitters
+// Enables vectorized method calls on Dr.Jit arrays of emitters
 // -----------------------------------------------------------------------
 
 DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Emitter)
@@ -119,5 +153,4 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Emitter)
     DRJIT_CALL_GETTER(sampling_weight)
 DRJIT_CALL_END()
 
-//! @}
 // -----------------------------------------------------------------------

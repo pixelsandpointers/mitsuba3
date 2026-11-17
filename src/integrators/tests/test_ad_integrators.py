@@ -426,7 +426,7 @@ class CropWindowConfig(ConfigBase):
 class RotateShadingNormalsPlaneConfig(ConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_normals'
+        self.key = 'plane.normals'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -453,13 +453,12 @@ class RotateShadingNormalsPlaneConfig(ConfigBase):
     def initialize(self):
         super().initialize()
         self.params.keep([self.key])
-        self.initial_state = mi.Float(self.params[self.key])
+        self.initial_state = mi.Normal3f(self.params[self.key], flip_axes=True)
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(
+        self.params[self.key] = mi.TensorXf(
             mi.Transform4f().rotate(angle=theta, axis=[0.0, 1.0, 0.0]) @
-            dr.unravel(mi.Normal3f, self.initial_state)
-        )
+            self.initial_state, flip_axes=True)
         self.params.update()
         dr.eval()
 
@@ -475,12 +474,9 @@ class TranslateShapeConfigBase(ConfigBase):
     def __init__(self) -> None:
         super().__init__()
 
-    def initialize(self):
-        super().initialize()
-        self.initial_state = mi.Vector3f(dr.unravel(mi.Vector3f, mi.Float(self.params[self.key])))
-
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(theta, 0.0, 0.0))
+        offset = mi.TensorXf(mi.Vector3f(theta, 0.0, 0.0), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -492,12 +488,8 @@ class ScaleShapeConfigBase(ConfigBase):
     def __init__(self) -> None:
         super().__init__()
 
-    def initialize(self):
-        super().initialize()
-        self.initial_state = mi.Vector3f(dr.unravel(mi.Vector3f, mi.Float(self.params[self.key])))
-
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state * (1.0 + theta))
+        self.params[self.key] = self.initial_state * (1.0 + theta)
         self.params.update()
         dr.eval()
 
@@ -506,7 +498,7 @@ class ScaleShapeConfigBase(ConfigBase):
 class TranslateTexturedPlaneConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_positions'
+        self.key = 'plane.positions'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -536,7 +528,7 @@ class TranslateTexturedPlaneConfig(TranslateShapeConfigBase):
 class TranslatePlaneUnderEnvmapConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_positions'
+        self.key = 'plane.positions'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -557,7 +549,8 @@ class TranslatePlaneUnderEnvmapConfig(TranslateShapeConfigBase):
         self.error_max_threshold = 0.2
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -567,7 +560,7 @@ class TranslatePlaneUnderEnvmapConfig(TranslateShapeConfigBase):
 class TranslatePlaneUnderProjectorConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_positions'
+        self.key = 'plane.positions'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -593,7 +586,8 @@ class TranslatePlaneUnderProjectorConfig(TranslateShapeConfigBase):
         self.error_max_threshold = 0.2
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -602,7 +596,7 @@ class TranslatePlaneUnderProjectorConfig(TranslateShapeConfigBase):
 class TranslateGlassPlaneLensConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'shape.vertex_positions'
+        self.key = 'shape.positions'
         self.scene_dict = {
             'type': 'scene',
             'rough_glass': {
@@ -671,7 +665,8 @@ class TranslateGlassPlaneLensConfig(TranslateShapeConfigBase):
         self.error_max_threshold = 0.3
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -681,7 +676,7 @@ class TranslateGlassPlaneLensConfig(TranslateShapeConfigBase):
 class TranslateTexturedAreaEmitterConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_positions'
+        self.key = 'plane.positions'
         self.res = 64
         self.scene_dict = {
             'type': 'scene',
@@ -719,7 +714,8 @@ class TranslateTexturedAreaEmitterConfig(TranslateShapeConfigBase):
         self.error_mean_threshold_bwd = 0.25
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -728,7 +724,7 @@ class TranslateTexturedAreaEmitterConfig(TranslateShapeConfigBase):
 class TranslatePlaneUnderTexturedAreaEmitterConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_positions'
+        self.key = 'plane.positions'
         self.res = 64
         self.scene_dict = {
             'type': 'scene',
@@ -773,7 +769,8 @@ class TranslatePlaneUnderTexturedAreaEmitterConfig(TranslateShapeConfigBase):
         self.error_mean_threshold_bwd = 0.25
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -782,7 +779,7 @@ class TranslatePlaneUnderTexturedAreaEmitterConfig(TranslateShapeConfigBase):
 class TranslateTexturedAreaEmitterIlluminatingPlaneConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'light.vertex_positions'
+        self.key = 'light.positions'
         self.res = 64
         self.scene_dict = {
             'type': 'scene',
@@ -827,7 +824,8 @@ class TranslateTexturedAreaEmitterIlluminatingPlaneConfig(TranslateShapeConfigBa
         self.error_mean_threshold_bwd = 0.25
 
     def update(self, theta):
-        self.params[self.key] = dr.ravel(self.initial_state + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key] = self.initial_state + offset
         self.params.update()
         dr.eval()
 
@@ -837,7 +835,7 @@ class TranslateTexturedAreaEmitterIlluminatingPlaneConfig(TranslateShapeConfigBa
 class TranslateDiffuseRectangleConstantConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'rectangle.vertex_positions'
+        self.key = 'rectangle.positions'
         self.scene_dict = {
             'type': 'scene',
             'rectangle': {
@@ -860,7 +858,7 @@ class TranslateDiffuseRectangleConstantConfig(TranslateShapeConfigBase):
 class TranslateRectangleEmitterOnBlackConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'light.vertex_positions'
+        self.key = 'light.positions'
         self.scene_dict = {
             'type': 'scene',
             'light': {
@@ -947,7 +945,7 @@ class TranslateDiskEmitterOnGrayConfig(ConfigBase):
 class TranslateSphereEmitterOnBlackConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'light.vertex_positions'
+        self.key = 'light.positions'
         self.scene_dict = {
             'type': 'scene',
             'light': {
@@ -970,7 +968,7 @@ class TranslateSphereEmitterOnBlackConfig(TranslateShapeConfigBase):
 class ScaleSphereEmitterOnBlackConfig(ScaleShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'light.vertex_positions'
+        self.key = 'light.positions'
         self.scene_dict = {
             'type': 'scene',
             'light': {
@@ -993,7 +991,7 @@ class ScaleSphereEmitterOnBlackConfig(ScaleShapeConfigBase):
 class TranslateOccluderAreaLightConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'occluder.vertex_positions'
+        self.key = 'occluder.positions'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -1026,7 +1024,7 @@ class TranslateOccluderAreaLightConfig(TranslateShapeConfigBase):
 class TranslateShadowReceiverAreaLightConfig(TranslateShapeConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key = 'plane.vertex_positions'
+        self.key = 'plane.positions'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -1064,8 +1062,8 @@ class TranslateShadowReceiverAreaLightConfig(TranslateShapeConfigBase):
 class TranslatePlaneAndAreaEmitterConfig(ConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key1 = 'plane.vertex_positions'
-        self.key2 = 'light.vertex_positions'
+        self.key1 = 'plane.positions'
+        self.key2 = 'light.positions'
         self.scene_dict = {
             'type': 'scene',
             'plane': {
@@ -1114,12 +1112,13 @@ class TranslatePlaneAndAreaEmitterConfig(ConfigBase):
     def initialize(self):
         super().initialize()
         self.params.keep([self.key1, self.key2])
-        self.initial_state1 = mi.Vector3f(dr.unravel(mi.Vector3f, mi.Float(self.params[self.key1])))
-        self.initial_state2 = mi.Vector3f(dr.unravel(mi.Vector3f, mi.Float(self.params[self.key2])))
+        self.initial_state1 = mi.TensorXf(self.params[self.key1])
+        self.initial_state2 = mi.TensorXf(self.params[self.key2])
 
     def update(self, theta):
-        self.params[self.key1] = dr.ravel(self.initial_state1 + mi.Vector3f(0.0, 0.0, theta))
-        self.params[self.key2] = dr.ravel(self.initial_state2 + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key1] = self.initial_state1 + offset
+        self.params[self.key2] = self.initial_state2 + offset
         self.params.update()
         dr.eval()
 
@@ -1129,8 +1128,8 @@ class TranslatePlaneAndAreaEmitterConfig(ConfigBase):
 class TranslateSelfShadowingRightAngleConfig(ConfigBase):
     def __init__(self) -> None:
         super().__init__()
-        self.key1 = 'wall.vertex_positions'
-        self.key2 = 'floor.vertex_positions'
+        self.key1 = 'wall.positions'
+        self.key2 = 'floor.positions'
         self.scene_dict = {
             'type': 'scene',
             'wall': {
@@ -1189,12 +1188,13 @@ class TranslateSelfShadowingRightAngleConfig(ConfigBase):
     def initialize(self):
         super().initialize()
         self.params.keep([self.key1, self.key2])
-        self.initial_state1 = mi.Vector3f(dr.unravel(mi.Vector3f, mi.Float(self.params[self.key1])))
-        self.initial_state2 = mi.Vector3f(dr.unravel(mi.Vector3f, mi.Float(self.params[self.key2])))
+        self.initial_state1 = mi.TensorXf(self.params[self.key1])
+        self.initial_state2 = mi.TensorXf(self.params[self.key2])
 
     def update(self, theta):
-        self.params[self.key1] = dr.ravel(self.initial_state1 + mi.Vector3f(0.0, 0.0, theta))
-        self.params[self.key2] = dr.ravel(self.initial_state2 + mi.Vector3f(0.0, 0.0, theta))
+        offset = mi.TensorXf(mi.Vector3f(0.0, 0.0, theta), flip_axes=True)
+        self.params[self.key1] = self.initial_state1 + offset
+        self.params[self.key2] = self.initial_state2 + offset
         self.params.update()
         dr.eval()
 
@@ -1232,6 +1232,80 @@ class TranslateCameraConfig(ConfigBase):
         dr.eval()
 
 
+MASK_WINDOW = {'type': 'mask', 'opacity': 0.5, 'material': {'type': 'diffuse'}}
+
+# Opacity of a mask window in front of a directly visible gray plane. Camera
+# rays and emitter connections both cross the window. The image is linear in
+# the opacity, and the large finite difference step keeps the reference from
+# being dominated by samples that switch between reflection and transmission.
+class MaskOpacityVisibleConfig(ConfigBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.key = 'window.bsdf.opacity.value'
+        self.ref_fd_epsilon = 0.1
+        self.scene_dict = {
+            'type': 'scene',
+            'plane': {'type': 'rectangle', 'bsdf': {'type': 'diffuse'}},
+            'window': {'type': 'rectangle',
+                       'to_world': T().translate([0, 0, 1]),
+                       'bsdf': MASK_WINDOW},
+            'light': {'type': 'constant'}
+        }
+        # The derivative estimate switches sign between reflected and
+        # transmitted samples, which makes it noisy per pixel
+        self.spp = 2048
+        self.error_mean_threshold = 0.12
+        self.error_max_threshold = 1.0
+
+
+# Opacity of a mask window between an area light and a gray plane. The window
+# and the light are outside the view frustum, so only the illumination
+# crosses the window.
+class MaskOpacityIlluminationConfig(ConfigBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.key = 'window.bsdf.opacity.value'
+        self.ref_fd_epsilon = 0.1
+        self.scene_dict = {
+            'type': 'scene',
+            'plane': {'type': 'rectangle', 'bsdf': {'type': 'diffuse'}},
+            'window': {'type': 'rectangle',
+                       'to_world': T().translate([1.5, 0, 0.75])
+                                   @ T().rotate([0, 1, 0], -90)
+                                   @ T().scale([0.75, 2, 1]),
+                       'bsdf': MASK_WINDOW},
+            'light': {'type': 'rectangle',
+                      'to_world': T().translate([3, 0, 1])
+                                  @ T().rotate([0, 1, 0], -90),
+                      'emitter': {'type': 'area', 'radiance': 20.0}}
+        }
+
+
+# Albedo of a gray plane seen through a window with null transmission, for
+# each kind of null BSDF
+def make_albedo_behind_window_config(name, bsdf):
+    class Config(ConfigBase):
+        def __init__(self) -> None:
+            super().__init__()
+            self.key = 'plane.bsdf.reflectance.value'
+            self.scene_dict = {
+                'type': 'scene',
+                'plane': {'type': 'rectangle', 'bsdf': {'type': 'diffuse'}},
+                'window': {'type': 'rectangle',
+                           'to_world': T().translate([0, 0, 1]), 'bsdf': bsdf},
+                'light': {'type': 'constant'}
+            }
+    Config.__name__ = Config.__qualname__ = name
+    return Config
+
+DiffuseAlbedoBehindMaskConfig = make_albedo_behind_window_config(
+    'DiffuseAlbedoBehindMaskConfig', MASK_WINDOW)
+DiffuseAlbedoBehindThinDielectricConfig = make_albedo_behind_window_config(
+    'DiffuseAlbedoBehindThinDielectricConfig', {'type': 'thindielectric'})
+DiffuseAlbedoBehindNullConfig = make_albedo_behind_window_config(
+    'DiffuseAlbedoBehindNullConfig', {'type': 'null'})
+
+
 # -------------------------------------------------------------------
 #                           List configs
 # -------------------------------------------------------------------
@@ -1239,6 +1313,11 @@ class TranslateCameraConfig(ConfigBase):
 BASIC_CONFIGS_LIST = [
     DiffuseAlbedoConfig,
     DiffuseAlbedoGIConfig,
+    MaskOpacityVisibleConfig,
+    MaskOpacityIlluminationConfig,
+    DiffuseAlbedoBehindMaskConfig,
+    DiffuseAlbedoBehindThinDielectricConfig,
+    DiffuseAlbedoBehindNullConfig,
     AreaLightRadianceConfig,
     DirectlyVisibleAreaLightRadianceConfig,
     PointLightIntensityConfig,
@@ -1277,14 +1356,33 @@ INDIRECT_ILLUMINATION_CONFIGS_LIST = [
     TranslateGlassPlaneLensConfig
 ]
 
+# List of configs that look through a window with null transmission. The
+# direct integrators shade the window instead of what lies behind it.
+THROUGH_WINDOW_CONFIGS_LIST = [
+    MaskOpacityVisibleConfig,
+    DiffuseAlbedoBehindMaskConfig,
+    DiffuseAlbedoBehindThinDielectricConfig,
+    DiffuseAlbedoBehindNullConfig
+]
+
 # List of integrators to test they are triplets:
 # (integrator type, handles continuous derivaites w/ moving geometry, handle discontinuities)
 INTEGRATORS = [
     ('path', False, False),
+    ('direct', False, False),
     ('prb', True, False),
     ('direct_projective', True, True),
     ('prb_projective', True, True),
 ]
+
+
+def load_integrator(config, integrator_name, **kwargs):
+    """Instantiate ``integrator_name`` with the config's integrator settings.
+    The direct integrator has no depth parameter."""
+    d = dict(config.integrator_dict, type=integrator_name)
+    if integrator_name == 'direct':
+        del d['max_depth']
+    return mi.load_dict(d, **kwargs)
 
 CONFIGS = []
 for integrator_name, handles_moving_geom, handles_discontinuities in INTEGRATORS:
@@ -1294,7 +1392,8 @@ for integrator_name, handles_moving_geom, handles_discontinuities in INTEGRATORS
         (DISCONTINUOUS_CONFIGS_LIST if handles_discontinuities else [])
     )
     for config in todos:
-        if (('direct' in integrator_name) and config in INDIRECT_ILLUMINATION_CONFIGS_LIST):
+        if ('direct' in integrator_name) and \
+           config in INDIRECT_ILLUMINATION_CONFIGS_LIST + THROUGH_WINDOW_CONFIGS_LIST:
             continue
         CONFIGS.append((integrator_name, config))
 
@@ -1308,8 +1407,7 @@ def test01_rendering_primal(variants_all_ad_rgb, integrator_name, config):
     config = config()
     config.initialize()
 
-    config.integrator_dict['type'] = integrator_name
-    integrator = mi.load_dict(config.integrator_dict, parallel=False)
+    integrator = load_integrator(config, integrator_name, parallel=False)
 
     filename = join(output_dir, f"test_{config.name}_image_primal_ref.exr")
     image_primal_ref = mi.TensorXf32(mi.Bitmap(filename))
@@ -1330,8 +1428,7 @@ def test02_rendering_forward(variants_all_ad_rgb, integrator_name, config):
     config = config()
     config.initialize()
 
-    config.integrator_dict['type'] = integrator_name
-    integrator = mi.load_dict(config.integrator_dict)
+    integrator = load_integrator(config, integrator_name)
     if 'projective' in integrator_name:
         integrator.proj_seed_spp = 4192
 
@@ -1367,9 +1464,7 @@ def test03_rendering_backward(variants_all_ad_rgb, integrator_name, config):
     config = config()
     config.initialize()
 
-    config.integrator_dict['type'] = integrator_name
-
-    integrator = mi.load_dict(config.integrator_dict)
+    integrator = load_integrator(config, integrator_name)
     if 'projective' in integrator_name:
         integrator.proj_seed_spp = 4192
 
@@ -1453,6 +1548,59 @@ def test04_render_custom_op(variants_all_ad_rgb):
     if not check_image_error(image_fwd, image_fwd_ref, config, integrator_name,
                            epsilon=2e-1, test_type='fwd', save_error_image=True):
         pytest.fail("Gradient values exceeded configuration's tolerances!")
+
+
+# One C++ integrator, one radiative backpropagation integrator and one
+# projective sampling integrator
+@pytest.mark.parametrize('integrator_name', ['path', 'prb', 'direct_projective'])
+def test05_postprocess(variants_all_ad_rgb, integrator_name):
+    """Derivatives of a post-processed image account for the film's post-processing filters"""
+    if mi.is_polarized:
+        pytest.skip('Test must be adapted to polarized rendering.')
+
+    class Square(mi.PostProcess):
+        def __init__(self, props):
+            super().__init__(props)
+
+        def eval(self, image, channels):
+            return mi.TensorXf(dr.square(image.array), image.shape)
+
+    mi.register_postprocess('square', Square)
+
+    # The image is the constant radiance, the film's output its square
+    radiance = 0.5
+    scene = mi.load_dict({
+        'type': 'scene',
+        'integrator': {'type': integrator_name, 'max_depth': 2},
+        'emitter': {'type': 'constant', 'radiance': {'type': 'rgb', 'value': radiance}},
+        'sensor': {
+            'type': 'perspective',
+            'film': {
+                'type': 'hdrfilm', 'width': 4, 'height': 3,
+                'rfilter': {'type': 'box'}, 'filter': {'type': 'square'}
+            },
+            'sampler': {'type': 'independent', 'sample_count': 4}
+        }
+    })
+    params = mi.traverse(scene)
+    key = 'emitter.radiance.value'
+    pixels = 4 * 3
+
+    image = mi.render(scene, spp=4)
+    assert dr.allclose(image, radiance ** 2)
+
+    # Forward mode: d(r^2)/dr = 2r
+    dr.enable_grad(params[key])
+    params.update()
+    image = mi.render(scene, params, spp=4)
+    dr.forward(params[key])
+    assert dr.allclose(dr.grad(image), 2 * radiance)
+
+    # Reverse mode: the sum over the image yields 2r per pixel
+    dr.set_grad(params[key], 0.0)
+    image = mi.render(scene, params, spp=4)
+    dr.backward(dr.sum(image.array))
+    assert dr.allclose(dr.grad(params[key]), 2 * radiance * pixels)
 
 # -------------------------------------------------------------------
 #                      Generate reference images

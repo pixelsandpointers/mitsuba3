@@ -114,8 +114,9 @@ Timed sun and sky emitter (:monosp:`timed_sunsky`)
      Both implementations integrate to the same total power.
 
  * - to_world
-   - |transform|
-   - Specifies an optional emitter-to-world transformation.  (Default: none, i.e. emitter space = world space)
+   - |transform| or |animation|
+   - Specifies an optional emitter-to-world transformation. Animating this property
+     is currently not supported.  (Default: none, i.e. emitter space = world space)
    - |exposed|
 
 
@@ -125,7 +126,7 @@ It is particularly useful for applications like architectural visualization or h
 where the goal is to simulate the lighting conditions over multiple days, months, years, or
 even longer, rather than the lighting at a specific instant. If the goal is to
 render using the sunsky background emitter at a fixed point in time,
-please take a look at the :ref:`sunsky <Sunsky Emitter>` that is optimised and more efficient for that.
+please take a look at the :ref:`sunsky <emitter-sunsky>` that is optimised and more efficient for that.
 
 The local reference frame of this emitter is Z-up and X being towards the north direction.
 This behaviour can be changed with the ``to_world`` parameter.
@@ -188,7 +189,7 @@ public:
         m_turbidity, m_sky_scale, m_sun_scale, m_albedo,
         m_sun_half_aperture, m_sky_rad_dataset, m_sampling_params,
         m_sky_params_dataset, m_sun_radiance,
-        m_to_world, m_sky_irrad_dataset, m_sun_irrad_dataset,
+        m_to_world, m_to_world_anim, m_sky_irrad_dataset, m_sun_irrad_dataset,
 		MIN_SAMPLING_ETA, MAX_SAMPLING_ETA, CHANNEL_COUNT
     )
 
@@ -209,6 +210,9 @@ public:
     MI_IMPORT_TYPES()
 
     TimedSunskyEmitter(const Properties &props) : Base(props) {
+        if (m_to_world_anim)
+            Throw("TimedSunskyEmitter: 'to_world' cannot be animated directly. Please use 'interval'.");
+
         m_shutter_open          = props.get<ScalarFloat>("shutter_open", 0.f);
         m_inv_shutter_open_time = props.get<ScalarFloat>("shutter_close", 1.f) - m_shutter_open;
 
@@ -419,7 +423,7 @@ private:
         Float turb_idx_f = dr::clip(m_turbidity - 1.f, 0.f, TURBIDITY_LVLS - 1.f);
         TensorXf res = dr::take_interp(sampling_weights_data, turb_idx_f, 1);
 
-        return new SamplingTexture(res, true, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
+        return new SamplingTexture(res, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
     }
 
     template<typename Dataset>
@@ -480,10 +484,9 @@ private:
 
             dr::masked(sampling_weigths, !dr::isfinite(sampling_weigths)) = 0.f;
 
-            const size_t shape[2] = { MPDF_ELEVATION_COUNT, 1 };
-            TensorXf temp = TensorXf(sampling_weigths, 2, shape);
+            TensorXf temp(sampling_weigths, { MPDF_ELEVATION_COUNT, 1 });
 
-            sky_weight_tex = new SamplingTexture(temp, true, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
+            sky_weight_tex = new SamplingTexture(temp, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
         }
 
         // Sun irradiance
@@ -495,10 +498,10 @@ private:
                 sun_irrad_data = dr::ravel(rgb_sun_irrad);
             }
 
-            const size_t shape[2] = { MPDF_ELEVATION_COUNT, CHANNEL_COUNT };
-            TensorXf temp = TensorXf(sun_irrad_data, 2, shape);
+            TensorXf temp(sun_irrad_data,
+                          { MPDF_ELEVATION_COUNT, CHANNEL_COUNT });
 
-            sun_irrad_tex = new SunIrradTexture(temp, true, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
+            sun_irrad_tex = new SunIrradTexture(temp, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
         }
 
         return std::make_pair(sky_weight_tex, sun_irrad_tex);

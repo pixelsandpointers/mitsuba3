@@ -30,11 +30,11 @@ def test02_intersection_construction(variant_scalar_rgb):
     si.dp_dv = [21, 22, 23]
     si.dn_du = [18, 19, 20]
     si.dn_dv = [21, 22, 23]
-    si.duv_dx = [24, 25]
-    si.duv_dy = [26, 27]
+    si.footprint = mi.Matrix2f([[24, 25], [26, 27]])
+    si.footprint_scale = 28
     si.wi = [31, 32, 33]
     si.prim_index = 34
-    si.instance = None
+    si.instance_index = 0
     assert si.sh_frame == mi.Frame3f([9, 10, 11], [12, 13, 14], [15, 16, 17])
 
     assert repr(si).strip() == """SurfaceInteraction[
@@ -43,6 +43,7 @@ def test02_intersection_construction(variant_scalar_rgb):
   wavelengths=[],
   p=[1, 2, 3],
   n=[4, 5, 6],
+  p_err=0,
   shape=0x0,
   uv=[7, 8],
   sh_frame=Frame[
@@ -50,67 +51,19 @@ def test02_intersection_construction(variant_scalar_rgb):
              t=[12, 13, 14],
              n=[15, 16, 17]
 ],
+  frame_flipped=0,
   dp_du=[18, 19, 20],
   dp_dv=[21, 22, 23],
   dn_du=[18, 19, 20],
   dn_dv=[21, 22, 23],
-  duv_dx=[24, 25],
-  duv_dy=[26, 27],
+  footprint=[[24, 25],
+             [26, 27]],
+  footprint_scale=28,
   wi=[31, 32, 33],
   prim_index=34,
-  instance=0x0
+  instance_index=0
 ]"""
 
-
-def test03_intersection_partials(variant_scalar_rgb):
-    # Test the texture partial computation with some random data
-
-    o = [0.44650541, 0.16336525, 0.74225088]
-    d = [0.2956123, 0.67325977, 0.67774232]
-    time = 0.5
-    w = []
-    r = mi.RayDifferential3f(o, d, time, w)
-    r.o_x = r.o + [0.1, 0, 0]
-    r.o_y = r.o + [0, 0.1, 0]
-    r.d_x = r.d
-    r.d_y = r.d
-    r.has_differentials = True
-
-    si = mi.SurfaceInteraction3f()
-    si.p = r(10)
-    si.dp_du = [0.5514372, 0.84608955, 0.41559092]
-    si.dp_dv = [0.14551054, 0.54917541, 0.39286475]
-    si.n = dr.cross(si.dp_du, si.dp_dv)
-    si.n /= dr.norm(si.n)
-    si.t = 0
-
-    si.compute_uv_partials(r)
-
-    # Positions reached via computed partials
-    px1 = si.dp_du * si.duv_dx[0] + si.dp_dv * si.duv_dx[1]
-    py1 = si.dp_du * si.duv_dy[0] + si.dp_dv * si.duv_dy[1]
-
-    # Manually
-    px2 = r.o_x + r.d_x * \
-        ((dr.dot(si.n, si.p) - dr.dot(si.n, r.o_x)) / dr.dot(si.n, r.d_x))
-    py2 = r.o_y + r.d_y * \
-        ((dr.dot(si.n, si.p) - dr.dot(si.n, r.o_y)) / dr.dot(si.n, r.d_y))
-    px2 -= si.p
-    py2 -= si.p
-
-    assert dr.allclose(px1, px2, atol=1e-6)
-    assert dr.allclose(py1, py2, atol=1e-6)
-
-    si.dp_du = [0, 0, 0]
-    si.compute_uv_partials(r)
-
-    assert dr.allclose(px1, px2, atol=1e-6)
-    assert dr.allclose(py1, py2, atol=1e-6)
-
-    si.compute_uv_partials(r)
-
-    assert dr.allclose(si.duv_dx, [0, 0])
-    assert dr.allclose(si.duv_dy, [0, 0])
 
 def test04_mueller_to_world_to_local(variant_scalar_mono_polarized):
     """
@@ -163,3 +116,79 @@ def test05_gather_interaction(variants_any_llvm):
     assert(dr.width(si_.shape) == 2)
     assert(dr.allclose(si_.t[0], si.t[0]))
     assert(dr.allclose(si_.t[1], si.t[2]))
+
+
+def test06_footprint(variants_all_backends_once):
+    """
+    Checks that ``RayFlags.Footprint`` projects the ray cone onto the hit
+    surface with the expected UV-space extent, and that the computation is
+    skipped when the flag, the cone, or a filtered texture is absent.
+    """
+    import math
+    import numpy as np
+    from mitsuba.scalar_rgb.test.util import find_resource
+
+    # A rectangle spans [-1, 1]^2 with UVs in [0, 1]^2, so a world space
+    # length maps to half its value in UV space. The filtered texture keeps
+    # the scene from skipping the footprint computation.
+    def make_scene(filter_type):
+        return mi.load_dict({
+            'type': 'scene',
+            'rect': {
+                'type': 'rectangle',
+                'bsdf': {
+                    'type': 'diffuse',
+                    'reflectance': {
+                        'type': 'bitmap',
+                        'filename': find_resource('resources/data/common/textures/carrot.png'),
+                        'filter_type': filter_type
+                    }
+                }
+            }
+        })
+
+    scene = make_scene('trilinear')
+    assert scene.has_filtered_textures()
+
+    theta = math.radians(60)
+    d = mi.Vector3f(math.sin(theta), 0, -math.cos(theta))
+    ray = mi.Ray3f(mi.Point3f(0, 0, 0) - d * 5, d)
+
+    # Cone of width 1/256 at the hit point, which lies 5 units away
+    ray.cone = mi.RayCone(0, 1 / (256 * 5))
+    si = scene.ray_intersect(ray, mi.RayFlags.Default, coherent=True)
+
+    # The footprint stretches by 1/cos(theta) in the plane of incidence
+    # (the u axis) and is unchanged across it. The columns of the footprint
+    # matrix span the ellipse, whose axes are its singular values.
+    def axes(si):
+        m = np.array(si.footprint).reshape(2, 2)
+        return np.linalg.svd(m, compute_uv=False)
+
+    assert np.allclose(axes(si), [0.5 / 256 / math.cos(theta), 0.5 / 256], atol=1e-7)
+
+    # The footprint is zero without the flag, and for a ray without a cone
+    si = scene.ray_intersect(ray, mi.RayFlags.Shading, coherent=True)
+    assert dr.all(si.footprint == 0, axis=None)
+    ray.cone = mi.RayCone(0, 0)
+    si = scene.ray_intersect(ray, mi.RayFlags.Default, coherent=True)
+    assert dr.all(si.footprint == 0, axis=None)
+
+    # Normal incidence yields a circular footprint
+    ray = mi.Ray3f(mi.Point3f(0.2, 0.1, 3), mi.Vector3f(0, 0, -1))
+    ray.cone = mi.RayCone(0.03, 0)
+    si = scene.ray_intersect(ray, mi.RayFlags.Default, coherent=True)
+    assert np.allclose(axes(si), [0.015, 0.015], atol=1e-7)
+    assert dr.allclose(si.footprint_scale, 1)
+
+    # A narrowed cone yields a smaller footprint and reports its scale factor
+    ray.cone = mi.RayCone(0.03, 0).scale(0.25)
+    si = scene.ray_intersect(ray, mi.RayFlags.Default, coherent=True)
+    assert np.allclose(axes(si), [0.00375, 0.00375], atol=1e-7)
+    assert dr.allclose(si.footprint_scale, 0.25)
+
+    # A scene without filtered textures skips the footprint computation
+    scene = make_scene('bilinear')
+    assert not scene.has_filtered_textures()
+    si = scene.ray_intersect(ray, mi.RayFlags.Default, coherent=True)
+    assert dr.all(si.footprint == 0, axis=None)

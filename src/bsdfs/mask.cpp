@@ -216,19 +216,36 @@ public:
         return { value, pdf };
     }
 
-    Spectrum eval_null_transmission(const SurfaceInteraction3f &si,
-                                    Mask active) const override {
+    Spectrum eval_null(const SurfaceInteraction3f &si,
+                       Mask active) const override {
         Float opacity = eval_opacity(si, active);
-        return 1 - opacity * (1 - m_nested_bsdf->eval_null_transmission(si, active));
+        return 1 - opacity * (1 - m_nested_bsdf->eval_null(si, active));
     }
 
     MI_INLINE Float eval_opacity(const SurfaceInteraction3f &si, Mask active) const {
         return dr::clip(m_opacity->eval_1(si, active), 0.f, 1.f);
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si,
-                                      Mask active) const override {
-        return m_nested_bsdf->eval_diffuse_reflectance(si, active);
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        Float opacity = eval_opacity(si, active);
+        BSDFFeatures3f features = m_nested_bsdf->eval_features(si, active);
+        Float transparency = 1.f - opacity,
+              r = dr::mean(features.specular_reflectance),
+              t = dr::mean(features.specular_transmittance);
+
+        // The transparent part is a perfectly specular transmission lobe. It
+        // determines the direction and roughness where it dominates.
+        Mask pass_t = transparency > opacity * t,
+             pass_s = transparency > opacity * (r + t);
+        dr::masked(features.wt, pass_t) = -si.to_world(si.wi);
+        dr::masked(features.roughness, pass_s) = 0.f;
+
+        features.diffuse_albedo *= opacity;
+        features.specular_reflectance *= opacity;
+        features.specular_transmittance =
+            dr::fmadd(opacity, features.specular_transmittance, transparency);
+        return features;
     }
 
     std::string to_string() const override {

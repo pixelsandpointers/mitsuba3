@@ -20,86 +20,34 @@ MiOptixAccelData::~MiOptixAccelData() {
             jit_free(h.buffer);
 }
 
-/// Allocate (once) \c g's custom-primitive SBT data buffer in \c data_buffers
-/// (indexed by the stable ``g.data_slot``) and return its stable device
-/// pointer, without writing its contents. Triangles, curves, and shape groups
-/// carry no SBT data here and return ``nullptr``. The SBT only needs the stable
-/// pointer at pack time; \ref optix_refresh_shape_data writes the data.
-static void *optix_shape_data_ptr(const ShapeIR &g,
-                                  ShapeDataBuffers &data_buffers) {
-    if (g.type == ShapeType::ShapeGroup ||
-        g.kind != ShapeIR::Kind::Custom)
-        return nullptr;
-    size_t data_size = g.data_size_bytes();
-    if (!data_size || !g.fill_data || g.data_slot == (uint32_t) -1)
-        return nullptr;
-
-    // Stable per-shape device buffer (allocated once, refilled in place).
-    if (g.data_slot >= data_buffers.size())
-        data_buffers.resize(g.data_slot + 1, nullptr);
-    void *&buf = data_buffers[g.data_slot];
-    if (!buf)
-        buf = jit_malloc(JitBackend::CUDA, data_size);
-    return buf;
-}
-
-void optix_refresh_shape_data(const SceneIR &sd,
-                              ShapeDataBuffers &data_buffers) {
-    // Refill every custom shape's SBT data buffer in place (allocating it on
-    // first use). The SBT records keep pointing at the same buffers, so updated
-    // per-primitive values reach the device without rebuilding the SBT. Order
-    // does not matter: each custom shape's buffer is independent.
-    for (const BlasEntry &b : sd.blases)
-        for (const ShapeIR &g : b.geoms) {
-            void *buf = optix_shape_data_ptr(g, data_buffers);
-            if (!buf)
-                continue;
-
-            // Fill host-visible shared scratch directly, upload it with an
-            // async queue-ordered copy.
-            size_t data_size = g.data_size_bytes();
-            void *shared = jit_malloc(JitBackend::CUDA, data_size, /* shared = */ 1);
-            g.fill_data(g.ctx, shared);
-            jit_memcpy_async(JitBackend::CUDA, buf, shared, data_size);
-            jit_free(shared);
-        }
-}
-
-size_t count_hitgroup_records(const std::vector<BlasEntry> &blases) {
-    size_t count = 0;
-    for (const BlasEntry &b : blases)
-        count += b.geoms.size();
-    return count;
-}
-
 void fill_hitgroup_records(const std::vector<BlasEntry> &blases,
-                           HitGroupSbtRecord *out, size_t &cursor,
+                           HitGroupSbtRecord *out,
                            const OptixProgramGroup *pg,
-                           const OptixProgramGroupMapping &pg_mapping,
-                           ShapeDataBuffers &data_buffers) {
+                           const uint32_t *pg_index) {
     // The BLAS list is already in canonical (kind, slot) order, so packing one
     // record per geom in BLAS order produces the contiguous-per-BLAS SBT layout
     // whose base offsets prepare_ias() assigns to the IAS instances. Each record
     // carries the hit shape's registry id (jit_registry_id(g.ctx)), recovered as
-    // pi.shape on the device, plus the program group for the shape's type.
+    // pi.shape on the device. Custom shapes leave the header and data pointer
+    // to Dr.Jit, which writes them for the bound intersection routine.
     for (const BlasEntry &b : blases) {
         for (const ShapeIR &g : b.geoms) {
-            void *data = optix_shape_data_ptr(g, data_buffers);
-            HitGroupSbtRecord rec{ { jit_registry_id(g.ctx), data } };
-            uint32_t pg_index = pg_mapping.at(g.type);
-            jit_optix_check(optixSbtRecordPackHeader(pg[pg_index], &rec));
-            out[cursor++] = rec;
+            HitGroupSbtRecord rec{ { jit_registry_id(g.ctx), nullptr } };
+            if (!g.isect_func)
+                jit_optix_check(optixSbtRecordPackHeader(
+                    pg[pg_index[optix_pg_slot(g.kind)]], &rec));
+            *out++ = rec;
         }
     }
 }
 
 /**
- * \brief Fill an \ref OptixBuildInput from a shape's \ref describe()
- * descriptor \c g (triangles, curves or custom primitives).
+ * Fill an `OptixBuildInput` from a shape's `describe()`
+ * descriptor ``g`` (triangles, curves or custom primitives).
  *
- * \c ptr_storage provides stable backing for device-buffer pointers that OptiX
- * references by address. It must outlive the build that consumes \c build_input.
- * For host-AABB custom primitives, \c aabb_ptr is the device address of this
+ * ``ptr_storage`` provides stable backing for device-buffer pointers that OptiX
+ * references by address. It must outlive the build that consumes ``build_input``.
+ * For host-AABB custom primitives, ``aabb_ptr`` is the device address of this
  * shape's slice in the shared AABB pool. Shapes with their own device AABB
  * buffer ignore it.
  */
@@ -108,21 +56,22 @@ static void optix_fill_build_input(OptixBuildInput &build_input,
                                    void *ptr_storage[2]) {
     static const uint32_t flags_disable_anyhit[1] =
         { OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT };
-    static const uint32_t flags_none[1] = { OPTIX_GEOMETRY_FLAG_NONE };
 
     switch (g.kind) {
         case ShapeIR::Kind::Triangles:
         case ShapeIR::Kind::TrianglesCulled:
             ptr_storage[0] = (void *) g.vertex_ptr;
             build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-            build_input.triangleArray.vertexFormat     = OPTIX_VERTEX_FORMAT_FLOAT3;
-            build_input.triangleArray.indexFormat      = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-            build_input.triangleArray.numVertices      = (unsigned int) g.vertex_count;
-            build_input.triangleArray.vertexBuffers    = (CUdeviceptr *) &ptr_storage[0];
-            build_input.triangleArray.numIndexTriplets = (unsigned int) g.face_count;
-            build_input.triangleArray.indexBuffer      = (CUdeviceptr) g.index_ptr;
-            build_input.triangleArray.flags            = flags_disable_anyhit;
-            build_input.triangleArray.numSbtRecords    = 1;
+            build_input.triangleArray.vertexFormat        = OPTIX_VERTEX_FORMAT_FLOAT3;
+            build_input.triangleArray.vertexStrideInBytes = (unsigned int) g.vertex_stride;
+            build_input.triangleArray.indexFormat         = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            build_input.triangleArray.numVertices         = (unsigned int) g.vertex_count;
+            build_input.triangleArray.vertexBuffers       = (CUdeviceptr *) &ptr_storage[0];
+            build_input.triangleArray.numIndexTriplets    = (unsigned int) g.face_count;
+            build_input.triangleArray.indexBuffer         = (CUdeviceptr) g.index_ptr;
+            build_input.triangleArray.indexStrideInBytes  = (unsigned int) g.index_stride;
+            build_input.triangleArray.flags               = flags_disable_anyhit;
+            build_input.triangleArray.numSbtRecords       = 1;
             break;
 
         case ShapeIR::Kind::BSplineCurve:
@@ -157,9 +106,7 @@ static void optix_fill_build_input(OptixBuildInput &build_input,
             build_input.customPrimitiveArray.aabbBuffers   = (CUdeviceptr *) &ptr_storage[0];
             build_input.customPrimitiveArray.numPrimitives = (unsigned int) g.prim_count;
             build_input.customPrimitiveArray.strideInBytes = 6 * sizeof(float);
-            build_input.customPrimitiveArray.flags         =
-                g.type == ShapeType::Ellipsoids ? flags_none
-                                                : flags_disable_anyhit;
+            build_input.customPrimitiveArray.flags         = flags_disable_anyhit;
             build_input.customPrimitiveArray.numSbtRecords = 1;
             break;
 
@@ -201,9 +148,11 @@ void build_gas(const OptixDeviceContext &context,
         size_t shapes_count = geoms.size();
 
         OptixAccelBuildOptions accel_options = {};
-        accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
-        if (compact)
-            accel_options.buildFlags |= OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
+        // ALLOW_COMPACTION must always be present so that the flags agree with
+        // the builtin curve modules (init_optix_config); `compact` only decides
+        // whether the compaction pass below runs.
+        accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE |
+                                   OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
         accel_options.operation  = OPTIX_BUILD_OPERATION_BUILD;
         accel_options.motionOptions.numKeys = 0;
 
@@ -358,10 +307,33 @@ void build_gas(const OptixDeviceContext &context,
     }
 }
 
-void prepare_ias(const SceneIR &sd,
-                 const std::vector<OptixTraversableHandle> &blas_handle,
-                 const std::vector<uint32_t> &blas_sbt_offset,
-                 OptixInstance *out) {
+void *prepare_ias(const SceneIR &sd,
+                  const std::vector<OptixTraversableHandle> &blas_handle,
+                  const std::vector<uint32_t> &blas_sbt_offset,
+                  OptixDeviceContext context,
+                  OptixInstance *out) {
+    // The motion transforms of all animated instances share one buffer, in
+    // which each transform must start at an 8 byte boundary
+    auto srt_size = [](size_t n_keyframes) {
+        size_t size = sizeof(OptixSRTMotionTransform) +
+                      (n_keyframes - 2) * sizeof(OptixSRTData);
+        return (size + 7) & ~(size_t) 7;
+    };
+
+    size_t mt_size = 0;
+    for (const InstanceEntry &inst : sd.instances) {
+        size_t n_keyframes = sd.keyframes(inst).size();
+        if (n_keyframes > 1)
+            mt_size += srt_size(n_keyframes);
+    }
+
+    void *mt_device = nullptr, *mt_staging = nullptr;
+    if (mt_size) {
+        mt_device  = jit_malloc(JitBackend::CUDA, mt_size);
+        mt_staging = jit_malloc(JitBackend::CUDA, mt_size, /* shared = */ 1);
+    }
+    size_t mt_offset = 0;
+
     for (size_t i = 0; i < sd.instances.size(); ++i) {
         const InstanceEntry &inst = sd.instances[i];
         const BlasEntry &blas = sd.blases[inst.blas_index];
@@ -373,29 +345,75 @@ void prepare_ias(const SceneIR &sd,
                              ? OPTIX_INSTANCE_FLAG_NONE
                              : OPTIX_INSTANCE_FLAG_DISABLE_TRIANGLE_FACE_CULLING;
 
-        // instanceId is recovered on the device as pi.instance: the owning
-        // Instance's registry id for an instanced hit, or 0 (null) for a
-        // top-level shape.
-        uint32_t instance_id = inst.owner_registry_id == SCENE_IR_NO_OWNER
-                                   ? 0u
-                                   : inst.owner_registry_id;
+        uint32_t instance_id = inst.instance_index;
+        const std::vector<KeyframeIR> &keyframes = sd.keyframes(inst);
 
-        // to_world is column-major 3x4 (to_world[col*3 + row]). OptiX wants
-        // row-major 3x4.
-        float t[12];
-        for (int row = 0; row < 3; ++row)
-            for (int col = 0; col < 4; ++col)
-                t[row * 4 + col] = inst.to_world[col * 3 + row];
+        if (keyframes.size() > 1) {
+            // For an animated instance, wrap the BLAS in an SRT motion-transform
+            // traversable so intersections interpolate the instance-to-world
+            // transform across time. The IAS then references that traversable
+            // through an identity instance transform.
+            size_t n_keyframes = keyframes.size();
+            // 'numKeys' below is an unsigned short
+            if (n_keyframes > 65535)
+                Throw("prepare_ias(): an animated instance may have at most "
+                      "65535 keyframes, but %zu were given.", n_keyframes);
+            auto *mt = (OptixSRTMotionTransform *) ((uint8_t *) mt_staging + mt_offset);
+            mt->child                   = blas_handle[inst.blas_index];
+            mt->motionOptions.numKeys   = (unsigned short) n_keyframes;
+            mt->motionOptions.flags     = 0;
+            mt->motionOptions.timeBegin = keyframes.front().time;
+            mt->motionOptions.timeEnd   = keyframes.back().time;
+            for (size_t k = 0; k < n_keyframes; ++k) {
+                const KeyframeIR &kf = keyframes[k];
+                OptixSRTData &srt = mt->srtData[k];
+                srt.sx = kf.scale[0]; srt.sy = kf.scale[1]; srt.sz = kf.scale[2];
+                srt.a = srt.b = srt.c = 0.f; // no shear
+                srt.pvx = srt.pvy = srt.pvz = 0.f;
+                srt.qx = kf.quat[0]; srt.qy = kf.quat[1];
+                srt.qz = kf.quat[2]; srt.qw = kf.quat[3];
+                srt.tx = kf.trans[0]; srt.ty = kf.trans[1]; srt.tz = kf.trans[2];
+            }
 
-        out[i] = OptixInstance{
-            { t[0], t[1], t[2],  t[3],
-              t[4], t[5], t[6],  t[7],
-              t[8], t[9], t[10], t[11] },
-            instance_id, blas_sbt_offset[inst.blas_index],
-            /* visibilityMask = */ 255, flags,
-            blas_handle[inst.blas_index], /* pads = */ { 0, 0 }
-        };
+            OptixTraversableHandle motion_handle;
+            jit_optix_check(optixConvertPointerToTraversableHandle(
+                context, (CUdeviceptr) ((uint8_t *) mt_device + mt_offset),
+                OPTIX_TRAVERSABLE_TYPE_SRT_MOTION_TRANSFORM, &motion_handle));
+            mt_offset += srt_size(n_keyframes);
+
+            out[i] = OptixInstance{
+                { 1.f, 0.f, 0.f, 0.f,
+                  0.f, 1.f, 0.f, 0.f,
+                  0.f, 0.f, 1.f, 0.f },
+                instance_id, blas_sbt_offset[inst.blas_index],
+                blas.visibility_mask, flags,
+                motion_handle, /* pads = */ { 0, 0 }
+            };
+        } else {
+            // Static instance. to_world is col-major 3x4
+            // (to_world[col*3 + row]). OptiX wants row-major 3x4.
+            float t[12];
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 4; ++col)
+                    t[row * 4 + col] = inst.to_world[col * 3 + row];
+
+            out[i] = OptixInstance{
+                { t[0], t[1], t[2],  t[3],
+                  t[4], t[5], t[6],  t[7],
+                  t[8], t[9], t[10], t[11] },
+                instance_id, blas_sbt_offset[inst.blas_index],
+                blas.visibility_mask, flags,
+                blas_handle[inst.blas_index], /* pads = */ { 0, 0 }
+            };
+        }
     }
+
+    if (mt_size) {
+        jit_memcpy_async(JitBackend::CUDA, mt_device, mt_staging, mt_size);
+        jit_free(mt_staging);
+    }
+
+    return mt_device;
 }
 
 NAMESPACE_END(mitsuba)

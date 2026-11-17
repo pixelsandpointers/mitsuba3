@@ -39,7 +39,6 @@ def _variant_fixture_impl(request, variant):
     # Clean up after test
     dr.sync_thread()
     dr.flush_kernel_cache()
-    dr.kernel_history_clear()
     dr.flush_malloc_cache()
     dr.detail.malloc_clear_statistics()
     dr.detail.clear_registry()
@@ -112,6 +111,7 @@ variant_groups = {
     "all_scalar": v.all("scalar"),
     "all_rgb": v.all("rgb"),
     "all_rgb_unpolarized": v.all("rgb").exclude("polarized"),
+    "cpu_rgb": v.all("rgb").exclude("cuda", "metal"),
     "all_spectral": v.all("spectral"),
     "all_backends_once": v.all("scalar").one()
     + v.all("llvm").one()

@@ -30,9 +30,16 @@ Path tracer (:monosp:`path`)
      1, then path generation may randomly cease after encountering directly
      visible surfaces. (Default: 5)
 
- * - hide_emitters
-   - |bool|
-   - Hide directly visible emitters. (Default: no, i.e. |false|)
+ * - clamp_direct
+   - |float|
+   - Upper limit on individual *direct* light contribution. Setting this
+     parameter to a typical value (e.g., 3-10) will scale larger contributions
+     to this limit and trade sampling variance for energy loss.
+     A value of zero disables the clamp. (Default: 0)
+
+ * - clamp_indirect
+   - |float|
+   - Similar to the above, but for *indirect* contributions. (Default: 0)
 
 This integrator implements a basic path tracer and is a **good default choice**
 when there is no strong reason to prefer another method.
@@ -86,16 +93,16 @@ paths of arbitrary length to compute both direct and indirect illumination.
 template <typename Float, typename Spectrum>
 class PathIntegrator : public MonteCarloIntegrator<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(MonteCarloIntegrator, m_max_depth, m_rr_depth, m_hide_emitters)
+    MI_IMPORT_BASE(MonteCarloIntegrator, m_max_depth, m_rr_depth,
+                   m_clamp_direct, m_clamp_indirect, clamp_contribution)
     MI_IMPORT_TYPES(Scene, Sampler, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
 
     PathIntegrator(const Properties &props) : Base(props) { }
 
     std::pair<Spectrum, Bool> sample(const Scene *scene,
                                      Sampler *sampler,
-                                     const RayDifferential3f &ray_,
+                                     const Ray3f &ray_,
                                      const Medium * /* medium */,
-                                     Float * /* aovs */,
                                      Bool active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
 
@@ -104,156 +111,137 @@ public:
 
         // --------------------- Configure loop state ----------------------
 
-        Ray3f ray                     = Ray3f(ray_);
+        Ray3f ray                     = ray_;
         Spectrum throughput           = 1.f;
         Spectrum result               = 0.f;
         Float eta                     = 1.f;
         PreliminaryIntersection3f pi  = dr::zeros<PreliminaryIntersection3f>();
-        UInt32 depth                  = 0;
+        Mask valid_ray                = false;
+        BSDFContext bsdf_ctx;
 
-        // If m_hide_emitters == false, the environment emitter will be visible
-        Mask valid_ray = !m_hide_emitters && (scene->environment() != nullptr);
+        // Null tests fold to literals in scenes without null shapes
+        bool has_null = scene->has_null_shapes();
 
-        // Variables caching information from the previous bounce
-        Interaction3f prev_si         = dr::zeros<Interaction3f>();
-        Float         prev_bsdf_pdf   = 1.f;
-        Bool          prev_bsdf_delta = true;
-        BSDFContext   bsdf_ctx;
+        // State of the last scattering vertex of the path. Null crossings
+        // are not path vertices and leave it unchanged.
+        struct Vertex {
+            Interaction3f si;
+            Float bsdf_pdf;
+            Bool bsdf_delta;
+            UInt32 depth;
+            UInt32 ray_mask;
+            DRJIT_STRUCT(Vertex, si, bsdf_pdf, bsdf_delta, depth, ray_mask)
+        } vertex = { dr::zeros<Interaction3f>(), 1.f, true, 0,
+                     +RayMask::Primary };
 
-        /* Set up a Dr.Jit loop. This optimizes away to a normal loop in scalar
-           mode, and it generates either a megakernel (default) or
-           wavefront-style renderer in JIT variants. This can be controlled by
-           passing the '-W' command line flag to the mitsuba binary or
-           enabling/disabling the JitFlag.LoopRecord bit in Dr.Jit.
-        */
+        // Set up a Dr.Jit loop. This optimizes away to a normal loop in scalar
+        // mode, and it generates either a megakernel (default) or
+        // wavefront-style renderer in JIT variants. This can be controlled by
+        // passing the '-W' command line flag to the mitsuba binary or
+        // enabling/disabling the JitFlag.LoopRecord bit in Dr.Jit.
         struct LoopState {
             Ray3f ray;
             PreliminaryIntersection3f pi;
             Spectrum throughput;
             Spectrum result;
             Float eta;
-            UInt32 depth;
             Mask valid_ray;
-            Interaction3f prev_si;
-            Float prev_bsdf_pdf;
-            Bool prev_bsdf_delta;
+            Vertex vertex;
             Bool active;
             Sampler* sampler;
 
-            DRJIT_STRUCT(LoopState, ray, pi, throughput, result, eta, depth, \
-                valid_ray, prev_si, prev_bsdf_pdf, prev_bsdf_delta,
-                active, sampler)
+            DRJIT_STRUCT(LoopState, ray, pi, throughput, result, eta,
+                         valid_ray, vertex, active, sampler)
         } ls = {
             ray,
             pi,
             throughput,
             result,
             eta,
-            depth,
             valid_ray,
-            prev_si,
-            prev_bsdf_pdf,
-            prev_bsdf_delta,
+            vertex,
             active,
             sampler
         };
 
-        // First bounce is usually coherent - don't reorder threads
+        // First bounce is usually coherent - don't reorder threads. The
+        // camera mask hides emitters marked as invisible.
         ls.pi = scene->ray_intersect_preliminary(ls.ray,
                                                  /* coherent = */ true,
-                                                 /* reorder = */ false,
-                                                 /* reorder_hint = */ 0,
-                                                 /* reorder_hint_bits = */ 0,
+                                                 +RayMask::Primary,
                                                  ls.active);
-
-        // ---------------------- Hide area emitters ----------------------
-
-        /* dr::any_or() checks for active entries in the provided boolean
-           array. JIT/Megakernel modes can't do this test efficiently as
-           each Monte Carlo sample runs independently. In this case,
-           dr::any_or<..>() returns the template argument (true) which means
-           that the 'if' statement is always conservatively taken. */
-
-        if (m_hide_emitters && dr::any_or<true>(ls.depth == 0u)) {
-            // Did we hit an area emitter? If so, skip all area emitters along this ray
-            Mask skip_emitters = ls.pi.is_valid() &&
-                                 (ls.pi.shape->emitter() != nullptr) &&
-                                 ls.active;
-
-            if (dr::any_or<true>(skip_emitters)) {
-                SurfaceInteraction3f si = ls.pi.compute_surface_interaction(
-                    ls.ray, +RayFlags::Minimal, skip_emitters);
-                Ray3f ray = si.spawn_ray(ls.ray.d);
-                PreliminaryIntersection3f pi_after_skip =
-                    Base::skip_area_emitters(scene, ray, true, skip_emitters);
-                dr::masked(ls.pi, skip_emitters) = pi_after_skip;
-            }
-        }
 
         dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
             [](const LoopState& ls) { return ls.active; },
-            [this, scene, bsdf_ctx](LoopState& ls) {
+            [this, scene, bsdf_ctx, has_null](LoopState& ls) {
 
-            /* dr::while_loop implicitly masks all code in the loop using the
-               'active' flag, so there is no need to pass it to every function */
+            // dr::while_loop implicitly masks all code in the loop using the
+            // 'active' flag, so there is no need to pass it to every function
 
             // Fill out all information of the interaction
-            SurfaceInteraction3f si =
-                ls.pi.compute_surface_interaction(ls.ray, +RayFlags::All);
+            SurfaceInteraction3f si = scene->compute_surface_interaction(
+                ls.ray, ls.pi, +RayFlags::Default);
 
             // ---------------------- Direct emission ----------------------
 
-            if (dr::any_or<true>(si.emitter(scene) != nullptr)) {
-                DirectionSample3f ds(scene, si, ls.prev_si);
+            // The emitter lookup uses the mask of the ray that produced 'si'
+            EmitterPtr emitter = si.emitter(scene, ls.vertex.ray_mask);
+            ls.valid_ray |= emitter != nullptr;
+
+            if (dr::any_or<true>(emitter != nullptr)) {
+                DirectionSample3f ds(scene, si, ls.vertex.si,
+                                     ls.vertex.ray_mask);
                 Float em_pdf = 0.f;
 
-                if (dr::any_or<true>(!ls.prev_bsdf_delta))
-                    em_pdf = scene->pdf_emitter_direction(ls.prev_si, ds,
-                                                          !ls.prev_bsdf_delta);
+                if (dr::any_or<true>(!ls.vertex.bsdf_delta))
+                    em_pdf = scene->pdf_emitter_direction(ls.vertex.si, ds,
+                                                          !ls.vertex.bsdf_delta);
 
                 // Compute MIS weight for emitter sample from previous bounce
-                Float mis_bsdf = mis_weight(ls.prev_bsdf_pdf, em_pdf);
+                Float mis_bsdf = mis_weight(ls.vertex.bsdf_pdf, em_pdf);
 
-                // Accumulate, being careful with polarization (see spec_fma)
-                ls.result = spec_fma(
-                    ls.throughput,
-                    ds.emitter->eval(si, ls.prev_bsdf_pdf > 0.f) * mis_bsdf,
-                    ls.result);
+                // Accumulate and potentially clamp outliers
+                ls.result += clamp_contribution(
+                    ls.throughput * (emitter->eval(si) * mis_bsdf),
+                    /* direct = */ ls.vertex.depth <= 1);
             }
 
-            // Continue tracing the path at this point?
-            Bool active_next = (ls.depth + 1 < m_max_depth) && si.is_valid();
-
-            if (dr::none_or<false>(active_next)) {
-                ls.active = active_next;
-                ls.valid_ray |= (si.emitter(scene) != nullptr) && !m_hide_emitters;
+            if (dr::none_or<false>(si.is_valid())) {
+                ls.active = false;
                 return; // early exit for scalar mode
             }
 
-            BSDFPtr bsdf = si.bsdf(ls.ray);
+            BSDFPtr bsdf = si.bsdf();
+            UInt32 bsdf_flags = bsdf->flags();
+
+            // Continue tracing the path at this point? Null crossings don't
+            // count when checking for the max_depth cutoff.
+            Bool depth_ok  = ls.vertex.depth + 1 < m_max_depth,
+                 can_cross = has_null ? has_flag(bsdf_flags, BSDFFlags::Null)
+                                      : Mask(false),
+                 active_next = si.is_valid() && (depth_ok || can_cross);
+
+            if (dr::none_or<false>(active_next)) {
+                ls.active = false;
+                return; // early exit for scalar mode
+            }
 
             // ---------------------- Emitter sampling ----------------------
 
             // Perform emitter sampling?
-            Mask active_em = active_next && has_flag(bsdf->flags(), BSDFFlags::Smooth);
+            Mask active_em = active_next && depth_ok &&
+                             has_flag(bsdf_flags, BSDFFlags::Smooth);
 
             DirectionSample3f ds = dr::zeros<DirectionSample3f>();
             Spectrum em_weight = dr::zeros<Spectrum>();
             Vector3f wo = dr::zeros<Vector3f>();
 
             if (dr::any_or<true>(active_em)) {
-                // Sample the emitter
+                // Sample the emitter. The sample is detached, and its weight
+                // is attached to the emitter and to the motion of 'si'.
                 std::tie(ds, em_weight) = scene->sample_emitter_direction(
                     si, ls.sampler->next_2d(), true, active_em);
                 active_em &= (ds.pdf != 0.f);
-
-                /* Given the detached emitter sample, recompute its contribution
-                   with AD to enable light source optimization. */
-                if (dr::grad_enabled(si.p)) {
-                    ds.d = dr::normalize(ds.p - si.p);
-                    Spectrum em_val = scene->eval_emitter_direction(si, ds, active_em);
-                    em_weight = dr::select(ds.pdf != 0, em_val / ds.pdf, 0);
-                }
 
                 wo = si.to_local(ds.d);
             }
@@ -275,9 +263,10 @@ public:
                 Float mis_em =
                     dr::select(ds.delta, 1.f, mis_weight(ds.pdf, bsdf_pdf));
 
-                // Accumulate, being careful with polarization (see spec_fma)
-                ls.result[active_em] = spec_fma(
-                    ls.throughput, bsdf_val * em_weight * mis_em, ls.result);
+                // Accumulate and potentially clamp outliers
+                dr::masked(ls.result, active_em) += clamp_contribution(
+                    ls.throughput * (bsdf_val * em_weight * mis_em),
+                    ls.vertex.depth == 0);
             }
 
             // ---------------------- BSDF sampling ----------------------
@@ -286,57 +275,61 @@ public:
 
             ls.ray = si.spawn_ray(si.to_world(bsdf_sample.wo));
 
-            /* When the path tracer is differentiated, we must be careful that
-               the generated Monte Carlo samples are detached (i.e. don't track
-               derivatives) to avoid bias resulting from the combination of moving
-               samples and discontinuous visibility. We need to re-evaluate the
-               BSDF differentiably with the detached sample in that case. */
+            // A null crossing is not a path vertex
+            Mask scattered = has_null ? !bsdf_sample.is_null() : Mask(true);
+
+            // When the path tracer is differentiated, we must be careful that
+            // the generated Monte Carlo samples are detached (i.e. don't track
+            // derivatives) to avoid bias resulting from the combination of moving
+            // samples and discontinuous visibility. We need to re-evaluate the
+            // BSDF differentiably with the detached sample in that case. A
+            // null crossing keeps the attached weight of the null lobe.
             if (dr::grad_enabled(ls.ray)) {
-                ls.ray = dr::detach<true>(ls.ray);
+                ls.ray = dr::detach(ls.ray);
 
                 // Recompute 'wo' to propagate derivatives to cosine term
                 Vector3f wo_2 = si.to_local(ls.ray.d);
-                auto [bsdf_val_2, bsdf_pdf_2] = bsdf->eval_pdf(bsdf_ctx, si, wo_2, ls.active);
-                bsdf_weight[bsdf_pdf_2 > 0.f] = bsdf_val_2 / dr::detach(bsdf_pdf_2);
+                auto [bsdf_val_2, bsdf_pdf_2] = bsdf->eval_pdf(bsdf_ctx, si, wo_2);
+                bsdf_weight[bsdf_pdf_2 > 0.f && scattered] =
+                    bsdf_val_2 / dr::detach(bsdf_pdf_2);
             }
 
             // ------ Update loop variables based on current interaction ------
 
             ls.throughput *= bsdf_weight;
             ls.eta *= bsdf_sample.eta;
-            ls.valid_ray |= ls.active && si.is_valid() &&
-                         !has_flag(bsdf_sample.sampled_type, BSDFFlags::Null);
 
-            // Information about the current vertex needed by the next iteration
-            ls.prev_si = Interaction3f(si);
-            ls.prev_bsdf_pdf = bsdf_sample.pdf;
-            ls.prev_bsdf_delta = has_flag(bsdf_sample.sampled_type, BSDFFlags::Delta);
+            ls.valid_ray |= scattered && si.is_valid();
+            dr::masked(ls.vertex, scattered) = Vertex{
+                Interaction3f(si), bsdf_sample.pdf,
+                bsdf_sample.is_delta(),
+                ls.vertex.depth + 1,
+                // A specular event leaves the visibility class unchanged
+                dr::select(bsdf_sample.is_delta(), ls.vertex.ray_mask,
+                           +RayMask::Secondary) };
 
             // -------------------- Stopping criterion ---------------------
-
-            dr::masked(ls.depth, si.is_valid()) += 1;
 
             Float throughput_max = dr::max(unpolarized_spectrum(ls.throughput));
 
             Float rr_prob = dr::minimum(throughput_max * dr::square(ls.eta), .95f);
-            Mask rr_active = ls.depth >= m_rr_depth,
+            Mask rr_active = ls.vertex.depth >= m_rr_depth,
                  rr_continue = ls.sampler->next_1d() < rr_prob;
 
-            /* Differentiable variants of the renderer require the russian
-               roulette sampling weight to be detached to avoid bias. This is a
-               no-op in non-differentiable variants. */
+            // Differentiable variants of the renderer require the russian
+            // roulette sampling weight to be detached to avoid bias. This is a
+            // no-op in non-differentiable variants.
             ls.throughput[rr_active] *= dr::rcp(dr::detach(rr_prob));
 
-            ls.active = active_next && (!rr_active || rr_continue) &&
-                        (throughput_max != 0.f);
+            ls.active = active_next && (depth_ok || !scattered) &&
+                        (!rr_active || rr_continue) && (throughput_max != 0.f);
 
-            // Reorder threads based on the shape they hit
+            // Reorder threads based on the shape they hit.
             ls.pi = scene->ray_intersect_preliminary(ls.ray,
                                                      /* coherent = */ false,
-                                                     /* reorder = */ jit_flag(JitFlag::LoopRecord),
-                                                     /* reorder_hint = */ 0,
-                                                     /* reorder_hint_bits = */ 0,
-                                                     ls.active);
+                                                     ls.vertex.ray_mask,
+                                                     ls.active,
+                                                     /* reorder = */ jit_flag(JitFlag::LoopRecord));
         });
 
         return {
@@ -345,14 +338,15 @@ public:
         };
     }
 
-    //! @}
     // =============================================================
 
     std::string to_string() const override {
         return tfm::format("PathIntegrator[\n"
             "  max_depth = %u,\n"
-            "  rr_depth = %u\n"
-            "]", m_max_depth, m_rr_depth);
+            "  rr_depth = %u,\n"
+            "  clamp_direct = %f,\n"
+            "  clamp_indirect = %f\n"
+            "]", m_max_depth, m_rr_depth, m_clamp_direct, m_clamp_indirect);
     }
 
     /// Compute a multiple importance sampling weight using the power heuristic
@@ -360,19 +354,7 @@ public:
         pdf_a *= pdf_a;
         pdf_b *= pdf_b;
         Float w = pdf_a / (pdf_a + pdf_b);
-        return dr::detach<true>(dr::select(dr::isfinite(w), w, 0.f));
-    }
-
-    /**
-     * \brief Perform a Mueller matrix multiplication in polarized modes, and a
-     * fused multiply-add otherwise.
-     */
-    Spectrum spec_fma(const Spectrum &a, const Spectrum &b,
-                      const Spectrum &c) const {
-        if constexpr (is_polarized_v<Spectrum>)
-            return a * b + c;
-        else
-            return dr::fmadd(a, b, c);
+        return dr::detach(dr::select(dr::isfinite(w), w, 0.f));
     }
 
     MI_DECLARE_CLASS(PathIntegrator)

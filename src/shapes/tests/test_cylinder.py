@@ -29,7 +29,13 @@ def test01_create(variant_scalar_rgb):
         "to_world" : rot @ T().translate([1, -1, -1]) @ T().rotate([1.0, 0.0, 0.0], -45) @ T().scale([0.5, 0.5, dr.sqrt(8)])
     })
 
-    assert str(s1) == str(s2)
+    # Compare numerically rather than via ``str()`` because both transforms are
+    # mathematically identical but are assembled in a different order, which
+    # perturbs the last digits of the printed keyframe decomposition.
+    assert dr.allclose(s1.to_world().matrix, s2.to_world().matrix, atol=1e-6)
+    assert dr.allclose(s1.surface_area(), s2.surface_area())
+    assert dr.allclose(s1.bbox().min, s2.bbox().min, atol=1e-6)
+    assert dr.allclose(s1.bbox().max, s2.bbox().max, atol=1e-6)
 
 
 def test02_bbox(variant_scalar_rgb):
@@ -68,7 +74,8 @@ def test03_ray_intersect(variant_scalar_rgb):
                     ray = mi.Ray3f(o=[x, -10, z], d=[0, 1, 0],
                                 time=0.0, wavelengths=[])
                     si_found = s.ray_test(ray)
-                    si = s.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.dNSdUV, True)
+                    si = s.ray_intersect(
+                        ray, mi.RayFlags.Default | mi.RayFlags.NormalPartials, True)
 
                     assert si_found == si.is_valid()
                     assert si_found == dr.allclose(si.p[0]**2 + si.p[1]**2, r**2)
@@ -126,37 +133,37 @@ def test05_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(ray.d)
 
     # If the ray origin is shifted along the x-axis, so does si.p
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.p *= 1.0
     dr.forward(ray.o.x)
     assert dr.allclose(dr.grad(si.p), [1, 0, 0])
 
     # If the ray origin is shifted along the z-axis, so does si.p
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.p *= 1.0
     dr.forward(ray.o.z)
     assert dr.allclose(dr.grad(si.p), [0, 0, 1])
 
     # If the ray origin is shifted along the y-axis, so does si.t
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.t *= 1.0
     dr.forward(ray.o.y)
     assert dr.allclose(dr.grad(si.t), -1.0)
 
     # If the ray direction is shifted along the x-axis, so does si.p
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.p *= 1.0
     dr.forward(ray.d.x)
     assert dr.allclose(dr.grad(si.p), [9, 0, 0])
 
     # If the ray origin is shifted tangent to the cylinder section, si.uv.x move by 1 / 2pi
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.uv *= 1.0
     dr.forward(ray.o.x)
     assert dr.allclose(dr.grad(si.uv), [1 / (2 * dr.pi), 0])
 
     # If the ray origin is shifted along the cylinder length, si.uv.y move by 1
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.uv *= 1.0
     dr.forward(ray.o.z)
     assert dr.allclose(dr.grad(si.uv), [0, 1])
@@ -171,13 +178,13 @@ def test06_differentiable_surface_interaction_ray_backward(variant_cuda_ad_rgb):
     dr.enable_grad(ray.o)
 
     # If si.p is shifted along the x-axis, so does the ray origin
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     dr.backward(si.p.x)
     assert dr.allclose(dr.grad(ray.o), [1, 0, 0])
 
     # If si.t is changed, so does the ray origin along the z-axis
     dr.set_grad(ray.o, 0.0)
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     dr.backward(si.t)
     assert dr.allclose(dr.grad(ray.o), [0, -1, 0])
 
@@ -195,7 +202,7 @@ def test07_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().scale(1 + theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default)
 
     dr.forward(theta)
 
@@ -213,7 +220,7 @@ def test07_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().scale(1 + theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.FollowShape)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default | mi.RayFlags.FollowShape)
 
     dr.forward(theta)
 
@@ -231,7 +238,7 @@ def test07_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().translate([0, 0, theta])
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.FollowShape)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default | mi.RayFlags.FollowShape)
 
     dr.forward(theta)
 
@@ -249,7 +256,7 @@ def test07_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().rotate([0, 0, 1], 90 * theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.FollowShape)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default | mi.RayFlags.FollowShape)
 
     dr.forward(theta)
 
@@ -267,7 +274,7 @@ def test07_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().rotate([0, 0, 1], 90 * theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default)
 
     dr.forward(theta)
 

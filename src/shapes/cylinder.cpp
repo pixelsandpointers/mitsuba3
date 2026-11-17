@@ -11,14 +11,6 @@
 
 #include <drjit/packet.h>
 
-#if defined(MI_ENABLE_CUDA)
-    #include "optix/cylinder.cuh"
-#endif
-
-#if defined(MI_ENABLE_METAL) || defined(MI_ENABLE_CUDA)
-    #include <mitsuba/render/shapedata.h>
-#endif
-
 NAMESPACE_BEGIN(mitsuba)
 
 /**!
@@ -100,16 +92,14 @@ A simple example for instantiating a cylinder, whose interior is visible:
 template <typename Float, typename Spectrum>
 class Cylinder final : public Shape<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Shape, m_to_world, m_is_instance,
-                   m_discontinuity_types, m_shape_type, initialize, mark_dirty,
-                   get_children_string, parameters_grad_enabled)
+    MI_IMPORT_BASE(Shape, m_to_world, m_discontinuity_types, m_shape_type,
+                   initialize, mark_dirty, get_children_string)
     MI_IMPORT_TYPES()
 
     using typename Base::ScalarIndex;
-    using typename Base::ScalarSize;
 
     Cylinder(const Properties &props) : Base(props) {
-        /// Are the sphere normals pointing inwards? default: no
+        // Are the cylinder normals pointing inwards? default: no
         m_flip_normals = props.get<bool>("flip_normals", false);
 
         // Update the to_world transform if face points and radius are also provided
@@ -133,25 +123,23 @@ public:
     }
 
     void update() {
-         // Extract center and radius from to_world matrix (25 iterations for numerical accuracy)
-        auto [S, Q, T] = transform_decompose(m_to_world.scalar().matrix, 25);
+        // The columns must be orthogonal, with equal lengths along X and Y
+        const ScalarAffineTransform4f &tw = m_to_world.scalar();
+        ScalarVector3f cx = tw * ScalarVector3f(1.f, 0.f, 0.f),
+                       cy = tw * ScalarVector3f(0.f, 1.f, 0.f),
+                       cz = tw * ScalarVector3f(0.f, 0.f, 1.f);
+        ScalarFloat lx = dr::norm(cx), ly = dr::norm(cy), lz = dr::norm(cz);
 
-        if (dr::abs(S[0][1]) > 1e-6f || dr::abs(S[0][2]) > 1e-6f || dr::abs(S[1][0]) > 1e-6f ||
-            dr::abs(S[1][2]) > 1e-6f || dr::abs(S[2][0]) > 1e-6f || dr::abs(S[2][1]) > 1e-6f)
+        if (dr::abs(dr::dot(cx, cy)) > 1e-4f * lx * ly ||
+            dr::abs(dr::dot(cx, cz)) > 1e-4f * lx * lz ||
+            dr::abs(dr::dot(cy, cz)) > 1e-4f * ly * lz)
             Log(Warn, "'to_world' transform shouldn't contain any shearing!");
 
-        if (!(dr::abs(S[0][0] - S[1][1]) < 1e-6f))
+        if (dr::abs(lx - ly) > 1e-4f * lx)
             Log(Warn, "'to_world' transform shouldn't contain non-uniform scaling along the X and Y axes!");
 
         m_radius = dr::norm(m_to_world.value() * Vector3f(1.f, 0.f, 0.f));
         m_length = dr::norm(m_to_world.value() * Vector3f(0.f, 0.f, 1.f));
-
-        if (S[0][0] <= 0.f) {
-            m_radius = dr::abs(m_radius.value());
-            m_flip_normals = !m_flip_normals;
-        }
-
-        // Compute the to_object transformation with uniform scaling and no shear
 
         m_inv_surface_area = dr::rcp(surface_area());
 
@@ -186,13 +174,13 @@ public:
         ScalarPoint3f p0 = m_to_world.scalar() * ScalarPoint3f(0.f, 0.f, 0.f),
                       p1 = m_to_world.scalar() * ScalarPoint3f(0.f, 0.f, 1.f);
 
-        /* To bound the cylinder, it is sufficient to find the
-           smallest box containing the two circles at the endpoints. */
+        // To bound the cylinder, it is sufficient to find the
+        // smallest box containing the two circles at the endpoints.
         return ScalarBoundingBox3f(dr::minimum(p0 - x, p1 - x),
                                    dr::maximum(p0 + x, p1 + x));
     }
 
-    ScalarBoundingBox3f bbox(ScalarIndex /*index*/, const ScalarBoundingBox3f &clip) const override {
+    ScalarBoundingBox3f bbox(ScalarIndex /*prim_index*/, const ScalarBoundingBox3f &clip) const override {
         using FloatP8         = dr::Packet<ScalarFloat, 8>;
         using MaskP8          = dr::mask_t<FloatP8>;
         using Point3fP8       = Point<FloatP8, 3>;
@@ -207,9 +195,9 @@ public:
         ScalarBoundingBox3f bbox(this->bbox());
         bbox.clip(clip);
 
-        /* Now forget about the cylinder ends and intersect an infinite
-           cylinder with each bounding box face, then compute a bounding
-           box of the resulting ellipses. */
+        // Now forget about the cylinder ends and intersect an infinite
+        // cylinder with each bounding box face, then compute a bounding
+        // box of the resulting ellipses.
         Point3fP8  face_p = dr::zeros<Point3fP8>();
         Vector3fP8 face_n = dr::zeros<Vector3fP8>();
 
@@ -257,11 +245,6 @@ public:
         return dr::TwoPi<ScalarFloat> * m_radius.value() * m_length.value();
     }
 
-    /// Does this cylinder have flipped normals?
-    bool has_flipped_normals() const override {
-        return m_flip_normals;
-    }
-
     PositionSample3f sample_position(Float time, const Point2f &sample,
                                      Mask active) const override {
         MI_MASK_ARGUMENT(active);
@@ -272,12 +255,12 @@ public:
         Point3f p(cos_theta, sin_theta, sample.x());
         Normal3f n(cos_theta, sin_theta, 0.f);
 
-        if (m_flip_normals)
-            n *= -1;
-
         PositionSample3f ps = dr::zeros<PositionSample3f>();
         ps.p     = to_world * p;
         ps.n     = dr::normalize(to_world * n);
+        if (m_flip_normals)
+            ps.n = -ps.n;
+        ps.p_err = to_world.position_error(p, ps.n);
         ps.pdf   = m_inv_surface_area;
         ps.time  = time;
         ps.delta = false;
@@ -294,30 +277,44 @@ public:
     SurfaceInteraction3f eval_parameterization(const Point2f &uv,
                                                uint32_t ray_flags,
                                                Mask active) const override {
+        MI_MASK_ARGUMENT(active);
+
+        bool detach_shape = has_flag(ray_flags, RayFlags::DetachShape);
+        AffineTransform4f to_world = detach_shape ? dr::detach(m_to_world.value())
+                                                  : m_to_world.value();
+        Float radius = detach_shape ? dr::detach(m_radius.value())
+                                    : m_radius.value();
+
         auto [sin_phi, cos_phi] = dr::sincos(dr::TwoPi<Float> * uv.x());
         Point3f local(cos_phi, sin_phi, uv.y());
-        Point3f p = m_to_world.value() * local;
+        Vector3f n = dr::normalize(to_world * Normal3f(cos_phi, sin_phi, 0.f));
 
-        Ray3f ray(p + local, -local, 0, Wavelength(0));
+        SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
+        si.t     = dr::select(active, 0.f, dr::Infinity<Float>);
+        si.p     = to_world * local;
+        si.p_err = to_world.position_error(local, n);
+        si.uv    = uv;
+        si.dp_du = to_world * Vector3f(-sin_phi, cos_phi, 0.f) * dr::TwoPi<Float>;
+        si.dp_dv = to_world * Vector3f(0.f, 0.f, 1.f);
+        si.n = m_flip_normals ? -n : n;
+        si.sh_frame.n = si.n;
+        si.sh_frame.s = si.dp_du;
+        si.initialize_sh_frame();
+        si.shape = this;
+        dr::masked(si.shape, !active) = nullptr;
 
-        PreliminaryIntersection3f pi = ray_intersect_preliminary(ray, 0, active);
-        active &= pi.is_valid();
-
-        if (dr::none_or<false>(active))
-            return dr::zeros<SurfaceInteraction3f>();
-
-        SurfaceInteraction3f si =
-            compute_surface_interaction(ray, pi, ray_flags, 0, active);
-        si.finalize_surface_interaction(pi, ray, ray_flags, active);
+        // The normal partial along 'v' vanishes, the cylinder is straight
+        if (has_flag(ray_flags, RayFlags::NormalPartials))
+            si.dn_du = si.dp_du * ((m_flip_normals ? -1.f : 1.f) *
+                                   dr::rcp(radius));
 
         return si;
     }
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Silhouette sampling routines and other utilities
+    // Silhouette sampling routines and other utilities
     // =============================================================
 
     SilhouetteSample3f sample_silhouette(const Point3f &sample,
@@ -329,21 +326,20 @@ public:
         SilhouetteSample3f ss = dr::zeros<SilhouetteSample3f>();
 
         if (has_flag(flags, DiscontinuityFlags::PerimeterType)) {
-            /// Sample a point on the shape surface
+            // Sample a point on the shape surface
             ss.uv = dr::select(
                 sample.x() < 0.5f,
                 Point2f(sample.x() * 2.f, 0.f),
                 Point2f(sample.x() * 2.f - 1.f, 1.f)
             );
-            Float sin_theta(0), cos_theta(0);
-            std::tie(sin_theta, cos_theta) = dr::sincos(ss.uv.x() * dr::TwoPi<Float>);
+            auto [sin_theta, cos_theta] = dr::sincos(ss.uv.x() * dr::TwoPi<Float>);
             Point3f local_p(cos_theta, sin_theta, ss.uv.y());
             ss.p = to_world * local_p;
 
-            /// Sample a tangential direction at the point
+            // Sample a tangential direction at the point
             ss.d = warp::square_to_uniform_sphere(Point2f(sample.y(), sample.z()));
 
-            /// Fill other fields
+            // Fill other fields
             ss.discontinuity_type = (uint32_t) DiscontinuityFlags::PerimeterType;
             ss.flags = flags;
             ss.silhouette_d  = dr::normalize(to_world *
@@ -360,14 +356,14 @@ public:
             ss.pdf *= warp::square_to_uniform_sphere_pdf(ss.d);
             ss.foreshortening = dr::norm(dr::cross(ss.d, ss.silhouette_d));
         } else if (has_flag(flags, DiscontinuityFlags::InteriorType)) {
-            /// Sample a point on the shape surface
+            // Sample a point on the shape surface
             ss = SilhouetteSample3f(
                 sample_position(0.f, dr::tail<2>(sample), active));
 
-            /// Sample a tangential direction at the point
+            // Sample a tangential direction at the point
             ss.d = warp::interval_to_tangent_direction(ss.n, sample.x());
 
-            /// Fill other fields
+            // Fill other fields
             ss.discontinuity_type = (uint32_t) DiscontinuityFlags::InteriorType;
             ss.flags = flags;
 
@@ -389,7 +385,7 @@ public:
                                      Mask active) const override {
         MI_MASK_ARGUMENT(active);
 
-        /// Invert perimeter type samples
+        // Invert perimeter type samples
         Point3f sample_perimeter = dr::zeros<Point3f>(dr::width(ss));
         sample_perimeter.x() = dr::select(ss.uv.y() < 0.5f,
                                           ss.uv.x() * 0.5f,
@@ -398,13 +394,13 @@ public:
         sample_perimeter.y() = sample_perimeter_yz.x();
         sample_perimeter.z() = sample_perimeter_yz.y();
 
-        /// Invert interior type samples
+        // Invert interior type samples
         Point3f sample_interior = dr::zeros<Point3f>(dr::width(ss));
         sample_interior.x() = warp::tangent_direction_to_interval(ss.n, ss.d);
         sample_interior.y() = ss.uv.y();
         sample_interior.z() = ss.uv.x();
 
-        /// Merge outputs
+        // Merge outputs
         Point3f sample = dr::zeros<Point3f>();
         Mask is_perimeter =
             has_flag(ss.discontinuity_type, DiscontinuityFlags::PerimeterType);
@@ -463,16 +459,16 @@ public:
             ss.n = frame_n;
             ss.discontinuity_type = (uint32_t) DiscontinuityFlags::PerimeterType;
         } else if (has_flag(flags, DiscontinuityFlags::InteriorType)) {
+            // Squared distance of the viewpoint from the axis in object space
             Point3f local = m_to_world.value().inverse() * viewpoint;
-            local.z() = 0.f;
+            Float dist_2 = dr::square(local.x()) + dr::square(local.y());
 
-            Float norm_local_v = dr::norm(local);
             Float OV_theta = dr::atan2(local.y(), local.x());
             auto [sin_Y_pos, cos_Y_pos] = dr::sincos(OV_theta + 0.5f * dr::Pi<Float>);
             auto [sin_si, cos_si] = dr::sincos(si.uv.x() * dr::TwoPi<Float>);
             Float sign = dr::sign(cos_Y_pos * cos_si + sin_Y_pos * sin_si);
 
-            Float phi = dr::safe_asin(dr::rcp(norm_local_v));
+            Float phi = dr::safe_asin(dr::rsqrt(dist_2));
 
             Float ss_u_theta = OV_theta + (0.5f * dr::Pi<Float> - phi) * sign;
             dr::masked(ss_u_theta, ss_u_theta < 0.f) += dr::TwoPi<Float>;
@@ -490,9 +486,8 @@ public:
             ss.n = dr::normalize(to_world * local_n);
 
             // No interior boundary if the viewpoint is inside the cylinder
-            Mask succeeded = dr::select(norm_local_v > 1.f, 1u, 0u);
             ss.discontinuity_type =
-                dr::select(succeeded,
+                dr::select(dist_2 > 1.f,
                            (uint32_t) DiscontinuityFlags::InteriorType,
                            (uint32_t) DiscontinuityFlags::Empty);
         }
@@ -552,122 +547,70 @@ public:
         return ss;
     }
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Ray tracing routines
+    // Ray tracing routines
     // =============================================================
+
+    template <typename FloatP, typename Ray3fP>
+    std::pair<dr::mask_t<FloatP>, FloatP>
+    intersect_impl(const Ray3fP &ray_, dr::mask_t<FloatP> active) const {
+        using Vector2fP = Vector<FloatP, 2>;
+
+        // Object space contains the unit cylinder along the Z axis
+        Ray3fP ray;
+        if constexpr (!dr::is_jit_v<FloatP>)
+            ray = m_to_world.scalar().inverse() * ray_;
+        else
+            ray = m_to_world.value().inverse() * ray_;
+
+        // Shift the ray origin to the point closest to the axis (see sphere.cpp)
+        Vector2fP l(ray.o.x(), ray.o.y()),
+                  d(ray.d.x(), ray.d.y());
+
+        FloatP A = dr::squared_norm(d),
+               t_offset = dr::select(A != 0.f, -dr::dot(l, d) / A, 0.f);
+        Vector2fP o = dr::fmadd(d, t_offset, l);
+
+        FloatP B = 2.f * dr::dot(o, d),
+               C = dr::squared_norm(o) - 1.f;
+
+        auto [solution_found, near_t, far_t] = math::solve_quadratic(A, B, C);
+        near_t += t_offset;
+        far_t += t_offset;
+
+        FloatP z_near = dr::fmadd(ray.d.z(), near_t, ray.o.z()),
+               z_far  = dr::fmadd(ray.d.z(), far_t,  ray.o.z());
+
+        dr::mask_t<FloatP> near_ok = near_t >= 0.f && near_t <= ray.maxt &&
+                                     z_near >= 0.f && z_near <= 1.f,
+                           far_ok  = far_t  >= 0.f && far_t  <= ray.maxt &&
+                                     z_far  >= 0.f && z_far  <= 1.f;
+
+        active &= solution_found && (near_ok || far_ok);
+        FloatP t = dr::select(near_ok, near_t, far_t);
+
+        return { active, dr::select(active, t, dr::Infinity<FloatP>) };
+    }
 
     template <typename FloatP, typename Ray3fP>
     std::tuple<dr::mask_t<FloatP>, FloatP, Point<FloatP, 2>,
                dr::uint32_array_t<FloatP>, dr::uint32_array_t<FloatP>>
-    ray_intersect_preliminary_impl(const Ray3fP &ray_,
-                                   ScalarIndex /*prim_index*/,
+    ray_intersect_preliminary_impl(const Ray3fP &ray,
+                                   dr::uint32_array_t<FloatP> /*prim_index*/,
                                    dr::mask_t<FloatP> active) const {
         MI_MASK_ARGUMENT(active);
-
-        using Value = std::conditional_t<dr::is_cuda_v<FloatP> || dr::is_diff_v<Float>,
-                                         dr::float32_array_t<FloatP>,
-                                         dr::float64_array_t<FloatP>>;
-        using ScalarValue = dr::scalar_t<Value>;
-
-        Ray3fP ray;
-        Value radius(1.0); // Constant kept for readability
-        Value length(1.0);
-        if constexpr (!dr::is_jit_v<Value>)
-            ray = m_to_world.scalar().inverse() * ray_;
-        else
-            ray = m_to_world.value().inverse() * ray_;
-
-        Value maxt = Value(ray.maxt);
-
-        Value ox = Value(ray.o.x()),
-              oy = Value(ray.o.y()),
-              oz = Value(ray.o.z()),
-              dx = Value(ray.d.x()),
-              dy = Value(ray.d.y()),
-              dz = Value(ray.d.z());
-
-        Value A = dr::square(dx) + dr::square(dy),
-              B = ScalarValue(2.f) * (dx * ox + dy * oy),
-              C = dr::square(ox) + dr::square(oy) - dr::square(radius);
-
-        auto [solution_found, near_t, far_t] = math::solve_quadratic(A, B, C);
-
-        // Cylinder doesn't intersect with the segment on the ray
-        dr::mask_t<FloatP> out_bounds =
-            !(near_t <= maxt && far_t >= Value(0.0)); // NaN-aware conditionals
-
-        Value z_pos_near = oz + dz * near_t,
-              z_pos_far  = oz + dz * far_t;
-
-        // Cylinder fully contains the segment of the ray
-        dr::mask_t<FloatP> in_bounds = near_t < Value(0.0) && far_t > maxt;
-
-        active &= solution_found && !out_bounds && !in_bounds &&
-                  ((z_pos_near >= Value(0.0) && z_pos_near <= length && near_t >= Value(0.0)) ||
-                   (z_pos_far  >= Value(0.0) && z_pos_far <= length  && far_t <= maxt));
-
-        FloatP t =
-            dr::select(active,
-                       dr::select(z_pos_near >= Value(0.0) && z_pos_near <= length &&
-                                      near_t >= Value(0.0),
-                                  FloatP(near_t), FloatP(far_t)),
-                       dr::Infinity<FloatP>);
-
-        return { active, t, dr::zeros<Point<FloatP, 2>>(), ((uint32_t) -1), 0 };
+        auto [valid, t] = intersect_impl<FloatP>(ray, active);
+        return { valid, t, dr::zeros<Point<FloatP, 2>>(), ((uint32_t) -1), 0 };
     }
 
     template <typename FloatP, typename Ray3fP>
-    dr::mask_t<FloatP> ray_test_impl(const Ray3fP &ray_,
-                                     ScalarIndex /*prim_index*/,
+    dr::mask_t<FloatP> ray_test_impl(const Ray3fP &ray,
+                                     dr::uint32_array_t<FloatP> /*prim_index*/,
                                      dr::mask_t<FloatP> active) const {
         MI_MASK_ARGUMENT(active);
-
-        using Value = std::conditional_t<dr::is_cuda_v<FloatP> || dr::is_diff_v<Float>,
-                                         dr::float32_array_t<FloatP>,
-                                         dr::float64_array_t<FloatP>>;
-        using ScalarValue = dr::scalar_t<Value>;
-
-        Ray3fP ray;
-        Value radius(1.0); // Constant kept for readability
-        Value length(1.0);
-        if constexpr (!dr::is_jit_v<Value>)
-            ray = m_to_world.scalar().inverse() * ray_;
-        else
-            ray = m_to_world.value().inverse() * ray_;
-
-        Value maxt = Value(ray.maxt);
-
-        Value ox = Value(ray.o.x()),
-              oy = Value(ray.o.y()),
-              oz = Value(ray.o.z()),
-              dx = Value(ray.d.x()),
-              dy = Value(ray.d.y()),
-              dz = Value(ray.d.z());
-
-        Value A = dr::square(dx) + dr::square(dy),
-              B = ScalarValue(2.f) * (dx * ox + dy * oy),
-              C = dr::square(ox) + dr::square(oy) - dr::square(radius);
-
-        auto [solution_found, near_t, far_t] = math::solve_quadratic(A, B, C);
-
-        // Cylinder doesn't intersect with the segment on the ray
-        dr::mask_t<FloatP> out_bounds = !(near_t <= maxt && far_t >= Value(0.0)); // NaN-aware conditionals
-
-        Value z_pos_near = oz + dz * near_t,
-              z_pos_far  = oz + dz * far_t;
-
-        // Cylinder fully contains the segment of the ray
-        dr::mask_t<FloatP> in_bounds = near_t < Value(0.0) && far_t > maxt;
-
-        dr::mask_t<FloatP> valid_intersection =
-            active && solution_found && !out_bounds && !in_bounds &&
-            ((z_pos_near >= Value(0.0) && z_pos_near <= length && near_t >= Value(0.0)) ||
-             (z_pos_far  >= Value(0.0) && z_pos_far  <= length && far_t  <= maxt));
-
-        return valid_intersection;
+        return intersect_impl<FloatP>(ray, active).first;
     }
 
     MI_SHAPE_DEFINE_RAY_INTERSECT_METHODS()
@@ -675,112 +618,71 @@ public:
     SurfaceInteraction3f compute_surface_interaction(const Ray3f &ray,
                                                      const PreliminaryIntersection3f &pi,
                                                      uint32_t ray_flags,
-                                                     uint32_t recursion_depth,
                                                      Mask active) const override {
         MI_MASK_ARGUMENT(active);
-        constexpr bool IsDiff = dr::is_diff_v<Float>;
 
-        // Early exit when tracing isn't necessary
-        if (!m_is_instance && recursion_depth > 0)
-            return dr::zeros<SurfaceInteraction3f>();
-
-        // Fields requirement dependencies
-        bool need_dn_duv  = has_flag(ray_flags, RayFlags::dNSdUV) ||
-                            has_flag(ray_flags, RayFlags::dNGdUV);
         bool detach_shape = has_flag(ray_flags, RayFlags::DetachShape);
-        bool follow_shape = has_flag(ray_flags, RayFlags::FollowShape);
 
         const Float& radius = m_radius.value();
         const AffineTransform4f& to_world = m_to_world.value();
         AffineTransform4f to_object = to_world.inverse();
 
-        /* If necessary, temporally suspend gradient tracking for all shape
-        parameters to construct a surface interaction completely detach from
-        the shape. */
+        // If necessary, temporally suspend gradient tracking for all shape
+        // parameters to construct a surface interaction completely detach from
+        // the shape.
         dr::suspend_grad<Float> scope(detach_shape, radius, to_world, to_object);
 
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
 
+        // Local coordinates of the hit point, re-projected onto the unit
+        // cylinder to mitigate roundoff error
+        Point3f local = dr::detach(to_object * ray(pi.t));
+        Float inv_r = dr::rsqrt(dr::square(local.x()) + dr::square(local.y()));
+        local.x() *= inv_r;
+        local.y() *= inv_r;
+
         si.t = pi.t;
-        si.p = ray(si.t);
-        Point3f local;
-        if constexpr (IsDiff) {
-            if (follow_shape) {
-                /* FollowShape glues the interaction point with the shape.
-                   Therefore, to also account for a possible differential motion
-                   of the shape, we first compute a detached intersection point
-                   in local space and transform it back in world space to get a
-                   point rigidly attached to the shape's motion, including
-                   translation, scaling and rotation. */
-                local = to_object * si.p;
-                Float r = dr::norm(dr::head<2>(local));
-                local.x() /= r;
-                local.y() /= r;
-                local = dr::detach(local);
-                si.p = to_world * local;
-                si.t = dr::sqrt(dr::squared_norm(si.p - ray.o) / dr::squared_norm(ray.d));
-            } else {
-                /* To ensure that the differential interaction point stays along
-                   the traced ray, we first recompute the intersection distance
-                   in a differentiable way (w.r.t. to the cylindrical parameters) and
-                   then compute the corresponding point along the ray. */
-                si.t = dr::replace_grad(si.t, ray_intersect_preliminary(ray, 0, active).t);
-                si.p = ray(si.t);
-                local = to_object * si.p;
-            }
-        } else {
-            local = to_object * si.p;
-        }
+        si.p = dr::detach(to_world) * local;
+        si.n = Normal3f(dr::normalize(
+            dr::detach(to_world) * Normal3f(local.x(), local.y(), 0.f)));
+        si.p_err = to_world.position_error(local, si.n);
 
-        si.t = dr::select(active, si.t, dr::Infinity<Float>);
+        // The local coordinates are static as the cylinder moves
+        Point3f p_att = to_world * local;
 
-        // si.uv
-        Float phi = dr::atan2(local.y(), local.x());
-        dr::masked(phi, phi < 0.f) += dr::TwoPi<Float>;
-        si.uv = Point2f(phi * dr::InvTwoPi<Float>, local.z());
-        // si.dp_duv & si.n
-        Vector3f dp_du = dr::TwoPi<Float> * Vector3f(-local.y(), local.x(), 0.f);
-        Vector3f dp_dv = Vector3f(0.f, 0.f, 1.f);
-        si.dp_du = to_world * dp_du;
-        si.dp_dv = to_world * dp_dv;
-        si.n = Normal3f(dr::normalize(dr::cross(si.dp_du, si.dp_dv)));
+        si.attach_motion(ray, p_att, ray_flags);
 
-        if constexpr (!IsDiff) {
-            /* Mitigate roundoff error issues by a normal shift of the computed
-               intersection point */
-            si.p += si.n * (1.f - dr::norm(dr::head<2>(local)));
-        }
+        local = to_object * si.p;
+
+        si.n = Normal3f(dr::normalize(
+            to_world * Normal3f(local.x(), local.y(), 0.f)));
 
         if (m_flip_normals)
             si.n = -si.n;
-        si.sh_frame.n = si.n;
 
-        if (likely(need_dn_duv)) {
-            si.dn_du = si.dp_du / (radius * (m_flip_normals ? -1.f : 1.f));
-            si.dn_dv = Vector3f(0.f);
+        if (likely(has_flag(ray_flags, RayFlags::Shading))) {
+            Float phi = dr::atan2(local.y(), local.x());
+            dr::masked(phi, phi < 0.f) += dr::TwoPi<Float>;
+
+            si.uv         = Point2f(phi * dr::InvTwoPi<Float>, local.z());
+            si.dp_du      = to_world * (dr::TwoPi<Float> *
+                                        Vector3f(-local.y(), local.x(), 0.f));
+            si.dp_dv      = to_world * Vector3f(0.f, 0.f, 1.f);
+            si.sh_frame.n = si.n;
+            si.sh_frame.s = si.dp_du;
+
+            // The normal partial along 'v' vanishes, the cylinder is straight
+            if (has_flag(ray_flags, RayFlags::NormalPartials))
+                si.dn_du = si.dp_du * ((m_flip_normals ? -1.f : 1.f) *
+                                       dr::rcp(m_radius.value()));
         }
 
         si.prim_index = pi.prim_index;
         si.shape    = this;
-        si.instance = nullptr;
+        si.instance_index = 0;
 
         return si;
     }
-
-#if defined(MI_ENABLE_METAL) || defined(MI_ENABLE_CUDA)
-    void gpu_fill_data(void *out) const {
-        shapedata::CylinderData &d = *(shapedata::CylinderData *) out;
-        shapedata::fill_affine3x4(m_to_world.scalar().inverse().matrix,
-                                  d.to_object);
-        // Object space is the unit-radius, unit-length z-axis cylinder (length
-        // and radius are baked into m_to_world), so both params are 1 here.
-        d.params = { 1.f, 1.f, 0.f, 0.f };
-    }
-
-    void describe(ShapeIR &g) const override {
-        Base::template describe_with_data<Cylinder, shapedata::CylinderData>(g);
-    }
-#endif
 
     bool parameters_grad_enabled() const override {
         return dr::grad_enabled(m_radius) || dr::grad_enabled(m_length) ||

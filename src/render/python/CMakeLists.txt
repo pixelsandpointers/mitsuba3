@@ -1,5 +1,6 @@
 set(RENDER_PY_V_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/bsdf_v.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/dedge_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/emitter_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/endpoint_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/film_v.cpp
@@ -13,6 +14,7 @@ set(RENDER_PY_V_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/microflake_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/optixdenoiser_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/phase_v.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/postprocess_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/records_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/sampler_v.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/scene_v.cpp
@@ -29,12 +31,12 @@ set(RENDER_PY_V_SRC
 set(RENDER_PY_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/emitter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/bsdf.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/dedge.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/shape.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/microfacet.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/interaction.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/phase.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/sensor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/spiral.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/film.cpp
   PARENT_SCOPE
 )

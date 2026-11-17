@@ -33,6 +33,15 @@ Smooth dielectric material (:monosp:`dielectric`)
    - Optional factor that can be used to modulate the specular transmission component. Note that for physical realism, this parameter should never be touched. (Default: 1.0)
    - |exposed|, |differentiable|
 
+ * - eta_scale
+   - |bool|
+   - Refraction compresses the solid angle of a ray bundle, which scales the radiance
+     crossing the interface by the squared ratio of the refractive indices. The plugin
+     applies this factor when tracing radiance. Some production renderers (incorrectly)
+     omit this scale, which can lead to inconsistencies, e.g., when rendering glass
+     panels with only one sheet. Set this flag to :monosp:`false` to emulate their
+     behavior. (Default: |true|)
+
  * - eta
    - |float|
    - Relative index of refraction from the exterior to the interior
@@ -226,12 +235,24 @@ public:
         if (props.has_property("specular_transmittance"))
             m_specular_transmittance = props.get_texture<Texture>("specular_transmittance", 1.f);
 
+        m_eta_scale = props.get<bool>("eta_scale", true);
+
         m_components.push_back(BSDFFlags::DeltaReflection | BSDFFlags::FrontSide |
                                BSDFFlags::BackSide);
-        m_components.push_back(BSDFFlags::DeltaTransmission | BSDFFlags::FrontSide |
-                               BSDFFlags::BackSide | BSDFFlags::NonSymmetric);
+        uint32_t f = BSDFFlags::DeltaTransmission | BSDFFlags::FrontSide |
+                     BSDFFlags::BackSide;
+        if (m_eta_scale)
+            f = f | BSDFFlags::NonSymmetric;
+        m_components.push_back(f);
 
         m_flags = m_components[0] | m_components[1];
+
+        parameters_changed();
+    }
+
+    void parameters_changed(const std::vector<std::string> &/*keys*/ = {}) override {
+        m_inv_eta = dr::rcp(m_eta);
+        dr::make_opaque(m_eta, m_inv_eta);
     }
 
     void traverse(TraversalCallback *cb) override {
@@ -255,7 +276,7 @@ public:
         // Evaluate the Fresnel equations for unpolarized illumination
         Float cos_theta_i = Frame3f::cos_theta(si.wi);
 
-        auto [r_i, cos_theta_t, eta_it, eta_ti] = fresnel(cos_theta_i, Float(m_eta));
+        auto [r_i, cos_theta_t, eta_it, eta_ti] = fresnel(cos_theta_i, m_eta, m_inv_eta);
         Float t_i = 1.f - r_i;
 
         // Lobe selection
@@ -282,7 +303,7 @@ public:
                            reflect(si.wi),
                            refract(si.wi, cos_theta_t, eta_ti));
 
-        bs.eta = dr::select(selected_r, Float(1.f), eta_it);
+        bs.eta = m_eta_scale ? dr::select(selected_r, Float(1.f), eta_it) : Float(1.f);
 
         UnpolarizedSpectrum reflectance = 1.f, transmittance = 1.f;
         if (m_specular_reflectance)
@@ -292,14 +313,14 @@ public:
 
         Spectrum weight(0.f);
         if constexpr (is_polarized_v<Spectrum>) {
-            /* Due to the coordinate system rotations for polarization-aware
-               pBSDFs below we need to know the propagation direction of light.
-               In the following, light arrives along `-wo_hat` and leaves along
-               `+wi_hat`. */
+            // Due to the coordinate system rotations for polarization-aware
+            // pBSDFs below we need to know the propagation direction of light.
+            // In the following, light arrives along `-wo_hat` and leaves along
+            // `+wi_hat`.
             Vector3f wo_hat = ctx.mode == TransportMode::Radiance ? bs.wo : si.wi,
                      wi_hat = ctx.mode == TransportMode::Radiance ? si.wi : bs.wo;
 
-            /* BSDF weights are Mueller matrices now. */
+            // BSDF weights are Mueller matrices now.
             Float cos_theta_o_hat = Frame3f::cos_theta(wo_hat);
             Spectrum R = mueller::specular_reflection(UnpolarizedSpectrum(cos_theta_o_hat), UnpolarizedSpectrum(m_eta)),
                      T = mueller::specular_transmission(UnpolarizedSpectrum(cos_theta_o_hat), UnpolarizedSpectrum(m_eta));
@@ -311,8 +332,8 @@ public:
                 bs.pdf = 1.f;
             }
 
-            /* The Stokes reference frame vector of this matrix lies perpendicular
-               to the plane of reflection. */
+            // The Stokes reference frame vector of this matrix lies perpendicular
+            // to the plane of reflection.
             Vector3f n(0, 0, 1);
             Vector3f s_axis_in  = dr::cross(n, -wo_hat);
             Vector3f s_axis_out = dr::cross(n, wi_hat);
@@ -324,8 +345,8 @@ public:
             s_axis_out = dr::select(collinear, Vector3f(1, 0, 0),
                                                dr::normalize(s_axis_out));
 
-            /* Rotate in/out reference vector of `weight` s.t. it aligns with the
-               implicit Stokes bases of -wo_hat & wi_hat. */
+            // Rotate in/out reference vector of `weight` s.t. it aligns with the
+            // implicit Stokes bases of -wo_hat & wi_hat.
             weight = mueller::rotate_mueller_basis(weight,
                                                    -wo_hat, s_axis_in, mueller::stokes_basis(-wo_hat),
                                                     wi_hat, s_axis_out, mueller::stokes_basis(wi_hat));
@@ -339,8 +360,8 @@ public:
         } else {
             if (likely(has_reflection && has_transmission)) {
                 weight = 1.f;
-                /* For differentiable variants, lobe choice has to be detached to avoid bias.
-                    Sampling weights should be computed accordingly. */
+                // For differentiable variants, lobe choice has to be detached to avoid bias.
+                // Sampling weights should be computed accordingly.
                 if constexpr (dr::is_diff_v<Float>) {
                     if (dr::grad_enabled(r_i)) {
                         Float r_diff = dr::replace_grad(Float(1.f), r_i / dr::detach(r_i));
@@ -359,9 +380,9 @@ public:
                 weight[selected_t] *= transmittance;
         }
 
-        if (dr::any_or<true>(selected_t)) {
-            /* For transmission, radiance must be scaled to account for the solid
-               angle compression that occurs when crossing the interface. */
+        if (m_eta_scale && dr::any_or<true>(selected_t)) {
+            // For transmission, radiance must be scaled to account for the solid
+            // angle compression that occurs when crossing the interface.
             Float factor = (ctx.mode == TransportMode::Radiance) ? eta_ti : Float(1.f);
             weight[selected_t] *= dr::square(factor);
         }
@@ -379,6 +400,22 @@ public:
         return 0.f;
     }
 
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        auto [r, cos_theta_t, eta_it, eta_ti] =
+            fresnel(Frame3f::cos_theta(si.wi), m_eta, m_inv_eta);
+        UnpolarizedSpectrum reflectance = r, transmittance = 1.f - r;
+        if (m_specular_reflectance)
+            reflectance *= m_specular_reflectance->eval(si, active);
+        if (m_specular_transmittance)
+            transmittance *= m_specular_transmittance->eval(si, active);
+        // Total internal reflection leaves no transmitted direction
+        Vector3f wt = dr::select(r < 1.f, refract(si.wi, cos_theta_t, eta_ti),
+                                 Vector3f(0.f));
+        return { 0.f, reflectance, transmittance, si.sh_frame, 0.f,
+                 si.to_world(wt) };
+    }
+
     std::string to_string() const override {
         std::ostringstream oss;
         oss << "SmoothDielectric[" << std::endl;
@@ -393,11 +430,13 @@ public:
 
     MI_DECLARE_CLASS(SmoothDielectric)
 private:
-    ScalarFloat m_eta;
+    Float m_eta, m_inv_eta;
+    bool m_eta_scale;
     ref<Texture> m_specular_reflectance;
     ref<Texture> m_specular_transmittance;
 
-    MI_TRAVERSE_CB(Base, m_eta, m_specular_reflectance,m_specular_transmittance)
+    MI_TRAVERSE_CB(Base, m_eta, m_inv_eta, m_specular_reflectance,
+                   m_specular_transmittance)
 };
 
 MI_EXPORT_PLUGIN(SmoothDielectric)

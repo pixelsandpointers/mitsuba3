@@ -57,7 +57,7 @@ def test_sampling(variant_scalar_rgb, center, radius, np_rng):
     dir_samples = np_rng.random((num_samples, 2))
 
     for i in range(num_samples):
-        ray = sensor.sample_ray_differential(
+        ray = sensor.sample_ray(
             0.0, wav_samples[i], pos_samples[i], dir_samples[i])[0]
 
         # assert that the ray starts at the sphere surface
@@ -102,7 +102,7 @@ def test_incoming_flux(variant_scalar_rgb, radiance, np_rng):
     dir_samples = np_rng.random((num_samples, 2))
 
     for i in range(num_samples):
-        ray, weight = sensor.sample_ray_differential(
+        ray, weight = sensor.sample_ray(
             0.0, wav_samples[i], pos_samples[i], dir_samples[i])
 
         intersection = scene.ray_intersect(ray)
@@ -136,8 +136,8 @@ def test_incoming_flux_integrator(variant_scalar_rgb, radiance):
     scene.integrator().render(scene, seed=0)
     film = scene.sensors()[0].film()
 
-    img = film.bitmap(raw=True).convert(mi.Bitmap.PixelFormat.Y,
-                                        mi.Struct.Type.Float32, srgb_gamma=False)
+    img = film.bitmap().convert(mi.Bitmap.PixelFormat.Y,
+                                mi.Struct.Type.Float32, srgb_gamma=False)
 
     assert dr.allclose(mi.TensorXf(img), (radiance * dr.pi))
 

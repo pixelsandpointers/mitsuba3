@@ -137,6 +137,29 @@ def test05_sample_direct(variant_scalar_rgb):
             assert dr.allclose(si.p, sample.p, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize('radius', [1.0, 1e-2, 1e-3, 1e-4])
+def test05b_sample_direct_small_cone(variants_all_rgb, radius):
+    # The solid angle PDF must stay accurate when the sphere subtends a tiny
+    # cone, where '1 - cos_theta_max' cancels catastrophically in float32
+    import math
+    sphere = mi.load_dict({'type': 'sphere', 'radius': radius})
+    dist = 100.0
+    it = dr.zeros(mi.Interaction3f)
+    it.p = [0, 0, -dist]
+
+    cos_theta_max = math.sqrt(1 - (radius / dist)**2)
+    pdf_ref = 1 / (2 * math.pi * (1 - cos_theta_max))
+
+    ds = sphere.sample_direction(it, [0.3, 0.7])
+    assert dr.allclose(ds.pdf, pdf_ref, rtol=1e-4)
+    assert dr.allclose(sphere.pdf_direction(it, ds), pdf_ref, rtol=1e-4)
+
+    # The sampled direction lands on the sphere
+    si = sphere.ray_intersect(mi.Ray3f(it.p, ds.d))
+    assert dr.all(si.is_valid())
+    assert dr.allclose(si.t, ds.dist, rtol=1e-5)
+
+
 def test06_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     shape = mi.load_dict({'type' : 'sphere'})
 
@@ -147,25 +170,25 @@ def test06_differentiable_surface_interaction_ray_forward(variants_all_ad_rgb):
     dr.enable_grad(ray.d)
 
     # If the ray origin is shifted along the x-axis, so does si.p
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.p *= 1.0
     dr.forward(ray.o.x)
     assert dr.allclose(dr.grad(si.p), [1, 0, 0])
 
     # If the ray origin is shifted along the z-axis, so does si.p
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.p *= 1.0
     dr.forward(ray.o.z)
     assert dr.allclose(dr.grad(si.p), [0, 0, 1])
 
     # If the ray origin is shifted along the y-axis, so does si.t
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.t *= 1.0
     dr.forward(ray.o.y)
     assert dr.allclose(dr.grad(si.t), -1)
 
     # If the ray direction is shifted along the x-axis, so does si.p
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     si.p *= 1.0
     dr.forward(ray.d.x)
     assert dr.allclose(dr.grad(si.p), [9, 0, 0])
@@ -208,13 +231,13 @@ def test07_differentiable_surface_interaction_ray_backward(variants_all_ad_rgb):
     dr.enable_grad(ray.o)
 
     # If si.p is shifted along the x-axis, so does the ray origin
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     dr.backward(si.p.x)
     assert dr.allclose(dr.grad(ray.o), [1, 0, 0])
 
     # If si.t is changed, so does the ray origin along the z-axis
     dr.set_grad(ray.o, 0.0)
-    si = pi.compute_surface_interaction(ray)
+    si = shape.compute_surface_interaction(ray, pi)
     dr.backward(si.t)
     assert dr.allclose(dr.grad(ray.o), [0, 0, -1])
 
@@ -232,7 +255,7 @@ def test08_differentiable_surface_interaction_ray_forward_follow_shape(variants_
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().scale(1 + theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.DetachShape)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default | mi.RayFlags.DetachShape)
 
     dr.forward(theta)
 
@@ -250,7 +273,7 @@ def test08_differentiable_surface_interaction_ray_forward_follow_shape(variants_
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().scale(1 + theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default)
 
     dr.forward(theta)
 
@@ -268,7 +291,7 @@ def test08_differentiable_surface_interaction_ray_forward_follow_shape(variants_
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().translate([theta, 0.0, 0.0])
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.FollowShape)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default | mi.RayFlags.FollowShape)
 
     dr.forward(theta)
 
@@ -286,7 +309,7 @@ def test08_differentiable_surface_interaction_ray_forward_follow_shape(variants_
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().rotate([0, 1, 0], 90 * theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All | mi.RayFlags.FollowShape)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default | mi.RayFlags.FollowShape)
 
     dr.forward(theta)
 
@@ -304,7 +327,7 @@ def test08_differentiable_surface_interaction_ray_forward_follow_shape(variants_
     dr.enable_grad(theta)
     params['to_world'] = mi.Transform4f().rotate([1, 0, 0], 90 * theta)
     params.update()
-    si = shape.ray_intersect(ray, mi.RayFlags.All)
+    si = shape.ray_intersect(ray, mi.RayFlags.Default)
 
     dr.forward(theta)
 
@@ -471,28 +494,28 @@ def test19_shape_type(variant_scalar_rgb):
     assert sphere.shape_type() == mi.ShapeType.Sphere.value;
 
 
-@pytest.mark.parametrize('r', [1, 3])
-def test20_eval_param_consistency(variants_vec_rgb, r):
-    s = mi.load_dict({
-        "type" : "sphere",
-        "radius" : r,
-        "to_world": mi.ScalarTransform4f().translate([0, 1, 0]) @
-                    mi.ScalarTransform4f().rotate([0, 1, 0], 30.0)
-    })
+def test21_normal_partials(variant_scalar_rgb):
+    import numpy as np
+    from mitsuba.scalar_rgb.test.util import check_normal_partials
 
-    x = dr.linspace(mi.Float, 1e-3, 1-1e-3, 10)
-    y = dr.linspace(mi.Float, 1e-3, 1-1e-3, 10)
-    samples = mi.Point2f(dr.meshgrid(x, y))
-    ps = s.sample_position(0, samples)
+    scene = mi.load_dict({'type': 'scene',
+                          'shape': {'type': 'sphere', 'radius': 0.8}})
+    flags = mi.RayFlags.Default | mi.RayFlags.NormalPartials
 
-    si_param = s.eval_parameterization(ps.uv)
+    def normal_field(u, v):
+        phi, theta = 2 * np.pi * u, np.pi * v
+        return np.stack([np.sin(theta) * np.cos(phi),
+                         np.sin(theta) * np.sin(phi),
+                         np.cos(theta)], axis=-1)
 
-    center = mi.Point3f(0, 1, 0)
-    ray = mi.Ray3f(o=dr.fma(2, ps.p - center, center), d=(center - ps.p),
-                   time=0.0, wavelengths=[])
-    si_ray = s.ray_intersect(ray)
+    hits = 0
+    for x in dr.linspace(Float, -0.5, 0.5, 6):
+        for y in dr.linspace(Float, -0.5, 0.5, 6):
+            ray = mi.Ray3f(mi.Point3f(x, y, 5), mi.Vector3f(0, 0, -1))
+            si = scene.ray_intersect(ray, flags, True)
+            if not si.is_valid():
+                continue
+            hits += 1
+            check_normal_partials(si, normal_field)
 
-    assert dr.allclose(si_param.p, ps.p)
-    assert dr.allclose(si_ray.p, ps.p)
-    assert dr.allclose(si_param.uv, ps.uv)
-    assert dr.allclose(si_ray.uv, ps.uv)
+    assert hits > 10, hits

@@ -138,3 +138,107 @@ def test05_shape_accessors(variants_vec_rgb):
 
     assert type(emitter.get_shape()) == mi.Mesh
     assert type(emitter_ptr.get_shape()) == mi.ShapePtr
+
+
+@fresolver_append_path
+@pytest.mark.parametrize('sample_texture', [False, True])
+def test06_sample_direction_moving_texture(variants_all_ad_rgb, sample_texture):
+    """The weight of a detached emitter sample follows the deformation of a
+    textured emitter under the fixed sampled direction. Its derivative
+    matches finite differences of the radiance that the direction meets on
+    the deformed emitter."""
+    T = mi.ScalarTransform4f
+    scene = mi.load_dict({
+        'type': 'scene',
+        'light': {
+            'type': 'obj',
+            'filename': 'resources/data/common/meshes/rectangle.obj',
+            'to_world': T().translate([0.3, 0.2, 2]) @ T().rotate([1, 0, 0], 200),
+            'emitter': {
+                'type': 'area',
+                'sample_texture': sample_texture,
+                # Software lookups keep the finite differences below exact
+                # on backends with hardware texture sampling
+                'radiance': {'type': 'bitmap', 'accel': False,
+                             'filename': 'resources/data/common/textures/gradient.jpg'}
+            }
+        }
+    })
+    params = mi.traverse(scene)
+    positions = dr.detach(params['light.positions'])
+
+    # Scaling about the origin moves every point of the emitter differently
+    def deform(theta):
+        params['light.positions'] = mi.TensorXf(positions.array * (1 + theta),
+                                                positions.shape)
+        params.update()
+
+    ref = dr.zeros(mi.Interaction3f)
+    ref.p = mi.Point3f(0.1, -0.2, 0)
+
+    theta = mi.Float(0)
+    dr.enable_grad(theta)
+    deform(theta)
+    ds, weight = scene.sample_emitter_direction(ref, mi.Point2f(0.37, 0.61), False)
+    assert dr.all(ds.pdf > 0)
+    dr.set_grad(theta, 1.0)
+    grad = dr.forward_to(weight)
+
+    eps = 1e-3
+    emitter = scene.emitters()[0]
+    Le = []
+    for s in [-eps, eps]:
+        deform(mi.Float(s))
+        si = scene.ray_intersect(mi.Ray3f(ref.p, dr.detach(ds.d)))
+        dr.eval(si)  # before the next deformation rebuilds the scene
+        Le.append(emitter.eval(si))
+    grad_fd = (Le[1] - Le[0]) / (2 * eps) / dr.detach(ds.pdf)
+
+    assert dr.any(dr.abs(mi.unpolarized_spectrum(grad_fd)) > 0.01)
+    dr.assert_allclose(grad, grad_fd, rtol=1e-2, atol=1e-3)
+
+
+@fresolver_append_path
+def test07_textured_sampling_modes(variants_vec_rgb):
+    """A textured emitter is sampled like a uniform one by default, with the
+    density of the shape, and proportionally to the texture with
+    'sample_texture'. Both modes report their density consistently and
+    estimate the same irradiance."""
+    T = mi.ScalarTransform4f
+
+    def make(sample_texture):
+        return mi.load_dict({
+            'type': 'obj',
+            'filename': 'resources/data/common/meshes/rectangle.obj',
+            'to_world': T().translate([0.3, 0.2, 2]) @ T().rotate([1, 0, 0], 180),
+            'emitter': {
+                'type': 'area',
+                'sample_texture': sample_texture,
+                'radiance': {'type': 'bitmap', 'accel': False,
+                             'filename': 'resources/data/common/textures/gradient.jpg'}
+            }
+        })
+
+    n = 1 << 18
+    it = dr.zeros(mi.Interaction3f, n)
+    it.p = mi.Point3f(0.1, -0.2, 0)
+    sampler = mi.load_dict({'type': 'independent'})
+    sampler.seed(0, n)
+    u = sampler.next_2d()
+
+    irradiance = []
+    for sample_texture in (False, True):
+        shape = make(sample_texture)
+        emitter = shape.emitter()
+        flag = int(mi.EmitterFlags.SamplesTexture)
+        assert bool(emitter.flags() & flag) == sample_texture
+        ds, weight = emitter.sample_direction(it, u)
+        assert dr.all(ds.pdf > 0)
+        dr.assert_allclose(emitter.pdf_direction(it, ds), ds.pdf, rtol=1e-4)
+        shape_pdf = shape.sample_direction(it, u).pdf
+        if sample_texture:
+            assert not dr.allclose(ds.pdf, shape_pdf, rtol=1e-2)
+        else:
+            dr.assert_allclose(ds.pdf, shape_pdf, rtol=1e-5)
+        irradiance.append(dr.mean(mi.unpolarized_spectrum(weight)[0] * ds.d.z))
+    dr.assert_allclose(irradiance[0], irradiance[1], rtol=0.01)

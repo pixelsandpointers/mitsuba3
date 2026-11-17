@@ -23,7 +23,7 @@ struct Ellipsoid {
 constexpr uint32_t EllipsoidStructSize = 10u;
 
 /**
- * \brief Generic container class for ellipsoids.
+ * Generic container class for ellipsoids.
  *
  * This is a convenience data structure meant to hold ellipsoids shape
  * data (centers, scales, rotation) and its extra attributes.
@@ -61,7 +61,8 @@ public:
             if (!fs::exists(file_path))
                 fail("file not found");
 
-            ref<Stream> stream = new FileStream(file_path);
+            ref<FileStream> file = new FileStream(file_path);
+            ref<Stream> stream = file.get();
             ScopedPhase phase(ProfilerPhase::LoadGeometry);
 
             PLYHeader header;
@@ -73,7 +74,7 @@ public:
                             "\"%s\": performance warning -- this file uses the ASCII PLY format, which "
                             "is slow to parse. Consider converting it to the binary PLY format.",
                             name);
-                    stream = parse_ascii((FileStream *) stream.get(), header.elements, name);
+                    stream = parse_ascii(file.get(), header.elements, name);
                 }
             } catch (const std::exception &e) {
                 fail(e.what());
@@ -201,6 +202,8 @@ public:
                 count++;
             }
 
+            file->close();
+
             m_data = dr::load<FloatStorage>(ellipsoid_data.get(), count * EllipsoidStructSize);
 
             if (is_3dg) {
@@ -250,11 +253,11 @@ public:
             m_data = dr::zeros<FloatStorage>(centers.shape(0) * EllipsoidStructSize);
             UInt32Storage idx = dr::arange<UInt32Storage>(centers.shape(0));
             for (int i = 0; i < 3; i++)
-                dr::scatter(m_data, dr::gather<FloatStorage>(centers.array(), idx * 3 + i), idx * EllipsoidStructSize + i);
+                dr::scatter(m_data, dr::gather<FloatStorage>(centers.array(), idx * 3 + i), idx * EllipsoidStructSize + i, true, ReduceMode::NoConflicts);
             for (int i = 0; i < 3; i++)
-                dr::scatter(m_data, dr::gather<FloatStorage>(scales.array(), idx * 3 + i), idx * EllipsoidStructSize + 3 + i);
+                dr::scatter(m_data, dr::gather<FloatStorage>(scales.array(), idx * 3 + i), idx * EllipsoidStructSize + 3 + i, true, ReduceMode::NoConflicts);
             for (int i = 0; i < 4; i++)
-                dr::scatter(m_data, dr::gather<FloatStorage>(quats.array(), idx * 4 + i), idx * EllipsoidStructSize + 6 + i);
+                dr::scatter(m_data, dr::gather<FloatStorage>(quats.array(), idx * 4 + i), idx * EllipsoidStructSize + 6 + i, true, ReduceMode::NoConflicts);
             dr::eval(m_data);
         } else {
             Throw("Must specify either \"data\" or \"filename\" or \"centers\".");

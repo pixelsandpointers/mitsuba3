@@ -360,10 +360,10 @@ def test06_path_tracer_quarter_wave(variant_scalar_mono_polarized):
         sampler.seed(0)
 
         # Sample ray from sensor
-        ray, _ = sensor.sample_ray_differential(0.0, 0.5, [0.5, 0.5], [0.5, 0.5])
+        ray, _ = sensor.sample_ray(0.0, 0.5, [0.5, 0.5], [0.5, 0.5])
 
         # Call integrator
-        value, _, _ = integrator.sample(scene, sampler, ray)
+        value, _ = integrator.sample(scene, sampler, ray)
 
         # Normalize Stokes vector
         value = value * dr.rcp(value[0,0][0])
@@ -476,10 +476,10 @@ def test07_path_tracer_half_wave(variant_scalar_mono_polarized):
         sampler.seed(0)
 
         # Sample ray from sensor
-        ray, _ = sensor.sample_ray_differential(0.0, 0.5, [0.5, 0.5], [0.5, 0.5])
+        ray, _ = sensor.sample_ray(0.0, 0.5, [0.5, 0.5], [0.5, 0.5])
 
         # Call integrator
-        value, _, _ = integrator.sample(scene, sampler, ray)
+        value, _ = integrator.sample(scene, sampler, ray)
 
         # Normalize Stokes vector
         value = value * dr.rcp(value[0,0][0])
@@ -528,7 +528,7 @@ def test08_rotated_quarter_wave(variant_scalar_mono_polarized):
     si.sh_frame = mi.Frame3f(si.n)
 
     _, M = bsdf.sample(ctx, si, 0.0, [0.0, 0.0])
-    M_null = bsdf.eval_null_transmission(si)
+    M_null = bsdf.eval_null(si)
     assert dr.allclose(M, M_null, atol=1e-3)
 
     assert dr.allclose(M @ linear_horizontal, circular_right, atol=1e-3)
@@ -540,7 +540,7 @@ def test08_rotated_quarter_wave(variant_scalar_mono_polarized):
     si.wi = [0, 0, -1]
 
     _, M = bsdf.sample(ctx, si, 0.0, [0.0, 0.0])
-    M_null = bsdf.eval_null_transmission(si)
+    M_null = bsdf.eval_null(si)
     assert dr.allclose(M, M_null, atol=1e-3)
 
     assert dr.allclose(M @ linear_horizontal, circular_left, atol=1e-3)

@@ -5,6 +5,407 @@ Being an experimental research framework, Mitsuba 3 does not strictly follow the
 `Semantic Versioning <https://semver.org/>`__ convention. That said, we will
 strive to document breaking API changes in the release notes below.
 
+Mitsuba 3.10.0
+--------------
+*in development*
+
+- **Redesigned mesh representation**. The ``Mesh`` class was rewritten from
+  scratch. Improvements include:
+
+  - It can now represent with discontinuous attributes (e.g., normals, UVs)
+    without introducing geometric seams.
+
+  - It can directly ingest corner-indexed meshes (e.g., from OBJ files or
+    Blender) and efficiently convert them into its representation.
+
+  - It tightly packs mesh data into an interleaved representation compatible
+    with packet loads/atomics for efficient use in a GPU renderer.
+
+  - It smoothly interpolates vertex tangents, which avoids tesselation
+    artifacts present in prior versions. The interpolation follows the
+    `MikkTSpace <https://github.com/mmikk/MikkTSpace>`__ convention, which
+    makes it possible to use normal maps authored elsewhere in Mitsuba
+    and optimize maps in Mitsuba for use in other tools.
+
+  - Mesh orientation is now a property of the mesh data rather than of the
+    scene description. The face winding order defines the orientation of the
+    surface, and the ``flip_normals`` and ``to_world`` properties are baked
+    into the records once when the shape is built, instead of being reapplied
+    to the result of every query. A flipped mesh written back out via
+    ``write_ply()`` or ``write_packed()`` therefore carries the flip, and
+    reloading it does not require the scene description to repeat it.
+
+  - The directed edge adjacency data structure moved into a standalone
+    ``mi.DirectedEdge`` class that a mesh builds on demand. The new class
+    produces a richer representation while also improving build efficiency.
+    It is reachable through ``mesh.dedge()`` and, for use in vectorized calls,
+    through the ``dedge_opposite()``, ``dedge_vertex_edge()``,
+    ``dedge_vertex_valence()`` and ``dedge_vertex_flags()`` accessors.
+
+  - The adjacency and the silhouette sampling density are now built lazily,
+    the first time something asks for them, rather than eagerly whenever a
+    mesh with differentiable positions is updated. Renderers that differentiate
+    geometry without sampling silhouettes (e.g. ``prb``) no longer pay for
+    either. As a consequence, ``sample_silhouette()``,
+    ``invert_silhouette_sample()`` and ``primitive_silhouette_projection()``
+    return an empty result unless the mesh positions carry gradients;
+    previously they did so unless the adjacency happened to exist.
+
+  ⚠️ **WARNING** ⚠️: This is an **API-breaking change**. Code that constructs
+  meshes or touches mesh scene parameters must be updated as follows.
+
+  - **Scene parameters**. A mesh with ``F`` faces and ``V`` vertices further
+    consists of ``P`` surface positions and ``N`` normal groups (``P <= N <=
+    V``). The parameters exposed by ``mi.traverse()`` changed name and shape.
+
+    ============================== ==========================================
+    Before (flat buffer)           After (tensor)
+    ============================== ==========================================
+    ``vertex_positions`` ``[3V]``  ``positions``, ``(P, 3)``
+    ``vertex_normals`` ``[3V]``    ``normals``, ``(N, 3)``
+    ``vertex_texcoords`` ``[2V]``  ``texcoords``, ``(V, 2)``
+    ``faces`` ``[3F]``             ``faces``, ``(F, 3)``
+    vertex attribute ``[dV]``      ``(V, d)``, and ``(F, d)`` per face
+    ============================== ==========================================
+
+    The ``position_index`` ``[V]`` and ``normal_index`` ``[V]`` entries are
+    new and writable. These maps are empty by default and indicate that there
+    is no indirection for positions/normals.
+
+    Because the values are now shaped tensors, the flat-buffer bookkeeping that
+    used to surround an edit tends to disappear:
+
+    .. code-block:: python
+
+        # Before
+        v = dr.unravel(mi.Point3f, params['teapot.vertex_positions'])
+        v.z += 0.5
+        params['teapot.vertex_positions'] = dr.ravel(v)
+
+        # After
+        params['teapot.positions'] += mi.TensorXf([[0, 0, 0.5]])
+
+    An operation that does need the structure-of-arrays layout, such as
+    applying a ``Transform4f``, converts in either direction via ``flip_axes``:
+
+    .. code-block:: python
+
+        # Before
+        v = dr.unravel(mi.Point3f, params['bunny.vertex_positions'])
+        params['bunny.vertex_positions'] = dr.ravel(trafo @ v)
+
+        # After
+        v = mi.Point3f(params['bunny.positions'], flip_axes=True)
+        params['bunny.positions'] = mi.TensorXf(trafo @ v, flip_axes=True)
+
+    Sizes are editable: a step that resizes a mesh (e.g. remeshing) simply
+    writes the new tensors and calls ``update()``.
+
+    .. code-block:: python
+
+        params['shape.faces']     = mi.TensorXu(new_faces)
+        params['shape.positions'] = mi.TensorXf(new_positions)
+        params.update()
+
+  - **Construction**. Building a mesh is now a single call that supplies the
+    data up front:
+
+    .. code-block:: python
+
+        # Before
+        mesh = mi.Mesh("wavydisk", vertex_count=N, face_count=N - 1,
+                       has_vertex_normals=False, has_vertex_texcoords=False)
+        params = mi.traverse(mesh)
+        params['vertex_positions'] = dr.ravel(vertex_pos)    # mi.Point3f
+        params['faces'] = dr.ravel(face_indices)             # mi.Vector3u
+        params.update()
+
+        # After
+        mesh = mi.Mesh("wavydisk",
+                       faces=face_indices,                   # (F, 3) TensorXu
+                       positions=vertex_pos)                 # (P, 3) TensorXf
+
+    The constructor optionally also accepts ``normals``, ``texcoords``,
+    ``position_index``, and ``normal_index``. Alternatively,
+    an empty mesh created via ``mi.Mesh(name)`` can be built by calling
+    ``from_fields()`` (the same parameters as above), ``from_corners()``
+    (corner-indexed data as produced by OBJ files or DCC applications), or
+    ``from_packed()`` (the packed representation verbatim).
+
+   - **Parameter handling and winding order**: The face winding order now
+     defines the orientation of the surface. In particular, the geometric
+     normal of a face follows from the right hand rule applied to its
+     positions. Shading normals must lie in the same hemisphere, and ``Mesh``
+     maintains that invariant.
+
+     The ``flip_normals`` and ``to_world`` transformation parameters of
+     mesh-based shapes are now baked into the vertex positions and winding
+     order at construction time.
+
+  - **Method renames**. The remaining interface changes are mechanical:
+
+    ============================================ ==============================
+    Before                                       After
+    ============================================ ==============================
+    ``faces_buffer()``                           ``faces()``
+    ``vertex_positions_buffer()``                ``positions()``
+    ``vertex_normals_buffer()``                  ``normals()``
+    ``vertex_texcoords_buffer()``                ``texcoords()``
+    ``attribute_buffer(name)``                   ``attribute(name)``
+    ``has_vertex_texcoords()``                   ``has_texcoords()``
+    ``has_vertex_normals()``                     ``has_normals()``
+    ``recompute_vertex_normals()``               ``recompute_normals()``
+    ``mesh.merge(other)``                        ``mi.Mesh.merge(shapes)``
+    ``build_directed_edges()``                   ``dedge()``
+    ``opposite_dedge(e)``                        ``dedge_opposite(e)``
+    ``edge_indices(f, i)``                       ``dedge_indices(3 * f + i)``
+    ============================================ ==============================
+
+- **Packed containers**. The new ``.packed`` :ref:`file format
+  <sec-packed-format>` bundles the meshes and textures of a scene in a
+  container that is memory-mapped and decompressed straight into the memory
+  used by the renderer. :py:meth:`mitsuba.Mesh.write_packed` and the new :ref:`packed
+  <shape-packed>` shape plugin store and load meshes in their internal
+  representation, which is considerably faster than the other mesh formats.
+  The :ref:`bitmap <texture-bitmap>` texture plugin loads BC4, BC5, and BC7
+  block-compressed textures from containers produced by the ``mitsuba.pack_tex``
+  script, which the ``cuda`` and ``metal`` variants sample directly using the
+  hardware texture units. This shrinks the GPU memory footprint of 8-bit
+  textures by a factor of 4 to 8. The :py:class:`mitsuba.PackedFile` class implements the
+  container. The ``serialized`` plugin continues to read the legacy
+  ``.serialized`` format, but ``write_serialized()`` was
+  replaced by ``write_packed()``.
+
+- **Ray visibility and null surfaces**. Shapes and emitters accept a
+  ``visibility`` property with the following possible values and
+  interpretations:
+
+  - ``all``: the object is unconditionally visible. This is the default.
+
+  - ``primary``: the object is visible to primary rays (i.e., to sensors)
+    and *invisible* to secondary rays (shadow rays, indirect reflection).
+    This is useful to effectively remove glass windows and improve direct
+    illumination sampling strategies in interior scenes.
+
+  - ``secondary``: the object is *invisible* to primary rays (i.e., to
+    sensors) and visible to secondary rays (shadow rays, indirect
+    reflection). This is useful to place invisible area lights into a
+    scene.
+
+  - ``hidden``: the object exists but is not observed by regular rays.
+    This could be useful for implementing measurement surfaces (e.g.
+    irradiance sensors) or to add a special type of geometry that is only
+    found via explicit ``RayMask.All`` queries performed by a custom
+    integrator.
+
+  The value of the property is available as `Shape.visibility()` and
+  `Emitter.visibility()` (a `ShapeVisibility`), and `Shape.has_null()` reports
+  whether the shape's BSDF has a null component. BSDFs that advertise
+  `BSDFFlags.Null` must implement `BSDF.eval_null()`, since shadow rays now
+  evaluate it.
+
+  ⚠️ **WARNING** ⚠️: This is an **API-breaking change**. Several functions and
+  types gained ``ray_mask`` arguments in the position that ``active`` used to
+  occupy. In Python, ``ray_mask`` and the arguments after it are keyword-only,
+  so existing code that passes ``active`` positionally raises a ``TypeError``.
+
+  .. code-block:: python
+
+      # Before
+      scene.ray_intersect(ray, ray_flags, coherent, active)
+      scene.ray_intersect(ray, ray_flags, coherent, reorder, reorder_hint, reorder_hint_bits, active)
+      scene.ray_intersect_preliminary(ray, coherent, active)
+      scene.ray_test(ray, coherent, active)
+      si.emitter(scene, active)
+
+      # After
+      scene.ray_intersect(ray, ray_flags, coherent=False, ray_mask=mi.RayMask.Secondary,
+                          active=True, reorder=False, reorder_hint=0, reorder_hint_bits=0)
+      scene.ray_intersect_preliminary(ray, coherent=False, ray_mask=..., active=True,
+                                      reorder=False, reorder_hint=0, reorder_hint_bits=0)
+      scene.ray_test(ray, coherent, ray_mask=..., active=True)
+      si.emitter(scene, ray_mask=..., active=True)
+      mi.DirectionSample3f(scene, si, ref, ray_mask=...)
+
+  Integrators should trace camera rays with ``mi.RayMask.Primary`` and all
+  other rays with the default ``mi.RayMask.Secondary``.
+
+- Surfaces with a null BSDF component (``null``, ``mask``, ``thindielectric``,
+  etc.) no longer occlude shadow rays and no longer count as path vertices,
+  which enables emitter sampling through foliage, thin dielectrics with a
+  single sheet of glass, etc. New functions `Scene.ray_test_tr()` and
+  `Scene.ray_intersect_tr()` generalize the existing shadow ray test and ray
+  tracing queries, while skipping null BSDF surfaces and returning the
+  associated transmittance.
+
+- **Ray epsilon**. Rays spawned from a surface must be offset by a small
+  distance to avoid self-intersection. Mitsuba previously used a fixed fraction
+  (1500 ULP) of the largest coordinate magnitude and an even larger fraction
+  (15000 ULP) for the far end of shadow rays. These are >2-3 orders of
+  magnitude larger than what the backends actually require in practice (~1-8
+  ULP), and it introduces light leaks and breaks ray tracing of small scenes or
+  closely spaced surfaces.
+
+  Shapes now explicitly bound the rounding error of their intersections via new
+  fields - `Interaction3f.p_err` and `PositionSample3f.p_err`.
+  `Interaction3f.spawn_ray` uses it to offset the ray origin, and a new
+  overload of `Interaction3f.spawn_ray_to`  uses it to also handle the bounds
+  on both sides of a shadow ray test. The bounds are close to the hardware's
+  actual needs and adapts to the scene scale and the surface orientation.
+
+- **Analytic shape fixes**. A thorough review pass over all analytic shapes
+  resolved numerical issues in ray-intersection and directional sampling
+  routines. It also addressed inconsistent handling of ray flags, mirroring
+  transformations, the ``flip_normals`` flag, and inconsistencies between
+  ray intersection and parameterization routines.
+
+- **Custom shapes**. Custom shapes can now be implemented entirely in Python by
+  subclassing :py:class:`mi.Shape <mitsuba.Shape>`. Dr.Jit symbolically traces
+  the underlying :py:func:`ray_intersect_preliminary()
+  <mitsuba.Shape.ray_intersect_preliminary>` function and generates efficient
+  CPU/GPU code targeting OptiX, Metal, and Embree/LLVM.
+
+  Shapes were previously an awkward special case in Mitsuba's otherwise
+  extensible plugin system that required backend-specific native
+  implementations. This change removes that long-standing limitation. A
+  :ref:`companion Jupyter notebook <sec-other-tutos>` demonstrates the new
+  feature with a Mandelbulb fractal implemented in a few lines of Python.
+
+  A shape may represent a single geometric primitive or an aggregate containing
+  many sub-primitives. All Mitsuba shapes with custom intersection routines
+  (``sphere``, ``disk``, ``cylinder``, ``ellipsoids``, and ``sdfgrid``) were
+  migrated to the new interface as part of this change. A Python shape that
+  carries an area emitter or sensor calls :py:func:`initialize()
+  <mitsuba.Shape.initialize>` at the end of its constructor, like the C++
+  plugins do.
+
+  This unification removes roughly 3.3K lines of code from Mitsuba. Previously,
+  shapes had to provide four versions of each intersection routine: a C++
+  template, an Embree packet implementation, OptiX shaders with precompiled
+  PTX, and MSL libraries with precompiled binaries. They additionally required
+  backend-specific POD layouts and data-transfer logic.
+
+- **Animation and motion blur**. Mitsuba can now represent and render motion
+  blur due to moving sensors, emitters, and shapes. At the XML level, a new
+  ``<animation>`` tag lists keyframes in place of a ``<transform>``:
+
+  .. code-block:: xml
+
+      <animation name="to_world">
+          <transform time="0.0">
+              <translate value="0, 0, 0"/>
+          </transform>
+          <transform time="1.0">
+              <translate value="1, 0, 0"/>
+          </transform>
+      </animation>
+
+  The feature builds on native time support in the OptiX, Metal, and Embree
+  backends. For details, see the :ref:`documentation section on animation
+  <sec-animation>`. (contributed by `Delio Vicini <https://github.com/dvicini>`__).
+
+  ⚠️ The ``position`` parameter of the point emitter is no longer exposed by
+  ``mi.traverse()``. Replace ``params['emitter.position']`` with
+  ``params['emitter.to_world']`` and a translation. The ``position`` scene
+  description property is unchanged.
+
+- **Python integration**. Scenes can now bundle custom Python plugins
+  (e.g., light sources, shapes, etc.) and import them with ``<import>`` tags
+  from scene XML files. See the
+  :ref:`documentation <sec-python-extensions>` for details.
+
+  A new Python entry point (``python -m mitsuba <...>``) behaves identically to
+  the previously existing ``mitsuba`` C++ binary and can process scenes with
+  custom Python extensions. When Mitsuba is installed through :monosp:`pip`,
+  the ``mitsuba`` command refers to this Python frontend.
+
+- **Textured area emitters** are now uniformly sampled by default, as the
+  importance sampling routine was very expensive and had numerous drawbacks.
+  To importance sample the texture, set the ``sample_texture`` parameter.
+
+- **Quadrature routines moved to Dr.Jit**. The ``mitsuba.quad`` submodule and
+  the ``mitsuba/core/quad.h`` header were removed. The Gauss-Legendre,
+  Gauss-Lobatto, composite Simpson and Chebyshev rules now live in
+  ``drjit.quad`` (C++: ``drjit/quad.h``). The Python functions take the
+  desired output array type as their first argument, e.g.
+  ``dr.quad.gauss_legendre(mi.Float, n)`` replaces ``mi.quad.gauss_legendre(n)``.
+
+Mitsuba 3.9.1
+-------------
+*August 7, 2026*
+
+- Upgrade to `Dr.Jit 1.5.0
+  <https://github.com/mitsuba-renderer/drjit/releases/tag/v1.5.0>`__ and
+  nanobind 2.14.0.
+
+  ⚠️ :py:func:`dr.minimum() <drjit.minimum>` and :py:func:`dr.maximum()
+  <drjit.maximum>` now propagate NaNs, while the new :py:func:`dr.fmin()
+  <drjit.fmin>` and :py:func:`dr.fmax() <drjit.fmax>` suppress them.
+  :py:func:`dr.clip() <drjit.clip>` follows the same convention. Code that
+  relied on ``dr.maximum(x, 0)`` to sanitize NaNs must switch to
+  ``dr.fmax()``. See the `Dr.Jit changelog
+  <https://drjit.readthedocs.io/en/latest/changelog.html>`__ for the
+  remaining changes. (commit `b46a13 <https://github.com/mitsuba-renderer/mitsuba3/commit/b46a1307e2a685e312ff545d14e274df8a62570c>`__).
+
+- **Metal backend**:
+
+  - Fixed a race condition during parallel scene loading, where computation
+    performed by the main thread was not yet committed to the Metal queue when
+    other threads read it. (commit `5f090a <https://github.com/mitsuba-renderer/mitsuba3/commit/5f090a15fdfba7630783b176006ded645f78c15d>`__).
+
+  - Removed a stale ``world_space_data`` tag from the intersection shaders and
+    rebuilt the ``.metallib``. (commits `5a9d41 <https://github.com/mitsuba-renderer/mitsuba3/commit/5a9d41249c19980f565f916a64cb5c7f5e93264c>`__,
+    `c36933 <https://github.com/mitsuba-renderer/mitsuba3/commit/c369336b4ac5afa20374d186a739fcdd30da570e>`__,
+    contributed by `Boris Zhestiankin <https://github.com/zhestyatsky>`__).
+
+- **Textures and bitmaps**:
+
+  - Added ``Bitmap::pad_to()``, which fixes the preparation of ``uint8``
+    textures. (commit `d4f015 <https://github.com/mitsuba-renderer/mitsuba3/commit/d4f015b38d2a2992ad58bc985c9a882c05142a42>`__,
+    contributed by `Christian Döring <https://github.com/DoeringChristian>`__).
+
+  - The :ref:`envmap <emitter-envmap>` emitter now pads environment maps to a
+    minimum size. (commit `4f3339 <https://github.com/mitsuba-renderer/mitsuba3/commit/4f3339d47815674e4fea748a2c55c4f9626ed5e0>`__,
+    contributed by `Delio Vicini <https://github.com/dvicini>`__).
+
+  - The :ref:`bitmap <texture-bitmap>` texture no longer warns about 1×1 pixel
+    images. (commit `3f00b7 <https://github.com/mitsuba-renderer/mitsuba3/commit/3f00b72372a24d0811a56186f137a817c9174f1f>`__).
+
+- **Differential geometry**. Two shapes reported tangent vectors that were
+  inconsistent with their own UV parameterization:
+
+  - Meshes without vertex texture coordinates report barycentric coordinates in
+    ``si.uv``. The associated ``si.dp_du`` and ``si.dp_dv`` previously held an
+    arbitrary orthonormal basis and now match that parameterization. This
+    changes the shading frame of such meshes, which is observable with
+    anisotropic BSDFs. (commit `886077 <https://github.com/mitsuba-renderer/mitsuba3/commit/886077b6ec814a57303d80e17185103495062130>`__).
+
+  - The :ref:`disk <shape-disk>` shape reports ``si.uv = (r, phi/(2*pi))``. Its
+    ``dp_dv`` was missing a factor of ``2*pi*r``, and ``eval_parameterization()``
+    used a concentric instead of a polar map. (commit `e6d34f <https://github.com/mitsuba-renderer/mitsuba3/commit/e6d34f89d90f9363973e9a82c1fa626c1ede07ca>`__).
+
+- **Removed ray differentials**. The ``RayDifferential3f`` type,
+  ``Sensor.sample_ray_differential()``, the ``si.duv_dx`` and ``si.duv_dy``
+  fields along with ``si.compute_uv_partials()`` and ``si.has_uv_partials()``,
+  the ``BSDFFlags.NeedsDifferentials`` flag, and the ``duv_dx``/``duv_dy`` AOVs
+  are gone. No BSDF used the screen-space UV partials, and the extra rays
+  added cost to every sensor sample. ``SamplingIntegrator.sample()`` now
+  receives a plain ``Ray3f``, and ``si.bsdf()`` no longer takes a ray
+  argument.
+
+- Fixed a numerical issue in the :ref:`hair <bsdf-hair>` BSDF that could
+  introduce NaNs. (commit `6e783e <https://github.com/mitsuba-renderer/mitsuba3/commit/6e783edb9729f16b15a3f01260ac3e39938fee79>`__).
+
+- ``mi.Thread.wait_for_tasks()`` now releases the GIL. (commit `6bfb31 <https://github.com/mitsuba-renderer/mitsuba3/commit/6bfb31efe7a35bbcd7b5ea3b1771ebdba256a542>`__,
+  contributed by `Delio Vicini <https://github.com/dvicini>`__).
+
+- Added Python aliases for further Dr.Jit types (``Array0f`` through
+  ``Array4f`` and their integer counterparts, the ``f8u`` texture storage
+  variants, ``Philox4x32``, ``ScalarPCG32``, and ``Event``). (commit `55e8a7 <https://github.com/mitsuba-renderer/mitsuba3/commit/55e8a75a97873069ba7468eca16133f9c83cc452>`__).
+
+- Documentation links now point to the Dr.Jit documentation. (commit `582781 <https://github.com/mitsuba-renderer/mitsuba3/commit/5827819ec6e78abac8bff6ab467cac74c90ff01b>`__,
+  contributed by `Leonard Eyer <https://github.com/LeonardEyer>`__).
+
 Mitsuba 3.9.0
 -------------
 *June 26, 2026*
@@ -25,7 +426,7 @@ Mitsuba 3.9.0
 
   - **Environment maps**. The :ref:`envmap <emitter-envmap>` emitter now uses
     GPU hardware texture units for lookups. The underlying
-    :cpp:class:`mitsuba.Hierarchical2D0` class for importance sampling
+    :py:class:`mitsuba.Hierarchical2D0` class for importance sampling
     envmaps switched to a packed memory layout and now uses vector memory
     loads to pull in data more efficiently. Scenes using environment maps
     should render noticeably faster after this change. (commits `2ad8ea <https://github.com/mitsuba-renderer/mitsuba3/commit/2ad8eaefeb79c95796fcc6196bbae6b6a0d28715>`__,
@@ -47,8 +448,7 @@ Mitsuba 3.9.0
     existing optimizations that use LDR textures for initialization (e.g.,
     loaded from JPEGs or PNGs). Add a ``<string name="format"
     value="variant"/>`` XML or "'formt' : 'variant' dictionary attribute to
-    promote them to the variant's precision. (commit `56ec0f
-    <https://github.com/mitsuba-renderer/mitsuba3/commit/56ec0f12bc3718b8a0ac09155bae74a57feb7c57>`__).
+    promote them to the variant's precision. (commit `56ec0f <https://github.com/mitsuba-renderer/mitsuba3/commit/56ec0f12bc3718b8a0ac09155bae74a57feb7c57>`__).
 
   - **Faster tracing and code generation**. A comprehensive
     optimization pass in `Dr.Jit 1.4.0
@@ -68,8 +468,7 @@ Mitsuba 3.9.0
     instances was reduced as well.
     (PR `#201
     <https://github.com/mitsuba-renderer/drjit-core/pull/201>`__, commit
-    `83207d
-    <https://github.com/mitsuba-renderer/drjit-core/commit/83207d5aeeb8fab27473c606b6a71349bce4157c>`__).
+    `83207d <https://github.com/mitsuba-renderer/drjit-core/commit/83207d5aeeb8fab27473c606b6a71349bce4157c>`__).
 
   - **Faster Python bindings**. The Python bindings are now faster thanks to
     improvements in `nanobind 2.13
@@ -581,7 +980,7 @@ Mitsuba 3.7.0
   as Dr.Jit tensor instances in Python/C++ code (PR `#1705
   <https://github.com/mitsuba-renderer/mitsuba3/pull/1705>`__).
 
-- The :ref:`rawconstant <texture-rawconstant>` texture plugin stores raw 1D/3D values without
+- The :ref:`rawconstant <spectrum-rawconstant>` texture plugin stores raw 1D/3D values without
   any color space conversion or spectral upsampling, useful when exact numerical values need to
   be preserved.  (PR `#1496 <https://github.com/mitsuba-renderer/mitsuba3/pull/1496>`__,
   contributed by `Merlin Nimier-David <https://merlin.nimierdavid.fr>`__).

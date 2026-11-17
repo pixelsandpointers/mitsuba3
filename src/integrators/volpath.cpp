@@ -30,9 +30,11 @@ Volumetric path tracer (:monosp:`volpath`)
    - Specifies the minimum path depth, after which the implementation will start to use the
      *russian roulette* path termination criterion. (Default: 5)
 
- * - hide_emitters
-   - |bool|
-   - Hide directly visible emitters. (Default: no, i.e. |false|)
+ * - clamp_direct, clamp_indirect
+   - |float|
+   - Upper limits on the mean channel value of a single direct or indirect light contribution,
+     with the same semantics as in the :ref:`path <integrator-path>` plugin. Zero disables the
+     clamp. (Default: 0)
 
 This plugin provides a volumetric path tracer that can be used to compute approximate solutions
 of the radiative transfer equation. Its implementation makes use of multiple importance sampling
@@ -71,7 +73,8 @@ template <typename Float, typename Spectrum>
 class VolumetricPathIntegrator : public MonteCarloIntegrator<Float, Spectrum> {
 
 public:
-    MI_IMPORT_BASE(MonteCarloIntegrator, m_max_depth, m_rr_depth, m_hide_emitters)
+    MI_IMPORT_BASE(MonteCarloIntegrator, m_max_depth, m_rr_depth,
+                   m_clamp_direct, m_clamp_indirect, clamp_contribution)
     MI_IMPORT_TYPES(Scene, Sampler, Emitter, EmitterPtr, BSDF, BSDFPtr,
                      Medium, MediumPtr, PhaseFunctionContext)
 
@@ -92,17 +95,13 @@ public:
 
     std::pair<Spectrum, Mask> sample(const Scene *scene,
                                      Sampler *sampler,
-                                     const RayDifferential3f &ray_,
+                                     const Ray3f &ray_,
                                      const Medium *initial_medium,
-                                     Float * /* aovs */,
                                      Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::SamplingIntegratorSample, active);
 
-        // If there is an environment emitter and emitters are visible: all rays will be valid
-        // Otherwise, it will depend on whether a valid interaction is sampled
-        Mask valid_ray = !m_hide_emitters && (scene->environment() != nullptr);
+        Mask valid_ray = false;
 
-        // For now, don't use ray differentials
         Ray3f ray = ray_;
 
         // Tracks radiance scaling due to index of refraction changes
@@ -111,8 +110,12 @@ public:
         Spectrum throughput(1.f), result(0.f);
         MediumPtr medium = initial_medium;
         MediumInteraction3f mei = dr::zeros<MediumInteraction3f>();
-        Mask specular_chain = active && !m_hide_emitters;
+        Mask specular_chain = active;
         UInt32 depth = 0;
+        UInt32 ray_mask = +RayMask::Primary;
+
+        // Null tests fold to literals in scenes without null shapes
+        bool has_null = scene->has_null_shapes();
 
         UInt32 channel = 0;
         if (is_rgb_v<Spectrum>) {
@@ -125,9 +128,9 @@ public:
         Interaction3f last_scatter_event = dr::zeros<Interaction3f>();
         Float last_scatter_direction_pdf = 1.f;
 
-        /* Set up a Dr.Jit loop (optimizes away to a normal loop in scalar mode,
-           generates wavefront or megakernel renderer based on configuration).
-           Register everything that changes as part of the loop here */
+        // Set up a Dr.Jit loop (optimizes away to a normal loop in scalar mode,
+        // generates wavefront or megakernel renderer based on configuration).
+        // Register everything that changes as part of the loop here
         struct LoopState {
             Mask active;
             UInt32 depth;
@@ -143,12 +146,13 @@ public:
             Mask needs_intersection;
             Mask specular_chain;
             Mask valid_ray;
+            UInt32 ray_mask;
             Sampler* sampler;
 
             DRJIT_STRUCT(LoopState, active, depth, ray, throughput, result, \
                 si, mei, medium, eta, last_scatter_event, \
                 last_scatter_direction_pdf, needs_intersection, \
-                specular_chain, valid_ray, sampler)
+                specular_chain, valid_ray, ray_mask, sampler)
         } ls = {
             active,
             depth,
@@ -164,12 +168,13 @@ public:
             needs_intersection,
             specular_chain,
             valid_ray,
+            ray_mask,
             sampler
         };
 
         dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
             [](const LoopState& ls) { return ls.active; },
-            [this, scene, channel](LoopState& ls) {
+            [this, scene, channel, has_null](LoopState& ls) {
 
             Mask& active = ls.active;
             UInt32& depth = ls.depth;
@@ -185,6 +190,7 @@ public:
             Mask& needs_intersection = ls.needs_intersection;
             Mask& specular_chain = ls.specular_chain;
             Mask& valid_ray = ls.valid_ray;
+            UInt32& ray_mask = ls.ray_mask;
             Sampler* sampler = ls.sampler;
 
             // ----------------- Handle termination of paths ------------------
@@ -221,7 +227,8 @@ public:
                 dr::masked(ray.maxt, active_medium && medium->is_homogeneous() && mei.is_valid()) = mei.t;
                 Mask intersect = needs_intersection && active_medium;
                 if (dr::any_or<true>(intersect))
-                    dr::masked(si, intersect) = scene->ray_intersect(ray, intersect);
+                    dr::masked(si, intersect) = scene->ray_intersect(
+                        ray, +RayFlags::Default, false, ray_mask, intersect);
                 needs_intersection &= !active_medium;
 
                 dr::masked(mei.t, active_medium && (si.t < mei.t)) = dr::Infinity<Float>;
@@ -278,8 +285,11 @@ public:
                 if (dr::any_or<true>(active_e)) {
                     auto [emitted, ds] = sample_emitter(mei, scene, sampler, medium, channel, active_e);
                     auto [phase_val, phase_pdf] = phase->eval_pdf(phase_ctx, mei, ds.d, active_e);
-                    dr::masked(result, active_e) += throughput * phase_val * emitted *
-                                                    mis_weight(ds.pdf, dr::select(ds.delta, 0.f, phase_pdf));
+                    // 'depth' already counts this scattering event
+                    dr::masked(result, active_e) += clamp_contribution(
+                        throughput * phase_val * emitted *
+                            mis_weight(ds.pdf, dr::select(ds.delta, 0.f, phase_pdf)),
+                        depth == 1u);
                 }
 
                 // ------------------ Phase function sampling -----------------
@@ -294,40 +304,28 @@ public:
                 needs_intersection |= act_medium_scatter;
                 dr::masked(last_scatter_direction_pdf, act_medium_scatter) = phase_pdf;
                 dr::masked(throughput, act_medium_scatter) *= phase_weight;
+                dr::masked(ray_mask, act_medium_scatter) = +RayMask::Secondary;
             }
 
             // --------------------- Surface Interactions ---------------------
             active_surface |= escaped_medium;
             Mask intersect = active_surface && needs_intersection;
             if (dr::any_or<true>(intersect))
-                dr::masked(si, intersect) = scene->ray_intersect(ray, intersect);
+                dr::masked(si, intersect) = scene->ray_intersect(
+                    ray, +RayFlags::Default, false, ray_mask, intersect);
 
             if (dr::any_or<true>(active_surface)) {
-                // ---------------------- Hide area emitters ----------------------
-                if (m_hide_emitters && dr::any_or<true>(ls.depth == 0u)) {
-                    // Are we on the first segment and did we hit an area emitter?
-                    // If so, skip all area emitters along this ray
-                    Mask skip_emitters = si.is_valid() &&
-                                         (si.shape->emitter() != nullptr) &&
-                                         (ls.depth == 0) &&
-                                         intersect;
-
-                    if (dr::any_or<true>(skip_emitters)) {
-                        Ray3f ray = si.spawn_ray(ls.ray.d);
-                        PreliminaryIntersection3f pi =
-                            Base::skip_area_emitters(scene, ray, true, skip_emitters);
-                        SurfaceInteraction3f si_after_skip =
-                            pi.compute_surface_interaction(ray, +RayFlags::All, skip_emitters);
-                        dr::masked(si, skip_emitters) = si_after_skip;
-                    }
-                }
-
                 // ---------------- Intersection with emitters ----------------
                 Mask ray_from_camera = active_surface && (depth == 0u);
                 Mask count_direct = ray_from_camera || specular_chain;
-                EmitterPtr emitter = si.emitter(scene);
-                Mask active_e = active_surface && (emitter != nullptr) &&
-                                !((depth == 0u) && m_hide_emitters);
+                // Reusing the trace's ray mask hides an invisible environment
+                // from escaped depth-0 rays
+                EmitterPtr emitter = si.emitter(scene, ray_mask);
+                Mask active_e = active_surface && (emitter != nullptr);
+
+                // Rays that see an emitter through the mask are valid samples.
+                // This includes escaped rays reaching a visible environment.
+                valid_ray |= active_e;
                 if (dr::any_or<true>(active_e)) {
                     Float emitter_pdf = 1.0f;
                     if (dr::any_or<true>(active_e && !count_direct)) {
@@ -338,15 +336,15 @@ public:
                     Spectrum emitted = emitter->eval(si, active_e);
                     Spectrum contrib = dr::select(count_direct, throughput * emitted,
                                                   throughput * mis_weight(last_scatter_direction_pdf, emitter_pdf) * emitted);
-                    dr::masked(result, active_e) += contrib;
+                    dr::masked(result, active_e) += clamp_contribution(contrib, depth <= 1u);
                 }
             }
             active_surface &= si.is_valid();
             if (dr::any_or<true>(active_surface)) {
                 // --------------------- Emitter sampling ---------------------
                 BSDFContext ctx;
-                BSDFPtr bsdf  = si.bsdf(ray);
-                Mask active_e = active_surface && has_flag(bsdf->flags(), BSDFFlags::Smooth) && (depth + 1 < (uint32_t) m_max_depth);
+                BSDFPtr bsdf  = si.bsdf();
+                Mask active_e = active_surface && bsdf->has_flag(BSDFFlags::Smooth) && (depth + 1 < (uint32_t) m_max_depth);
 
                 if (likely(dr::any_or<true>(active_e))) {
                     auto [emitted, ds] = sample_emitter(si, scene, sampler, medium, channel, active_e);
@@ -359,7 +357,9 @@ public:
                     // Determine probability of having sampled that same
                     // direction using BSDF sampling.
                     Float bsdf_pdf = bsdf->pdf(ctx, si, wo, active_e);
-                    result[active_e] += throughput * bsdf_val * mis_weight(ds.pdf, dr::select(ds.delta, 0.f, bsdf_pdf)) * emitted;
+                    dr::masked(result, active_e) += clamp_contribution(
+                        throughput * bsdf_val * mis_weight(ds.pdf, dr::select(ds.delta, 0.f, bsdf_pdf)) * emitted,
+                        depth == 0u);
                 }
 
                 // ----------------------- BSDF sampling ----------------------
@@ -374,17 +374,22 @@ public:
                 dr::masked(ray, active_surface) = bsdf_ray;
                 needs_intersection |= active_surface;
 
-                Mask non_null_bsdf = active_surface && !has_flag(bs.sampled_type, BSDFFlags::Null);
+                Mask null = has_null ? bs.is_null() : Mask(false),
+                     non_null_bsdf = active_surface && !null;
                 dr::masked(depth, non_null_bsdf) += 1;
+
+                // A specular event leaves the visibility class unchanged
+                dr::masked(ray_mask, non_null_bsdf && !bs.is_delta()) =
+                    +RayMask::Secondary;
 
                 // update the last scatter PDF event if we encountered a non-null scatter event
                 dr::masked(last_scatter_event, non_null_bsdf) = si;
                 dr::masked(last_scatter_direction_pdf, non_null_bsdf) = bs.pdf;
 
                 valid_ray |= non_null_bsdf;
-                specular_chain |= non_null_bsdf && has_flag(bs.sampled_type, BSDFFlags::Delta);
+                specular_chain |= non_null_bsdf && bs.is_delta();
                 specular_chain &= !(active_surface && has_flag(bs.sampled_type, BSDFFlags::Smooth));
-                act_null_scatter |= active_surface && has_flag(bs.sampled_type, BSDFFlags::Null);
+                act_null_scatter |= active_surface && null;
                 Mask has_medium_trans                = active_surface && si.is_medium_transition();
                 dr::masked(medium, has_medium_trans) = si.target_medium(ray.d);
             }
@@ -412,7 +417,7 @@ public:
             return { emitter_val, ds };
         }
 
-        Ray3f ray = ref_interaction.spawn_ray_to(ds.p);
+        Ray3f ray = ref_interaction.spawn_ray_to(ds);
         Float max_dist = ray.maxt;
 
         // Potentially escaping the medium if this is the current medium's boundary
@@ -527,14 +532,20 @@ public:
 
             active_surface &= si.is_valid() && active && !active_medium;
             if (dr::any_or<true>(active_surface)) {
-                auto bsdf         = si.bsdf(ray);
-                Spectrum bsdf_val = bsdf->eval_null_transmission(si, active_surface);
+                auto bsdf         = si.bsdf();
+                Spectrum bsdf_val = bsdf->eval_null(si, active_surface);
                 bsdf_val = si.to_world_mueller(bsdf_val, si.wi, si.wi);
                 dr::masked(transmittance, active_surface) *= bsdf_val;
             }
 
             // Update the ray with new origin & t parameter
             dr::masked(ray, active_surface) = si.spawn_ray(ray.d);
+
+            // Account for the rounding-related ray epsilon that Mitsuba
+            // adds when spawning rays
+            dr::masked(total_dist, active_surface) +=
+                dr::detach(dr::dot(ray.o - si.p, ray.d));
+
             ray.maxt = remaining_dist;
             needs_intersection |= active_surface;
 
@@ -553,15 +564,17 @@ public:
         return { ls.transmittance * emitter_val, dir_sample };
     }
 
-    //! @}
     // =============================================================
 
     std::string to_string() const override {
         return tfm::format("VolumetricSimplePathIntegrator[\n"
                            "  max_depth = %i,\n"
-                           "  rr_depth = %i\n"
+                           "  rr_depth = %i,\n"
+                           "  clamp_direct = %f,\n"
+                           "  clamp_indirect = %f\n"
                            "]",
-                           m_max_depth, m_rr_depth);
+                           m_max_depth, m_rr_depth, m_clamp_direct,
+                           m_clamp_indirect);
     }
 
     Float mis_weight(Float pdf_a, Float pdf_b) const {

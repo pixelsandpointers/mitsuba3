@@ -3,7 +3,7 @@ from __future__ import annotations # Delayed parsing of type annotations
 import drjit as dr
 import mitsuba as mi
 
-from .common import PSIntegrator, mis_weight, solid_angle_to_area_jacobian
+from .common import PSIntegrator, mis_weight, reattach_wi, reattach_wo
 
 class PathProjectiveIntegrator(PSIntegrator):
     r"""
@@ -32,8 +32,8 @@ class PathProjectiveIntegrator(PSIntegrator):
        - |int|
        - Number of samples per pixel used to estimate the continuous
          derivatives. Unless it is zero, this parameter is overriden by the
-         `spp` argument of the `render()` method. If neither this parameter nor
-         the `spp` argument are defined, the `sample_count` of the film's
+         ``spp`` argument of the `mitsuba.render()` method. If neither this parameter nor
+         the ``spp`` argument are defined, the ``sample_count`` of the film's
          sampler will be used.
 
      * - sppp
@@ -41,17 +41,17 @@ class PathProjectiveIntegrator(PSIntegrator):
        - Number of samples per pixel used to to estimate the gradients resulting
          from primary visibility changes (on the first segment of the light
          path: from the sensor to the first bounce) derivatives. Unless it is
-         zero, this parameter is overriden by the `spp` argument of the
-         `render()` method. If neither this parameter nor the `spp` argument are
-         defined, the `sample_count` of the film's sampler will be used.
+         zero, this parameter is overriden by the ``spp`` argument of the
+         `mitsuba.render()` method. If neither this parameter nor the ``spp`` argument are
+         defined, the ``sample_count`` of the film's sampler will be used.
 
      * - sppi
        - |int|
        - Number of samples per pixel used to to estimate the gradients resulting
          from indirect visibility changes  derivatives. Unless it is zero, this
-         parameter is overriden by the `spp` argument of the `render()` method.
-         If neither this parameter nor the `spp` argument are defined, the
-         `sample_count` of the film's sampler will be used.
+         parameter is overriden by the ``spp`` argument of the `mitsuba.render()` method.
+         If neither this parameter nor the ``spp`` argument are defined, the
+         ``sample_count`` of the film's sampler will be used.
 
      * - guiding
        - |string|
@@ -87,7 +87,7 @@ class PathProjectiveIntegrator(PSIntegrator):
     integrator starts by sampling a boundary segment and then attempts to
     connect it to the sensor and an emitter. It is effectively building lights
     paths from the middle outwards. In order to stay within the specified
-    `max_depth`, the integrator starts by sampling a path to the sensor by using
+    ``max_depth``, the integrator starts by sampling a path to the sensor by using
     reservoir sampling to decide whether or not to use a longer path. Once a
     path to the sensor is found, the other half of the full light path is
     sampled.
@@ -141,7 +141,7 @@ class PathProjectiveIntegrator(PSIntegrator):
                **kwargs # Absorbs unused arguments
     ) -> Tuple[mi.Spectrum, mi.Bool, List[mi.Float], Any]:
         """
-        See ``PSIntegrator.sample()`` for a description of this interface and
+        See `PSIntegrator.sample` for a description of this interface and
         the role of the various parameters and return values.
         """
 
@@ -165,13 +165,17 @@ class PathProjectiveIntegrator(PSIntegrator):
         depth_init = mi.UInt32(depth)                 # Initial depth
         pi = dr.zeros(mi.PreliminaryIntersection3f)   # Current interaction
 
+        # Ray mask indicating what geometry to intersect
+        ray_mask = mi.UInt32(dr.select(depth_init == 0,
+                                       mi.RayMask.Primary,
+                                       mi.RayMask.Secondary))
+
         if dr.hint(ignore_ray, mode='scalar'):
             si = si_shade
         else:
-            pi = scene.ray_intersect_preliminary(ray,
-                                                 coherent=True,
-                                                 reorder=False,
-                                                 active=active)
+            pi = scene.ray_intersect_preliminary(
+                ray, coherent=True, reorder=False, active=active,
+                ray_mask=ray_mask)
 
         # Variables caching information from the previous bounce
         ray_prev        = mi.Ray3f(ray)
@@ -179,6 +183,9 @@ class PathProjectiveIntegrator(PSIntegrator):
         si_prev         = dr.zeros(mi.SurfaceInteraction3f)
         bsdf_pdf_prev   = mi.Float(1.0)
         bsdf_delta_prev = mi.Bool(True)
+
+        # Null tests fold to literals in scenes without null shapes
+        has_null = scene.has_null_shapes()
 
         # Projective seed ray information
         cnt_seed = mi.UInt32(0)            # Number of valid seed rays encountered
@@ -195,37 +202,30 @@ class PathProjectiveIntegrator(PSIntegrator):
             # In primal mode, this is just an ordinary ray tracing operation.
             use_si_shade = ignore_ray & (depth == depth_init)
             with dr.resume_grad(when=not primal):
-                si = pi.compute_surface_interaction(ray,
-                                                    ray_flags=mi.RayFlags.All,
+                si = scene.compute_surface_interaction(ray, pi,
+                                                    ray_flags=mi.RayFlags.Default,
                                                     active=active_next & ~use_si_shade)
 
                 # Recompute an attached si.wi to account for motion of the
                 # previous surface interaction
                 if (not primal) & mi.Bool(depth >= 1):
-                    si_prev_diff = pi_prev.compute_surface_interaction(
-                        ray_prev,
-                        ray_flags=mi.RayFlags.Minimal,
-                        active=active_next & ~use_si_shade
-                    )
-                    si_prev = dr.replace_grad(si_prev, si_prev_diff)
-                    si_detached = dr.detach(si) # Ignore motion of current point
-                    wi_global = dr.normalize(si_prev.p - si_detached.p)
-                    si.wi = dr.replace_grad(si.wi, si_detached.to_local(wi_global))
+                    si_prev_diff = dr.replace_grad(si_prev, scene.compute_surface_interaction(
+                        ray_prev, pi_prev, ray_flags=mi.RayFlags.Minimal,
+                        active=active_next & ~use_si_shade))
+                    reattach_wi(si, si_prev_diff.p)
 
             if dr.hint(ignore_ray, mode='scalar'):
                 si[use_si_shade] = si_shade
 
-            # Get the BSDF, potentially computes texture-space differentials
-            bsdf = si.bsdf(ray)
+            # Get the BSDF
+            bsdf = si.bsdf()
+            bsdf_flags = bsdf.flags()
 
             # ---------------------- Direct emission ----------------------
 
-            # Hide the environment emitter if necessary
-            if dr.hint(self.hide_emitters, mode='scalar'):
-                active_next &= ~((depth == 0) & ~si.is_valid())
-
-            # Compute MIS weight for emitter sample from previous bounce
-            ds = mi.DirectionSample3f(scene, si=si, ref=si_prev)
+            # The emitter lookup uses the mask of the ray that produced si
+            ds = mi.DirectionSample3f(scene, si=si, ref=si_prev,
+                                      ray_mask=ray_mask)
 
             mis = mis_weight(
                 bsdf_pdf_prev,
@@ -237,53 +237,21 @@ class PathProjectiveIntegrator(PSIntegrator):
 
             # ---------------------- Emitter sampling ----------------------
 
-            # Should we continue tracing to reach one more vertex?
-            active_next &= (depth + 1 < self.max_depth) & si.is_valid()
+            # Continue tracing? Null crossings don't count towards max_depth
+            depth_ok = depth + 1 < self.max_depth
+            can_cross = mi.has_flag(bsdf_flags, mi.BSDFFlags.Null) if has_null else mi.Bool(False)
+            active_next &= si.is_valid() & (depth_ok | can_cross)
 
             # Is emitter sampling even possible on the current vertex?
-            active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+            active_em = active_next & depth_ok & \
+                        mi.has_flag(bsdf_flags, mi.BSDFFlags.Smooth)
 
-            # If so, randomly sample an emitter without derivative tracking.
-            ds, em_weight = scene.sample_emitter_direction(
-                si, sampler.next_2d(), True, active_em)
-            active_em &= (ds.pdf != 0.0)
-
+            # If so, sample an emitter. The sample is detached, and its
+            # weight is attached to the emitter and to the motion of 'si'.
             with dr.resume_grad(when=not primal):
-                if dr.hint(not primal, mode='scalar'):
-                    is_surface = mi.has_flag(ds.emitter.flags(), mi.EmitterFlags.Surface)
-                    is_infinite = mi.has_flag(ds.emitter.flags(), mi.EmitterFlags.Infinite)
-                    is_spatially_varying = mi.has_flag(ds.emitter.flags(), mi.EmitterFlags.SpatiallyVarying)
-
-                    # For textured area lights, we need to track UV changes on
-                    # the emitter if it is moving
-                    textured_area_em = active_em & is_surface & is_spatially_varying
-                    ray_em = si.spawn_ray_to(ds.p)
-                    # Move ray origin closer, visibibliy is already accounted for
-                    ray_em.o = dr.fma(ray_em.d, ray_em.maxt, ray_em.o)
-                    ray_em.maxt = dr.largest(ray_em.maxt)
-                    si_em = scene.ray_intersect(ray_em, textured_area_em)
-
-                    # Re-attach gradients for the the `ds` struct
-                    ds_diff = mi.DirectionSample3f(scene, si_em, si)
-                    ds_diff = dr.select(textured_area_em, ds_diff, dr.zeros(mi.DirectionSample3f))
-                    ds_diff.d = dr.select(textured_area_em, ds_diff.d, dr.normalize(ds.p - si.p))
-                    ds_diff.d = dr.select(~is_infinite, ds_diff.d, ds.d)
-                    ds = dr.replace_grad(ds, ds_diff)
-
-                    # If the current interaction point is moving, we need
-                    # to differentiate the solid angle to surface area
-                    # reparameterization.
-                    J = solid_angle_to_area_jacobian(
-                        si.p, dr.detach(ds.p), dr.detach(ds.n), active_em & is_surface
-                    )
-
-                    # Given the detached emitter sample, *recompute* its
-                    # contribution with AD to enable light source optimization
-                    em_val_diff = scene.eval_emitter_direction(si, ds, active_em)
-                    inv_ds_pdf = dr.select(ds.pdf != 0, dr.rcp(ds.pdf), 0)
-                    em_weight = dr.replace_grad(em_weight, em_val_diff * dr.detach(inv_ds_pdf))
-                    em_weight *= dr.relative_grad(J)
-
+                ds, em_weight = scene.sample_emitter_direction(
+                    si, sampler.next_2d(), test_visibility=True, active=active_em)
+                active_em &= (ds.pdf != 0.0)
 
                 # Evaluate BSDF * cos(theta) differentiably
                 wo = si.to_local(ds.d)
@@ -305,12 +273,6 @@ class PathProjectiveIntegrator(PSIntegrator):
             η *= bsdf_sample.eta
             β *= bsdf_weight
 
-            # Information about the current vertex needed by the next iteration
-
-            si_prev = dr.detach(si, True)
-            bsdf_pdf_prev = bsdf_sample.pdf
-            bsdf_delta_prev = mi.has_flag(bsdf_sample.sampled_type, mi.BSDFFlags.Delta)
-
             # ------------------------ Seed rays --------------------------
 
             # Note: even when the current vertex has a delta BSDF, which implies
@@ -328,21 +290,21 @@ class PathProjectiveIntegrator(PSIntegrator):
                     # We assume that `ray` intersects the scene
                     ray_seed_cand = ray_next
                 elif dr.hint(self.project_seed == "emitter", mode='scalar'):
-                    ray_seed_cand = si.spawn_ray_to(ds.p)
+                    ray_seed_cand = si.spawn_ray_to(ds)
                     ray_seed_cand.maxt = dr.largest(mi.Float)
                     # Directions towards the interior have no contribution
                     # unless we hit a transmissive BSDF
                     active_seed_cand &= (dr.dot(si.n, ray_seed_cand.d) > 0) | \
-                                         mi.has_flag(bsdf.flags(), mi.BSDFFlags.Transmission)
+                                         mi.has_flag(bsdf_flags, mi.BSDFFlags.Transmission)
                 elif dr.hint(self.project_seed == "both", mode='scalar'):
                     # By default we use the BSDF sample as the seed ray
                     ray_seed_cand = ray_next
 
                     # Flip a coin only when the emitter sample is valid
                     mask_replace = (dr.dot(si.n, ray_seed_cand.d) > 0) | \
-                                    mi.has_flag(bsdf.flags(), mi.BSDFFlags.Transmission)
+                                    mi.has_flag(bsdf_flags, mi.BSDFFlags.Transmission)
                     mask_replace &= sampler.next_1d(active_seed_cand) > 0.5
-                    ray_seed_cand[mask_replace] = si.spawn_ray_to(ds.p)
+                    ray_seed_cand[mask_replace] = si.spawn_ray_to(ds)
                     ray_seed_cand.maxt = dr.largest(mi.Float)
 
                 # Resovoir sampling: do we use this candidate seed ray?
@@ -370,44 +332,51 @@ class PathProjectiveIntegrator(PSIntegrator):
             rr_continue = sampler.next_1d() < rr_prob
             active_next &= ~rr_active | rr_continue
 
+            # Information about the current vertex needed by the next
+            # iteration (unchanged by null crossings)
+            null = bsdf_sample.is_null() if has_null else mi.Bool(False)
+            scattered = si.is_valid() & ~null
+            si_prev[scattered]         = dr.detach(si, True)
+            pi_prev[scattered]         = pi
+            ray_prev[scattered]        = ray
+            bsdf_pdf_prev[scattered]   = bsdf_sample.pdf
+            bsdf_delta_prev[scattered] = bsdf_sample.is_delta()
+            # A specular event leaves the visibility class unchanged
+            ray_mask[scattered & ~bsdf_sample.is_delta()] = \
+                mi.RayMask.Secondary
+            depth[scattered]          += 1
+            active_next &= depth_ok | ~scattered
+
             # ----------------- Find the next interaction -----------------
 
             pi_next = scene.ray_intersect_preliminary(ray_next,
                                                       coherent=False,
                                                       reorder=False,
-                                                      active=active_next)
+                                                      active=active_next,
+                                                      ray_mask=ray_mask)
 
             # ------------------ Differential phase only ------------------
 
             if dr.hint(not primal, mode='scalar'):
-                si_next = pi_next.compute_surface_interaction(ray_next,
-                                                              ray_flags=mi.RayFlags.Minimal,
-                                                              active=active_next)
+                si_next = scene.compute_surface_interaction(
+                    ray_next, pi_next, ray_flags=mi.RayFlags.Minimal,
+                    active=active_next)
 
                 with dr.resume_grad():
-                    # If the current interaction point is moving, we need
-                    # to differentiate the solid angle to surface area
-                    # reparameterization.
-                    J = solid_angle_to_area_jacobian(
-                        si.p, si_next.p, si_next.n, active_next & si_next.is_valid()
-                    )
-
                     # 'L' stores the reflected radiance at the current vertex
                     # but does not track parameter derivatives. The following
                     # addresses this by canceling the detached BSDF value and
                     # replacing it with an equivalent term that has derivative
-                    # tracking enabled.
+                    # tracking enabled. The direction to the next vertex and
+                    # the geometry term account for the motion of 'si'.
+                    wo, J = reattach_wo(si, si_next, ray_next, active_next)
 
-                    # Recompute 'wo' to propagate derivatives to cosine term
-                    wo_world_diff = dr.normalize(si_next.p - si.p)
-                    wo_world = dr.replace_grad(
-                        ray_next.d,
-                        dr.select(si_next.is_valid(), wo_world_diff, ray_next.d)
-                    )
-                    wo = si.to_local(wo_world)
-
-                    # Re-evaluate BSDF * cos(theta) differentiably
+                    # Re-evaluate BSDF * cos(theta) differentiably. A null
+                    # crossing continues with the null transmission instead.
                     bsdf_val = bsdf.eval(bsdf_ctx, si, wo, active_next)
+                    if dr.hint(has_null, mode='scalar'):
+                        null &= active_next
+                        bsdf_val[null] = bsdf.eval_null(si, null)
 
                     # Differentiable version of the reflected radiance.
                     Lr_ind = L * dr.relative_grad(bsdf_val) * dr.relative_grad(J)
@@ -415,7 +384,7 @@ class PathProjectiveIntegrator(PSIntegrator):
                     # Differentiable Monte Carlo estimate of all contributions
                     Lo = Le + Lr_dir + Lr_ind
 
-                    attached_contrib = dr.flag(dr.JitFlag.VCallRecord) and not dr.grad_enabled(Lo)
+                    attached_contrib = dr.flag(dr.JitFlag.SymbolicCalls) and not dr.grad_enabled(Lo)
                     if dr.hint(attached_contrib, mode='scalar'):
                         raise Exception(
                             "The contribution computed by the differential "
@@ -442,12 +411,8 @@ class PathProjectiveIntegrator(PSIntegrator):
 
             # ------------------ Update loop variables ------------------
 
-            depth[si.is_valid()] += 1
             active = active_next
-
-            pi_prev = pi
             pi = pi_next
-            ray_prev = ray
             ray = ray_next
 
         return (
@@ -461,7 +426,7 @@ class PathProjectiveIntegrator(PSIntegrator):
 
     def sample_radiance_difference(self, scene, ss, curr_depth, sampler, wavelengths, active):
         """
-        See ``PSIntegrator.sample_radiance_difference()`` for a description of
+        See `PSIntegrator.sample_radiance_difference` for a description of
         this interface and the role of the various parameters and return values.
         """
 
@@ -488,8 +453,8 @@ class PathProjectiveIntegrator(PSIntegrator):
 
         # The ray origin is wrong, but this is fine if we only need the primal
         # radiance
-        si_fg = pi_fg.compute_surface_interaction(
-            dummy_ray, mi.RayFlags.All, active)
+        si_fg = scene.compute_surface_interaction(
+            dummy_ray, pi_fg, mi.RayFlags.Default, active)
 
         # If smooth normals are used, it is possible that the computed
         # shading normal near visibility silhouette points to the wrong side
@@ -522,7 +487,7 @@ class PathProjectiveIntegrator(PSIntegrator):
     def sample_importance(self, scene, sensor, ss, max_depth, sampler,
                           wavelengths, active):
         """
-        See ``PSIntegrator.sample_importance()`` for a description of this
+        See `PSIntegrator.sample_importance` for a description of this
         interface and the role of the various parameters and return values.
         """
 
@@ -531,7 +496,7 @@ class PathProjectiveIntegrator(PSIntegrator):
         ss_importance.d = -ss_importance.d
         ray_boundary = ss_importance.spawn_ray(wavelengths)
         si_boundary = scene.ray_intersect(ray_boundary,
-                                          ray_flags=mi.RayFlags.All,
+                                          ray_flags=mi.RayFlags.Default,
                                           coherent=False,
                                           reorder=True,
                                           active=active)
@@ -555,24 +520,27 @@ class PathProjectiveIntegrator(PSIntegrator):
                       label="Estimate Importance"):
             # Is it possible to connect the current vertex to the sensor?
             bsdf = si_loop.bsdf()
-            active_connect = active_loop & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+            active_connect = active_loop & bsdf.has_flag(mi.BSDFFlags.Smooth)
 
             # Sample a direction from the current vertex towards the sensor
             sensor_ds, sensor_weight = sensor.sample_direction(
                 si_loop, sampler.next_2d(active_connect), active_connect)
             active_connect &= (sensor_ds.pdf > 0) & dr.any(sensor_weight > 0)
 
-            # Check that the sensor is visible from the current vertex (shadow test)
+            # Check that the sensor is visible from the current vertex. The
+            # shadow ray passes through null surfaces and returns their
+            # transmittance (zero when occluded).
             ray_test = si_loop.spawn_ray_to(sensor_ds.p)
-            occluded = scene.ray_test(ray_test, active_connect)
-            found = active_connect & ~occluded
+            tr = scene.ray_test_tr(ray_test, active=active_connect,
+                                   ray_mask=mi.RayMask.Primary)
+            found = active_connect & dr.any(mi.unpolarized_spectrum(tr) != 0)
             cnt_valid[found] += 1
 
             # Should we use this connection to replace the current one in the resovoir?
             replace = found & (sampler.next_1d(found) * cnt_valid <= 1)
             si_cam[replace]    = si_loop
             depth_cam[replace] = depth
-            W[replace]         = β
+            W[replace]         = β * tr
 
             # Should we continue tracing to reach one more vertex? We need to
             # continue tracing even when we have found a valid connection.
@@ -596,9 +564,9 @@ class PathProjectiveIntegrator(PSIntegrator):
             # Get the next surface interaction
             ray_next = si_loop.spawn_ray(wo_bsdf_world)
             si_loop[active_loop] = scene.ray_intersect(ray_next,
-                                                       ray_flags=mi.RayFlags.All,
+                                                       ray_flags=mi.RayFlags.Default,
                                                        coherent=False,
-                                                       reorder=dr.flag(dr.JitFlag.LoopRecord),
+                                                       reorder=dr.flag(dr.JitFlag.SymbolicLoops),
                                                        active=active_loop)
 
             # Update the active lanes

@@ -1,5 +1,7 @@
+#include <mitsuba/core/animated_transform.h>
 #include <mitsuba/core/properties.h>
 #include <mitsuba/render/mesh.h>
+#include <mitsuba/render/scene.h>
 #include <mitsuba/render/scene_ir.h>
 #include <mitsuba/render/emitter.h>
 #include <mitsuba/render/bsdf.h>
@@ -15,10 +17,26 @@
 
 NAMESPACE_BEGIN(mitsuba)
 
+ShapeVisibility parse_visibility(std::string_view value) {
+    if (value == "all")
+        return ShapeVisibility::All;
+    else if (value == "primary")
+        return ShapeVisibility::Primary;
+    else if (value == "secondary")
+        return ShapeVisibility::Secondary;
+    else if (value == "hidden")
+        return ShapeVisibility::Hidden;
+    Throw("Invalid 'visibility' value \"%s\", expected \"all\", \"primary\", "
+          "\"secondary\", or \"hidden\".", value);
+}
+
 MI_VARIANT Shape<Float, Spectrum>::Shape(const Properties &props)
     : JitObject<Shape>(props.id()) {
-    m_to_world =
-        (ScalarAffineTransform4f) props.get<ScalarAffineTransform4f>("to_world", ScalarAffineTransform4f());
+    // The 'instance' plugin looks up the animation itself
+    auto [to_world, anim] = AnimatedTransform4f::from_properties(props, "to_world");
+    if (anim && props.plugin_name() != "instance")
+        Throw("Shape animation requires the use of the instance plugin");
+    m_to_world = to_world;
 
     for (auto &prop : props.objects()) {
         if (Emitter *emitter = prop.try_get<Emitter>()) {
@@ -57,6 +75,14 @@ MI_VARIANT Shape<Float, Spectrum>::Shape(const Properties &props)
     }
 
     m_silhouette_sampling_weight = props.get<ScalarFloat>("silhouette_sampling_weight", 1.0f);
+    m_visibility = parse_visibility(
+        props.get<std::string_view>("visibility", "all"));
+
+    // The shape owns this property. The emitter still reports its own field
+    // here because initialize() has not attached it to this shape yet.
+    if (m_emitter && m_emitter->visibility() != ShapeVisibility::All)
+        Throw("The 'visibility' property of an area emitter must be "
+              "specified on the shape that carries it.");
 }
 
 MI_VARIANT Shape<Float, Spectrum>::~Shape() { }
@@ -76,18 +102,19 @@ MI_VARIANT Float Shape<Float, Spectrum>::pdf_position(const PositionSample3f & /
 MI_VARIANT void
 Shape<Float, Spectrum>::describe(ShapeIR &g) const {
     g.kind = ShapeIR::Kind::Custom;
-    g.type = m_shape_type;
     g.prim_count = primitive_count();
     g.ctx = this;
-#if defined(MI_ENABLE_METAL) || defined(MI_ENABLE_CUDA)
-    // Default custom shape: one AABB equal to the shape bounds.
     g.fill_aabbs = [](const void *ctx, void *out) {
-        ScalarBoundingBox3f b = static_cast<const Shape *>(ctx)->bbox();
+        const Shape *shape = static_cast<const Shape *>(ctx);
         float *d = (float *) out;
-        d[0] = (float) b.min.x(); d[1] = (float) b.min.y(); d[2] = (float) b.min.z();
-        d[3] = (float) b.max.x(); d[4] = (float) b.max.y(); d[5] = (float) b.max.z();
+        for (ScalarSize i = 0, n = shape->primitive_count(); i < n; ++i, d += 6) {
+            ScalarBoundingBox3f b = shape->bbox(i);
+            for (int k = 0; k < 3; ++k) {
+                d[k] = (float) b.min[k];
+                d[3 + k] = (float) b.max[k];
+            }
+        }
     };
-#endif
 }
 
 MI_VARIANT typename Shape<Float, Spectrum>::DirectionSample3f
@@ -177,7 +204,7 @@ Shape<Float, Spectrum>::sample_precomputed_silhouette(
 
 MI_VARIANT typename Shape<Float, Spectrum>::PreliminaryIntersection3f
 Shape<Float, Spectrum>::ray_intersect_preliminary(const Ray3f & /*ray*/,
-                                                  uint32_t /*prim_index*/, Mask /*active*/) const {
+                                                  UInt32 /*prim_index*/, Mask /*active*/) const {
     NotImplementedError("ray_intersect_preliminary");
 }
 
@@ -191,30 +218,8 @@ Shape<Float, Spectrum>::ray_intersect_preliminary_scalar(const ScalarRay3f & /*r
     NotImplementedError("ray_intersect_preliminary_scalar");
 }
 
-#define MI_DEFAULT_RAY_INTERSECT_PACKET(N)                                                          \
-    MI_VARIANT std::tuple<typename Shape<Float, Spectrum>::MaskP##N,                                \
-                           typename Shape<Float, Spectrum>::FloatP##N,                              \
-                           typename Shape<Float, Spectrum>::Point2fP##N,                            \
-                           typename Shape<Float, Spectrum>::UInt32P##N,                             \
-                           typename Shape<Float, Spectrum>::UInt32P##N>                             \
-    Shape<Float, Spectrum>::ray_intersect_preliminary_packet(                                       \
-        const Ray3fP##N & /*ray*/, uint32_t /*prim_index*/, MaskP##N /*active*/) const {            \
-        NotImplementedError("ray_intersect_preliminary_packet");                                    \
-    }                                                                                               \
-    MI_VARIANT typename Shape<Float, Spectrum>::MaskP##N                                            \
-    Shape<Float, Spectrum>::ray_test_packet(const Ray3fP##N &ray,                                   \
-                                            uint32_t prim_index,                                    \
-                                            MaskP##N active) const {                                \
-        auto res = ray_intersect_preliminary_packet(ray, prim_index, active);                       \
-        return std::get<0>(res);                                                                    \
-    }
-
-MI_DEFAULT_RAY_INTERSECT_PACKET(4)
-MI_DEFAULT_RAY_INTERSECT_PACKET(8)
-MI_DEFAULT_RAY_INTERSECT_PACKET(16)
-
 MI_VARIANT typename Shape<Float, Spectrum>::Mask
-Shape<Float, Spectrum>::ray_test(const Ray3f &ray, uint32_t prim_index, Mask active) const {
+Shape<Float, Spectrum>::ray_test(const Ray3f &ray, UInt32 prim_index, Mask active) const {
     MI_MASK_ARGUMENT(active);
     return ray_intersect_preliminary(ray, prim_index, active).is_valid();
 }
@@ -228,7 +233,6 @@ MI_VARIANT typename Shape<Float, Spectrum>::SurfaceInteraction3f
 Shape<Float, Spectrum>::compute_surface_interaction(const Ray3f & /*ray*/,
                                                     const PreliminaryIntersection3f &/*pi*/,
                                                     uint32_t /*ray_flags*/,
-                                                    uint32_t /*recursion_depth*/,
                                                     Mask /*active*/) const {
     NotImplementedError("compute_surface_interaction");
 }
@@ -236,8 +240,22 @@ Shape<Float, Spectrum>::compute_surface_interaction(const Ray3f & /*ray*/,
 MI_VARIANT typename Shape<Float, Spectrum>::SurfaceInteraction3f
 Shape<Float, Spectrum>::ray_intersect(const Ray3f &ray, uint32_t ray_flags, Mask active) const {
     MI_MASK_ARGUMENT(active);
-    auto pi = ray_intersect_preliminary(ray, 0, active);
-    return pi.compute_surface_interaction(ray, ray_flags, active);
+    PreliminaryIntersection3f pi = ray_intersect_preliminary(ray, 0, active);
+
+    active &= pi.is_valid();
+    if (dr::none_or<false>(active)) {
+        SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
+        si.wi = -ray.d;
+        si.wavelengths = ray.wavelengths;
+        return si;
+    }
+
+    // Route through the ShapePtr so that JIT variants trace the call like
+    // any other hit expansion
+    SurfaceInteraction3f si =
+        pi.shape->compute_surface_interaction(ray, pi, ray_flags, active);
+    si.finalize_surface_interaction(pi, ray, ray_flags, active);
+    return si;
 }
 
 MI_VARIANT void
@@ -280,58 +298,40 @@ MI_VARIANT typename Shape<Float, Spectrum>::UnpolarizedSpectrum
 Shape<Float, Spectrum>::eval_attribute(std::string_view name,
                                        const SurfaceInteraction3f & si,
                                        Mask active) const {
-    const auto& it = m_texture_attributes.find(name);
-    if (it == m_texture_attributes.end()) {
-        if constexpr (dr::is_jit_v<Float>)
-            return 0.f;
-        else
-            Throw("Invalid attribute requested %s.", name);
-    }
+    auto it = m_texture_attributes.find(name);
+    if (it == m_texture_attributes.end())
+        return 0.f; // Attributes that the shape does not carry read as zero
 
-    const auto& texture = it->second;
-    return texture->eval(si, active);
+    return it->second->eval(si, active);
 }
 
 MI_VARIANT Float
 Shape<Float, Spectrum>::eval_attribute_1(std::string_view name,
                                          const SurfaceInteraction3f &si,
                                          Mask active) const {
-    const auto& it = m_texture_attributes.find(name);
-    if (it == m_texture_attributes.end()) {
-        if constexpr (dr::is_jit_v<Float>)
-            return 0.f;
-        else
-            Throw("Invalid attribute requested %s.", name);
-    }
+    auto it = m_texture_attributes.find(name);
+    if (it == m_texture_attributes.end())
+        return 0.f; // Attributes that the shape does not carry read as zero
 
-    const auto& texture = it->second;
-    return texture->eval_1(si, active);
+    return it->second->eval_1(si, active);
 }
 
 MI_VARIANT typename Shape<Float, Spectrum>::Color3f
 Shape<Float, Spectrum>::eval_attribute_3(std::string_view name,
                                          const SurfaceInteraction3f &si,
                                          Mask active) const {
-    const auto& it = m_texture_attributes.find(name);
-    if (it == m_texture_attributes.end()) {
-        if constexpr (dr::is_jit_v<Float>)
-            return 0.f;
-        else
-            Throw("Invalid attribute requested %s.", name);
-    }
+    auto it = m_texture_attributes.find(name);
+    if (it == m_texture_attributes.end())
+        return 0.f; // Attributes that the shape does not carry read as zero
 
-    const auto& texture = it->second;
-    return texture->eval_3(si, active);
+    return it->second->eval_3(si, active);
 }
 
 MI_VARIANT typename dr::DynamicArray<Float>
 Shape<Float, Spectrum>::eval_attribute_x(std::string_view /*name*/,
                                          const SurfaceInteraction3f & /*si*/,
                                          Mask /*active*/) const {
-    if constexpr (dr::is_jit_v<Float>)
-        return 0.f;
-    else
-        NotImplementedError("eval_attribute_x");
+    return 0.f; // Attributes that the shape does not carry read as zero
 }
 
 MI_VARIANT Float Shape<Float, Spectrum>::surface_area() const {
@@ -344,15 +344,20 @@ Shape<Float, Spectrum>::bbox(ScalarIndex) const {
 }
 
 MI_VARIANT typename Shape<Float, Spectrum>::ScalarBoundingBox3f
-Shape<Float, Spectrum>::bbox(ScalarIndex index, const ScalarBoundingBox3f &clip) const {
-    ScalarBoundingBox3f result = bbox(index);
+Shape<Float, Spectrum>::bbox(ScalarIndex prim_index, const ScalarBoundingBox3f &clip) const {
+    ScalarBoundingBox3f result = bbox(prim_index);
     result.clip(clip);
     return result;
 }
 
 MI_VARIANT void
 Shape<Float, Spectrum>::set_bsdf(BSDF *bsdf) {
+    bool was_null = has_null();
     m_bsdf = bsdf;
+
+    // 'null' shapes potenially go into a separate BLAS, which requires a rebuil
+    if (was_null != has_null())
+        mark_dirty();
 }
 
 MI_VARIANT typename Shape<Float, Spectrum>::ScalarSize
@@ -363,10 +368,6 @@ Shape<Float, Spectrum>::primitive_count() const {
 MI_VARIANT typename Shape<Float, Spectrum>::ScalarSize
 Shape<Float, Spectrum>::effective_primitive_count() const {
     return primitive_count();
-}
-
-MI_VARIANT bool Shape<Float, Spectrum>::has_flipped_normals() const {
-    return false;
 }
 
 MI_VARIANT void Shape<Float, Spectrum>::traverse(TraversalCallback *cb) {
@@ -382,8 +383,8 @@ MI_VARIANT void Shape<Float, Spectrum>::traverse(TraversalCallback *cb) {
 
     cb->put("silhouette_sampling_weight", m_silhouette_sampling_weight, ParamFlags::NonDifferentiable);
 
-    for (auto it = m_texture_attributes.begin(); it != m_texture_attributes.end(); ++it)
-        cb->put(it.key(), it.value(), ParamFlags::Differentiable);
+    for (auto &[name, texture] : m_texture_attributes)
+        cb->put(name, texture, ParamFlags::Differentiable);
 }
 
 MI_VARIANT

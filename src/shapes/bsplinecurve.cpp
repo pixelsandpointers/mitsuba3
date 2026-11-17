@@ -4,14 +4,13 @@
 #include <mitsuba/core/transform.h>
 #include <mitsuba/core/util.h>
 #include <mitsuba/core/warp.h>
-#include <mitsuba/core/fresolver.h>
-#include <mitsuba/core/mmap.h>
 #include <mitsuba/core/timer.h>
 #include <mitsuba/render/fwd.h>
 #include <mitsuba/render/interaction.h>
 #include <mitsuba/render/shape.h>
 #include <mitsuba/render/scene_ir.h>
-#include <iostream>
+
+#include "curve.h"
 
 #include <drjit/texture.h>
 
@@ -19,11 +18,6 @@
 #include <embree3/rtcore.h>
 #endif
 
-#if defined(MI_ENABLE_METAL)
-#include "../render/metal/shapes.h"
-#endif
-
-#include "../render/bbox_reduce.h"
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -39,7 +33,17 @@ B-spline curve (:monosp:`bsplinecurve`)
 
  * - filename
    - |string|
-   - Filename of the curves to be loaded
+   - Filename of the curves to be loaded, either a text file or a
+     ``.packed`` container
+
+ * - index
+   - |int|
+   - Index of the entry to load from a ``.packed`` container. (Default: 0)
+
+ * - name
+   - |string|
+   - Alternatively, the name of the entry to load from a ``.packed``
+     container.
 
  * - to_world
    - |transform|
@@ -106,6 +110,13 @@ points and increasing radii::
      4.0 1.0 2.2 5
      4.0 0.0 2.3 6
 
+Large sets of curves are better stored in a ``.packed`` container, which
+holds the control points in a compressed binary form that loads considerably
+faster than the text format. The :ref:`file format description
+<sec-packed-curve>` documents the layout of a curve entry. When
+:monosp:`filename` refers to a container, the ``index`` or ``name``
+parameter selects the entry.
+
 .. tabs::
     .. code-tab:: xml
         :name: bsplinecurve
@@ -133,9 +144,8 @@ points and increasing radii::
 template <typename Float, typename Spectrum>
 class BSplineCurve final : public Shape<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Shape, m_to_world, m_is_instance, m_discontinuity_types,
-                   m_shape_type, initialize, mark_dirty, get_children_string,
-                   parameters_grad_enabled)
+    MI_IMPORT_BASE(Shape, m_to_world, m_discontinuity_types, m_shape_type,
+                   initialize, mark_dirty, get_children_string)
     MI_IMPORT_TYPES()
 
     using typename Base::ScalarIndex;
@@ -154,177 +164,41 @@ public:
                   "variants!");
 #endif
 
-        auto fs = file_resolver();
-        fs::path file_path = fs->resolve(props.get<std::string_view>("filename"));
-        std::string m_name = file_path.filename().string();
-
-        // used for throwing an error later
-        auto fail = [&](const char *descr, auto... args) {
-            Throw(("Error while loading B-spline curve(s) from \"%s\": " + std::string(descr))
-                      .c_str(), m_name, args...);
-        };
-
-        Log(Debug, "Loading B-spline curve(s) from \"%s\" ..", m_name);
-        if (!fs::exists(file_path))
-            fail("file not found!");
-
-        ref<MemoryMappedFile> mmap = new MemoryMappedFile(file_path);
         ScopedPhase phase(ProfilerPhase::LoadGeometry);
-
-        // Temporary buffers for vertices and radius
-        std::vector<InputPoint3f> vertices;
-        std::vector<InputFloat> radius;
-        ScalarSize vertex_guess = (ScalarSize) mmap->size() / 100;
-        vertices.reserve(vertex_guess);
-        radius.reserve(vertex_guess);
-
-        // Load data from the given file
-        const char *ptr = (const char *) mmap->data();
-        const char *eof = ptr + mmap->size();
-        char buf[1025];
         Timer timer;
 
-        size_t segment_count = 0;
-        std::vector<size_t> curve_1st_idx;
-        curve_1st_idx.reserve(vertex_guess / 4);
-        bool new_curve = true;
+        constexpr JitBackend Backend = dr::backend_v<Float>;
 
-        auto finish_curve = [&]() {
-            if (!new_curve) {
-                size_t num_control_points = vertices.size() - curve_1st_idx[curve_1st_idx.size() - 1];
-                if (unlikely((num_control_points < 4) && (num_control_points > 0)))
-                    fail("B-spline curves must have at least four control points!");
-                if (likely(num_control_points > 0))
-                    segment_count += (num_control_points - 3);
-            }
-        };
+        CurveData data = load_curves(Backend, props, m_to_world.scalar(), 4);
+        m_control_point_count = (ScalarSize) data.control_point_count();
 
-        while (ptr < eof) {
-            // Determine the offset of the next newline
-            const char *next = ptr;
-            advance<false>(&next, eof, "\n");
-
-            // Copy buf into a 0-terminated buffer
-            ScalarSize size = (ScalarSize) (next - ptr);
-            if (size >= sizeof(buf) - 1)
-                fail("file contains an excessively long line! (%i characters)!", size);
-            memcpy(buf, ptr, size);
-            buf[size] = '\0';
-
-            // Skip whitespace(s)
-            const char *cur = buf, *eol = buf + size;
-            advance<true>(&cur, eol, " \t\r");
-            bool parse_error = false;
-
-            // Empty line
-            if (*cur == '\0') {
-                finish_curve();
-                new_curve = true;
-                ptr = next + 1;
-                continue;
-            }
-
-            // Handle current line: v.x v.y v.z radius
-            if (new_curve) {
-                curve_1st_idx.push_back(vertices.size());
-                new_curve = false;
-            }
-
-            // Vertex position
-            InputPoint3f p;
-            for (ScalarSize i = 0; i < 3; ++i) {
-                const char *orig = cur;
-                p[i] = string::strtof<InputFloat>(cur, (char **) &cur);
-                parse_error |= cur == orig;
-            }
-            p = m_to_world.scalar() * p;
-
-            // Vertex radius
-            InputFloat r;
-            const char *orig = cur;
-            r = string::strtof<InputFloat>(cur, (char **) &cur);
-            parse_error |= cur == orig;
-
-            if (unlikely(!all(dr::isfinite(p))))
-                fail("B-spline control point contains invalid position data (line: \"%s\")!", buf);
-            if (unlikely(!dr::isfinite(r)))
-                fail("B-spline control point contains invalid radius data (line: \"%s\")!", buf);
-
-            vertices.push_back(p);
-            radius.push_back(r);
-
-            if (unlikely(parse_error))
-                fail("Could not parse line \"%s\"!", buf);
-            ptr = next + 1;
-        }
-        if (curve_1st_idx.size() == 0)
-            fail("Empty B-spline file: no control points were read!");
-        finish_curve();
-
-        m_control_point_count = (ScalarSize) vertices.size();
-
-        std::unique_ptr<ScalarIndex[]> indices = std::make_unique<ScalarIndex[]>(segment_count);
-        std::unique_ptr<ScalarIndex[]> curves_1st_prim_idx =
-            std::make_unique<ScalarIndex[]>(curve_1st_idx.size() + 1);
+        // Every curve with n control points contributes n - 3 segments
+        size_t curve_count = data.curve_count(),
+               segment_count = m_control_point_count - 3 * curve_count;
+        drjit::unique_buffer<ScalarIndex> indices(Backend, segment_count,
+                                                  /* shared = */ true);
+        drjit::unique_buffer<ScalarIndex> curves_1st_prim_idx(
+            Backend, curve_count + 1, /* shared = */ true);
         size_t segment_index = 0;
-        for (size_t i = 0; i < curve_1st_idx.size(); ++i) {
-            size_t next_curve_idx = i + 1 < curve_1st_idx.size() ? curve_1st_idx[i + 1] : vertices.size();
-            size_t curve_segment_count = next_curve_idx - curve_1st_idx[i] - 3;
+        for (size_t i = 0; i < curve_count; ++i) {
             curves_1st_prim_idx[i] = (ScalarIndex) segment_index;
-            for (size_t j = 0; j < curve_segment_count; ++j)
-                indices[segment_index++] = (ScalarIndex) (curve_1st_idx[i] + j);
+            for (uint32_t j = data.offsets[i]; j + 3 < data.offsets[i + 1]; ++j)
+                indices[segment_index++] = (ScalarIndex) j;
         }
-        curves_1st_prim_idx[curve_1st_idx.size()] = (ScalarIndex) segment_index;
+        curves_1st_prim_idx[curve_count] = (ScalarIndex) segment_index;
 
-        m_indices = dr::load<UInt32Storage>(indices.get(), segment_count);
-        m_curves_prim_idx = dr::load<UInt32Storage>(curves_1st_prim_idx.get(),
-                                                    curve_1st_idx.size() + 1);
+        // Reduce on the host while the control points are still staged there
+        m_bbox = reduce_bbox_host<ScalarPoint3f, 4, 3>(
+            data.control_points.data(), m_control_point_count);
 
-        std::unique_ptr<InputFloat[]> positions =
-            std::make_unique<InputFloat[]>(m_control_point_count * 3);
-        for (ScalarIndex i = 0; i < vertices.size(); i++) {
-            InputFloat *vertex_ptr = positions.get() + i * 3;
-            dr::store(vertex_ptr, vertices[i]);
-        }
+        m_indices = adopt<UInt32Storage>(indices);
+        m_curves_prim_idx = adopt<UInt32Storage>(curves_1st_prim_idx);
+        m_segment_count = dr::opaque<Float>((ScalarFloat) segment_count);
+        m_control_points = adopt<FloatStorage>(data.control_points);
 
-        // Merge buffers into m_control_points
-        m_control_points = dr::empty<FloatStorage>(m_control_point_count * 4);
-        FloatStorage vertex_buffer = dr::load<FloatStorage>(positions.get(), m_control_point_count * 3);
-        FloatStorage radius_buffer = dr::load<FloatStorage>(radius.data(), m_control_point_count * 1);
-
-        if constexpr (dr::is_jit_v<Float>) {
-            DynamicBuffer<UInt32> idx = dr::arange<DynamicBuffer<UInt32>>(m_control_point_count);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(vertex_buffer, idx * 3u + 0u), idx * 4u + 0u);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(vertex_buffer, idx * 3u + 1u), idx * 4u + 1u);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(vertex_buffer, idx * 3u + 2u), idx * 4u + 2u);
-            dr::scatter(m_control_points, dr::gather<FloatStorage>(radius_buffer, idx * 1u + 0u), idx * 4u + 3u);
-        } else {
-            for (size_t i = 0; i < m_control_point_count; ++i) {
-                m_control_points[i * 4 + 0] = vertex_buffer[i * 3 + 0];
-                m_control_points[i * 4 + 1] = vertex_buffer[i * 3 + 1];
-                m_control_points[i * 4 + 2] = vertex_buffer[i * 3 + 2];
-                m_control_points[i * 4 + 3] = radius_buffer[i * 1 + 0];
-            }
-        }
-
-        // Compute bounding box
-        m_bbox.reset();
-        for (ScalarSize i = 0; i < m_control_point_count; ++i) {
-            ScalarPoint3f p(positions[3 * i + 0], positions[3 * i + 1],
-                            positions[3 * i + 2]);
-            ScalarFloat r(radius[i]);
-            m_bbox.expand(p + r * ScalarVector3f(-1, 0, 0));
-            m_bbox.expand(p + r * ScalarVector3f(1, 0, 0));
-            m_bbox.expand(p + r * ScalarVector3f(0, -1, 0));
-            m_bbox.expand(p + r * ScalarVector3f(0, 1, 0));
-            m_bbox.expand(p + r * ScalarVector3f(0, 0, -1));
-            m_bbox.expand(p + r * ScalarVector3f(0, 0, 1));
-        }
-
-        ScalarSize control_point_bytes = 4 * sizeof(InputFloat);
         Log(Debug, "\"%s\": read %i control points (%s in %s)",
-            m_name, m_control_point_count,
-            util::mem_string(m_control_point_count * control_point_bytes),
+            data.name, m_control_point_count,
+            util::mem_string(m_control_point_count * 4 * sizeof(InputFloat)),
             util::time_string((float) timer.value())
         );
 
@@ -347,6 +221,7 @@ public:
             recompute_bbox();
             mark_dirty();
         }
+        m_segment_count = dr::opaque<Float>((ScalarFloat) dr::width(m_indices));
         Base::parameters_changed();
     }
 
@@ -364,10 +239,10 @@ public:
 
         // Convert global v to segment-local v
         Float v_global = uv.y();
-        size_t segment_count = dr::width(m_indices);
-        UInt32 segment_idx = dr::floor2int<UInt32>(v_global * segment_count);
-        segment_idx = dr::clip(segment_idx, 0, (uint32_t) segment_count - 1); // In case v_global == 1
-        Float v_local = v_global * segment_count - segment_idx;
+        UInt32 segment_idx = dr::floor2int<UInt32>(v_global * m_segment_count);
+        // In case v_global == 1
+        segment_idx = dr::minimum(segment_idx, UInt32(m_segment_count) - 1u);
+        Float v_local = v_global * m_segment_count - segment_idx;
 
         pi.prim_uv.x() = v_local;
         pi.prim_uv.y() = 0;
@@ -376,8 +251,8 @@ public:
         pi.valid = active;
         dr::masked(pi.t, active) = eps * 10;
 
-        /* Create a ray at the intersection point and offset it by epsilon in
-         the direction of the local surface normal */
+        // Create a ray at the intersection point and offset it by epsilon in
+        // the direction of the local surface normal
         Point3f c;
         Vector3f dc_dv, dc_dvv;
         Float radius, dr_dv;
@@ -397,14 +272,14 @@ public:
         Ray3f ray(o, d, 0, Wavelength(0));
 
         SurfaceInteraction3f si =
-            compute_surface_interaction(ray, pi, ray_flags, 0, active);
+            compute_surface_interaction(ray, pi, ray_flags, active);
         si.finalize_surface_interaction(pi, ray, ray_flags, active);
 
         return si;
     }
 
     // =============================================================
-    //! @{ \name Silhouette sampling routines and other utilities
+    // Silhouette sampling routines and other utilities
     // =============================================================
 
     SilhouetteSample3f sample_silhouette(const Point3f &sample,
@@ -415,7 +290,7 @@ public:
         SilhouetteSample3f ss = dr::zeros<SilhouetteSample3f>();
 
         if (has_flag(flags, DiscontinuityFlags::PerimeterType)) {
-            /// Sample a point on the shape surface
+            // Sample a point on the shape surface
 
             // sample a curve
             size_t curve_count = dr::width(m_curves_prim_idx) - 1;
@@ -439,7 +314,7 @@ public:
             ss.prim_index =
                 dr::select(use_first, first_segment_idx, last_segment_idx);
             ss.uv = Point2f(local_uv.x(),
-                            (local_uv.y() + ss.prim_index) / dr::width(m_indices));
+                            (local_uv.y() + ss.prim_index) / m_segment_count);
 
             // map UV parameterization to point on surface
             Point3f c;
@@ -456,7 +331,7 @@ public:
             auto [sin_u, cos_u] = dr::sincos(local_uv.x() * dr::TwoPi<Float>);
             ss.p = c + cos_u * u_rad * radius + sin_u * u_rot * radius;
 
-            /// Sample a tangential direction at the point
+            // Sample a tangential direction at the point
             Vector3f rad_vec = ss.p - c;
             Float correction = dr::dot(rad_vec, dc_dvv);  // curvature correction
             Normal3f n = dr::normalize(
@@ -465,14 +340,14 @@ public:
             );
             Frame3f frame(n);
 
-            /* Because of backface culling, we only consider the set of
-             * tangential direcitons in the hemisphere which is pointing In
-             * the same direction as the surface normal */
+            // Because of backface culling, we only consider the set of
+            // tangential direcitons in the hemisphere which is pointing In
+            // the same direction as the surface normal
             Vector3f local_d = warp::square_to_uniform_hemisphere(
                 Point2f(sample.y(), sample.z()));
             ss.d = frame.to_world(-local_d);
 
-            /// Fill other fields
+            // Fill other fields
             ss.discontinuity_type = (uint32_t) DiscontinuityFlags::PerimeterType;
             ss.flags = flags;
             ss.silhouette_d =
@@ -490,17 +365,17 @@ public:
             ss.pdf *= warp::square_to_uniform_hemisphere_pdf(local_d);
             ss.foreshortening = dr::norm(dr::cross(ss.d, ss.silhouette_d));
         } else if (has_flag(flags, DiscontinuityFlags::InteriorType)) {
-            /// Sample a point on the shape surface
+            // Sample a point on the shape surface
             ss.uv = Point2f(sample.y(), sample.x()); // We use the x-axis as the cylindrical axis
             auto [dp_du, dp_dv, dn_du, dn_dv, L, M, N] = partials(ss.uv, active);
             SurfaceInteraction3f si = eval_parameterization(
-                ss.uv, +RayFlags::AllNonDifferentiable, active);
+                ss.uv, RayFlags::Default | RayFlags::DetachShape, active);
             ss.p = si.p;
 
-            /// Sample a tangential direction at the point
+            // Sample a tangential direction at the point
             ss.d = warp::interval_to_tangent_direction(si.n, sample.z());
 
-            /// Fill other fields
+            // Fill other fields
             ss.discontinuity_type = (uint32_t) DiscontinuityFlags::InteriorType;
             ss.flags = flags;
             ss.n = si.n;
@@ -531,7 +406,7 @@ public:
                                      Mask active) const override {
         MI_MASK_ARGUMENT(active);
 
-        /// Invert perimeter type samples
+        // Invert perimeter type samples
         Point3f sample_perimeter = dr::zeros<Point3f>(dr::width(ss));
 
         size_t curve_count = dr::width(m_curves_prim_idx) - 1;
@@ -545,8 +420,7 @@ public:
         );
         curve_idx -= 1;
 
-        size_t segment_count = dr::width(m_indices);
-        Float local_v = ss.uv.y() * segment_count - ss.prim_index;
+        Float local_v = ss.uv.y() * m_segment_count - ss.prim_index;
 
         sample_perimeter.x() = dr::select(
             local_v < 0.5f,
@@ -574,13 +448,13 @@ public:
         sample_perimeter.y() = warp::uniform_hemisphere_to_square(local_d).x();
         sample_perimeter.z() = warp::uniform_hemisphere_to_square(local_d).y();
 
-        /// Invert interior type samples
+        // Invert interior type samples
         Point3f sample_interior = dr::zeros<Point3f>(dr::width(ss));
         sample_interior.z() = warp::tangent_direction_to_interval(ss.n, ss.d);
         sample_interior.y() = ss.uv.x();
         sample_interior.x() = ss.uv.y();
 
-        /// Merge outputs
+        // Merge outputs
         Point3f sample = dr::zeros<Point3f>();
         Mask perimeter_samples =
             has_flag(ss.discontinuity_type, DiscontinuityFlags::PerimeterType);
@@ -601,9 +475,8 @@ public:
         } else {
             Point2f uv = dr::detach(si.uv);
 
-            size_t segment_count = dr::width(m_indices);
-            UInt32 segment_id = dr::floor2int<UInt32>(uv.y() * segment_count);
-            Float v_local = uv.y() * segment_count - segment_id;
+            UInt32 segment_id = dr::floor2int<UInt32>(uv.y() * m_segment_count);
+            Float v_local = uv.y() * m_segment_count - segment_id;
 
             Point3f C;
             Vector3f Cv, Cvv, Cvvv;
@@ -649,15 +522,15 @@ public:
             UInt32 last_segment_idx =
                 dr::gather<UInt32>(m_curves_prim_idx, curve_idx + 1, active) - 1;
 
-            size_t segment_count = dr::width(m_indices);
-            Float local_v = si.uv.y() * segment_count - si.prim_index;
+            Float local_v = si.uv.y() * m_segment_count - si.prim_index;
             Float curve_v = Float(local_v + si.prim_index - first_segment_idx) /
                             Float(last_segment_idx - first_segment_idx + 1);
 
             Mask use_first = curve_v < 0.5f;
             local_v = dr::select(use_first, 0.f, 1.f);
             ss.prim_index = dr::select(use_first, first_segment_idx, last_segment_idx);
-            ss.uv = Point2f(si.uv.x(), (local_v + ss.prim_index) / segment_count);
+            ss.uv = Point2f(si.uv.x(),
+                            (local_v + ss.prim_index) / m_segment_count);
 
             // Map UV parameterization to point on surface
             Point3f c;
@@ -678,8 +551,8 @@ public:
                           dr::normalize(dc_dv));
             ss.n = dr::normalize(dr::cross(ss.d, ss.silhouette_d));
 
-            /* Because of backface culling, we only consider the set of
-             * directions which are seeing the outside of the curve */
+            // Because of backface culling, we only consider the set of
+            // directions which are seeing the outside of the curve
             Vector3f rad_vec = ss.p - c;
             Float correction = dr::dot(rad_vec, dc_dvv); // curvature correction
             Normal3f n = dr::normalize(
@@ -692,9 +565,9 @@ public:
                            (uint32_t) DiscontinuityFlags::PerimeterType,
                            (uint32_t) DiscontinuityFlags::Empty);
         } else if (has_flag(flags, DiscontinuityFlags::InteriorType)) {
-            size_t segment_count = dr::width(m_indices);
-            UInt32 segment_id = dr::floor2int<UInt32>(si.uv.y() * segment_count);
-            Float v_local = si.uv.y() * segment_count - segment_id;
+            UInt32 segment_id =
+                dr::floor2int<UInt32>(si.uv.y() * m_segment_count);
+            Float v_local = si.uv.y() * m_segment_count - segment_id;
 
             Point3f c;
             Vector3f dc_dv, dc_dvv, dc_dvvv;
@@ -708,8 +581,8 @@ public:
             std::tie(dir_rot, dir_rad) = local_frame(dc_dv_normalized);
 
             Vector3f OC = c - viewpoint;
-            Float OC_norm = dr::norm(OC);
-            OC /= OC_norm;
+            Float inv_OC_norm = dr::rsqrt(dr::squared_norm(OC));
+            OC *= inv_OC_norm;
 
             // Find a silhouette point by fixing `si.v` (along the curve) and
             // bisecting `si.u`. Only search in a half circle.
@@ -717,7 +590,7 @@ public:
                 auto [sin_u, cos_u] = dr::sincos(u * dr::TwoPi<Float>);
                 Vector3f rad = cos_u * dir_rad + sin_u * dir_rot;
                 return dc_dv_norm * (1.f - radius * dr::dot(dc_dvv_scaled, rad)) *
-                    (radius / OC_norm + dr::dot(OC, rad)) -
+                    (radius * inv_OC_norm + dr::dot(OC, rad)) -
                     dr_dv * dr::dot(OC, dc_dv_normalized);
             };
             Float u_lower = si.uv.x() - 0.25f + math::ShadowEpsilon<Float>,
@@ -763,7 +636,7 @@ public:
 
             ss.uv = Point2f(u_lower, si.uv.y());
             SurfaceInteraction3f si_ = eval_parameterization(
-                ss.uv, +RayFlags::AllNonDifferentiable, active);
+                ss.uv, RayFlags::Default | RayFlags::DetachShape, active);
             ss.p = si_.p;
             ss.n = si_.n;
             ss.d = dr::normalize(ss.p - viewpoint);
@@ -832,7 +705,7 @@ public:
         si.prim_index =
             dr::select(use_first, first_segment_idx, last_segment_idx);
         si.uv = Point2f(local_uv.x(),
-                        (local_uv.y() + si.prim_index) / dr::width(m_indices));
+                        (local_uv.y() + si.prim_index) / m_segment_count);
 
         uint32_t flags = (uint32_t) DiscontinuityFlags::PerimeterType;
         Mask perimeter = active & (sample1 == +DiscontinuityFlags::PerimeterType);
@@ -862,36 +735,27 @@ public:
         return ss;
     }
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Ray tracing routines
+    // Ray tracing routines
     // =============================================================
 
     SurfaceInteraction3f compute_surface_interaction(const Ray3f &ray,
                                                      const PreliminaryIntersection3f &pi,
                                                      uint32_t ray_flags,
-                                                     uint32_t recursion_depth,
                                                      Mask active) const override {
         MI_MASK_ARGUMENT(active);
         constexpr bool IsDiff = dr::is_diff_v<Float>;
 
-        // Early exit when tracing isn't necessary
-        if (!m_is_instance && recursion_depth > 0)
-            return dr::zeros<SurfaceInteraction3f>();
-
         // Fields requirement dependencies
-        bool need_dn_duv = has_flag(ray_flags, RayFlags::dNSdUV) ||
-                           has_flag(ray_flags, RayFlags::dNGdUV);
-        bool need_dp_duv  = has_flag(ray_flags, RayFlags::dPdUV) || need_dn_duv;
-        bool need_uv      = has_flag(ray_flags, RayFlags::UV) || need_dp_duv;
+        bool shading      = has_flag(ray_flags, RayFlags::Shading);
         bool detach_shape = has_flag(ray_flags, RayFlags::DetachShape);
         bool follow_shape = has_flag(ray_flags, RayFlags::FollowShape);
 
-        /* If necessary, temporally suspend gradient tracking for all shape
-           parameters to construct a surface interaction completely detach from
-           the shape. */
+        // If necessary, temporally suspend gradient tracking for all shape
+        // parameters to construct a surface interaction completely detach from
+        // the shape.
         dr::suspend_grad<Float> scope(detach_shape, m_control_points);
 
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
@@ -909,124 +773,106 @@ public:
         Vector3f u_rot, u_rad;
         std::tie(u_rot, u_rad) = local_frame(dc_dv_normalized);
 
+        // Primal geometry at the hit point
+        si.t = pi.t;
+        si.p = dr::detach(ray(pi.t));
+
+        Vector3f rad_vec_d = si.p - dr::detach(c);
+        si.n = dr::normalize(
+            (dr::squared_norm(dr::detach(dc_dv)) -
+             dr::dot(rad_vec_d, dr::detach(dc_dvv))) * rad_vec_d -
+            (dr::detach(dr_dv) * dr::detach(radius)) * dr::detach(dc_dv));
+        si.p_err = ray_error(ray, pi.t, si.n);
+
+        // Surface position at the detached parameterization: the angular
+        // coordinate does not move with the curve.
+        Vector3f rad_vec_dn = dr::normalize(rad_vec_d);
+        Float u = dr::atan2(dr::dot(dr::detach(u_rot), rad_vec_dn),
+                            dr::dot(dr::detach(u_rad), rad_vec_dn));
+        u += dr::select(u < 0.f, dr::TwoPi<Float>, 0.f);
+        u *= dr::InvTwoPi<Float>;
+
+        auto [sin_u, cos_u] = dr::sincos(u * dr::TwoPi<Float>);
+        Point3f p_att = c + (cos_u * u_rad + sin_u * u_rot) * radius;
+
+        si.attach_motion(ray, p_att, ray_flags);
+
         if constexpr (IsDiff) {
-            // Compute attached interaction point (w.r.t curve parameters)
-            Point3f p = ray(pi.t);
-            Vector3f rad_vec = p - c;
-            Vector3f rad_vec_normalized = dr::normalize(rad_vec);
-
-            Float u = dr::atan2(dr::dot(u_rot, rad_vec_normalized),
-                                dr::dot(u_rad, rad_vec_normalized));
-            u += dr::select(u < 0.f, dr::TwoPi<Float>, 0.f);
-            u *= dr::InvTwoPi<Float>;
-            u = dr::detach(u); // u has no motion
-
-            auto [sin_v, cos_v] = dr::sincos(u * dr::TwoPi<Float>);
-            Point3f p_diff = c + cos_v * u_rad * radius + sin_v * u_rot * radius;
-            p = dr::replace_grad(p, p_diff);
-
-            if (follow_shape) {
-                /* FollowShape glues the interaction point with the shape.
-                   Therefore, to also account for a possible differential motion
-                   of the shape, the interaction point must be completely
-                   differentiable w.r.t. the curve parameters. */
-                si.p = p;
-                Float t_diff = dr::sqrt(dr::squared_norm(si.p - ray.o) /
-                                        dr::squared_norm(ray.d));
-                si.t = dr::replace_grad(pi.t, t_diff);
-            } else {
-                /* To ensure that the differential interaction point stays along
-                   the traced ray, we first recompute the intersection distance
-                   in a differentiable way (w.r.t. the curve parameters) and
-                   then compute the corresponding point along the ray. (Instead
-                   of computing an intersection with the curve, we compute an
-                   intersection with the tangent plane.) */
-                Vector3f rad_vec_diff = si.p - c;
-                rad_vec = dr::replace_grad(rad_vec, rad_vec_diff);
-
-                // Differentiable tangent plane normal
-                Float correction = dr::dot(rad_vec, dc_dvv);
-                Vector3f n = dr::normalize(
-                    (dr::squared_norm(dc_dv) - correction) * rad_vec -
-                    (dr_dv * radius) * dc_dv
-                );
-
-                // Tangent plane intersection
-                Float t_diff = dr::dot(p - ray.o, n) / dr::dot(n, ray.d);
-                si.t = dr::replace_grad(pi.t, t_diff);
-                si.p = ray(si.t);
-
-                // Compute `v_local` with correct (hit point) motion
-                Float v_global = (v_local + prim_idx) / dr::width(m_indices);
+            if (!follow_shape) {
+                // Let the curve parameter follow the sliding of the
+                // interaction point across the moving surface
+                Float v_global = (v_local + prim_idx) / m_segment_count;
                 Vector3f dp_dv;
                 std::tie(std::ignore, dp_dv, std::ignore, std::ignore,
                          std::ignore, std::ignore, std::ignore) =
                     partials(Point2f(u, v_global), active);
                 dp_dv = dr::detach(dp_dv);
-                Float dp_dv_sqrnorm = dr::squared_norm(dp_dv);
-                Float v_diff = dr::dot(si.p - p_diff, dp_dv) / dp_dv_sqrnorm;
-                v_global = dr::replace_grad(v_global, v_diff);
-                Float v_local_diff = v_global * dr::width(m_indices) - prim_idx;;
-                v_local =  dr::replace_grad(v_local, v_local_diff);
 
-                // Recompute values with new `v_local` motion
-                std::tie(c, dc_dv, dc_dvv, std::ignore, radius, dr_dv, std::ignore) =
+                Float v_diff = dr::dot(si.p - p_att, dp_dv) /
+                               dr::squared_norm(dp_dv);
+                v_global = dr::replace_grad(v_global, v_global + v_diff);
+                v_local  = dr::replace_grad(
+                    v_local, v_global * m_segment_count - prim_idx);
+
+                // Recompute the center line with the correct motion
+                std::tie(c, dc_dv, dc_dvv, std::ignore, radius, dr_dv,
+                         std::ignore) =
                     cubic_interpolation(v_local, prim_idx, active);
                 dc_dv_normalized = dr::normalize(dc_dv);
                 std::tie(u_rot, u_rad) = local_frame(dc_dv_normalized);
             }
-        } else {
-            si.t = pi.t;
-            si.p = ray(si.t);
         }
-
-        si.t = dr::select(active, si.t, dr::Infinity<Float>);
 
         // Normal
         Vector3f rad_vec = si.p - c;
-        Vector3f rad_vec_normalized = dr::normalize(rad_vec);
         Float correction = dr::dot(rad_vec, dc_dvv);  // curvature correction
-        Normal3f n = dr::normalize(
+        si.n = dr::normalize(
             (dr::squared_norm(dc_dv) - correction) * rad_vec -
             (dr_dv * radius) * dc_dv
         );
-        si.n = si.sh_frame.n = n;
 
         // Embree and OptiX cull curve backfaces at trace time; Metal's HW
         // intersector reports both sides. Drop inside hits to match (a no-op
         // on backends that already cull).
         this->cull_backface(si, ray, active);
 
-        if (need_uv) {
-            Float u = dr::atan2(dr::dot(u_rot, rad_vec_normalized),
-                                dr::dot(u_rad, rad_vec_normalized));
-            u += dr::select(u < 0.f, dr::TwoPi<Float>, 0.f);
-            u *= dr::InvTwoPi<Float>;
-            Float v = (v_local + prim_idx) / dr::width(m_indices);
+        if (shading) {
+            // Recompute the angular coordinate so that it tracks the motion of
+            // the interaction point, unlike the one that defined ``p_att``
+            Vector3f rad_vec_n = dr::normalize(rad_vec);
+            Float u_att = dr::atan2(dr::dot(u_rot, rad_vec_n),
+                                    dr::dot(u_rad, rad_vec_n));
+            u_att += dr::select(u_att < 0.f, dr::TwoPi<Float>, 0.f);
+            u_att *= dr::InvTwoPi<Float>;
+            if constexpr (IsDiff)
+                u_att = dr::replace_grad(u, u_att);
 
-            si.uv = Point2f(u, v);
-        }
+            Float v = (v_local + prim_idx) / m_segment_count;
 
-        if (need_dp_duv) {
+            si.uv = Point2f(u_att, v);
+
             Vector3f dp_du, dp_dv, dn_du, dn_dv;
             std::tie(dp_du, dp_dv, dn_du, dn_dv, std::ignore, std::ignore,
                      std::ignore) = partials(si.uv, active);
             si.dp_du = dp_du;
             si.dp_dv = dp_dv;
-            if (need_dn_duv) {
+
+            if (has_flag(ray_flags, RayFlags::NormalPartials)) {
                 si.dn_du = dn_du;
                 si.dn_dv = dn_dv;
             }
+
+            si.sh_frame.n = si.n;
+            si.sh_frame.s = dp_du;
         }
 
         si.prim_index = pi.prim_index;
         si.shape = this;
-        si.instance = nullptr;
+        si.instance_index = 0;
 
         return si;
     }
 
-    //! @}
     // =============================================================
 
     void describe(ShapeIR &g) const override {
@@ -1055,44 +901,11 @@ public:
     MI_DECLARE_CLASS(BSplineCurve)
 
 private:
-    template <bool Negate, size_t N>
-    void advance(const char **start_, const char *end, const char (&delim)[N]) {
-        const char *start = *start_;
-
-        while (true) {
-            bool is_delim = false;
-            for (size_t i = 0; i < N; ++i)
-                if (*start == delim[i])
-                    is_delim = true;
-            if ((is_delim ^ Negate) || start == end)
-                break;
-            ++start;
-        }
-
-        *start_ = start;
-    }
-
     void recompute_bbox() {
-        m_bbox.reset();
-        if (m_control_point_count == 0)
-            return;
-
-        if constexpr (dr::is_jit_v<Float>) {
-            m_bbox = device_reduce_bbox<ScalarPoint3f>(
-                m_control_points, m_control_point_count, 4, /* radius_offset = */ 3);
-        } else {
-            const InputFloat *ptr = m_control_points.data();
-            for (ScalarSize i = 0; i < m_control_point_count; ++i) {
-                ScalarPoint3f p(ptr[4 * i + 0], ptr[4 * i + 1], ptr[4 * i + 2]);
-                ScalarFloat r(ptr[4 * i + 3]);
-                m_bbox.expand(p + r * ScalarVector3f(-1, 0, 0));
-                m_bbox.expand(p + r * ScalarVector3f(1, 0, 0));
-                m_bbox.expand(p + r * ScalarVector3f(0, -1, 0));
-                m_bbox.expand(p + r * ScalarVector3f(0, 1, 0));
-                m_bbox.expand(p + r * ScalarVector3f(0, 0, -1));
-                m_bbox.expand(p + r * ScalarVector3f(0, 0, 1));
-            }
-        }
+        m_bbox = reduce_bbox<
+            /* Type = */ ScalarPoint3f,
+            /* Stride = */ 4,
+            /* RadiusOffset = */ 3>(m_control_points, m_control_point_count);
     }
 
     std::tuple<Point3f, Vector3f, Vector3f, Vector3f, Float, Float, Float>
@@ -1156,21 +969,20 @@ private:
     }
 
     /**
-     * \brief Returns the position partials, normals partials and the second
+     * Returns the position partials, normals partials and the second
      * fundamental form
      */
     std::tuple<Vector3f, Vector3f, Vector3f, Vector3f, Float, Float, Float>
     partials(Point2f uv, Mask active) const {
-        /* To compute the partial devriatives of a point on the curve and of its
-           normal, we start by building the Frenet-Serret (TNB) frame. From the
-           frame we can compute the curves' first and second fundamental forms.
-           Finally, these are then used in the Weingarten equations to get the
-           normal's partials.
-         */
+        // To compute the partial devriatives of a point on the curve and of its
+        // normal, we start by building the Frenet-Serret (TNB) frame. From the
+        // frame we can compute the curves' first and second fundamental forms.
+        // Finally, these are then used in the Weingarten equations to get the
+        // normal's partials.
         Float v_global = uv.y();
-        size_t segment_count = dr::width(m_indices);
-        UInt32 segment_idx = dr::floor2int<UInt32>(v_global * segment_count);
-        Float v_local = v_global * segment_count - segment_idx;
+        UInt32 segment_idx = dr::floor2int<UInt32>(v_global * m_segment_count);
+        segment_idx = dr::minimum(segment_idx, UInt32(m_segment_count) - 1u);
+        Float v_local = v_global * m_segment_count - segment_idx;
 
         Point3f c;
         Vector3f dc_dv, dc_dvv, dc_dvvv;
@@ -1190,7 +1002,7 @@ private:
         dr::masked(tau, norm_cross_dc_dv_dc_dvv < 1e-6f) = 0.f;  // Numerical stability
         dr::masked(tau, dr::norm(dc_dvvv) < 1e-6f) = 0.f;
 
-        Vector3f frame_t = dc_dv / norm_dc_dv,
+        Vector3f frame_t = dc_dv_normalized,
                  frame_n = dr::normalize(dr::cross(cross_dc_dv_dc_dvv, dc_dv)),
                  frame_b = dr::normalize(dr::cross(frame_t, frame_n));
 
@@ -1230,8 +1042,8 @@ private:
         dp_du *= dr::TwoPi<Float>;
         dp_duv *= dr::TwoPi<Float>;
         dp_duu *= dr::square(dr::TwoPi<Float>);
-        ScalarFloat ratio = (ScalarFloat) dr::width(m_indices),
-                    ratio2 = ratio * ratio;
+        Float ratio = m_segment_count,
+              ratio2 = ratio * ratio;
         dp_dv  *= ratio;
         dp_duv *= ratio;
         dp_dvv *= ratio2;
@@ -1279,9 +1091,13 @@ private:
     mutable UInt32Storage m_indices;
     mutable FloatStorage m_control_points;
 
+    /// Needs to be opaque to not get baked into the kernel
+    mutable Float m_segment_count;
+
     static constexpr float silhouette_offset = 5e-3f;
 
-    MI_TRAVERSE_CB(Base, m_curves_prim_idx, m_indices, m_control_points)
+    MI_TRAVERSE_CB(Base, m_curves_prim_idx, m_indices, m_control_points,
+                   m_segment_count)
 };
 
 MI_EXPORT_PLUGIN(BSplineCurve);

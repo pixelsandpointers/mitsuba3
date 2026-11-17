@@ -12,10 +12,19 @@
 #include <tsl/robin_map.h>
 #include <vector>
 
-/// Forward-declare Embree's opaque scene type.
+/// Forward-declare Embree's opaque scene type and Dr.Jit's binding record.
 struct RTCSceneTy;
+struct JitIsectBinding;
 
 NAMESPACE_BEGIN(mitsuba)
+
+// Native state of a JIT variant's Embree scene
+struct EmbreeSceneState {
+    RTCSceneTy *scene = nullptr;
+
+    /// Recorded intersection function bindings of the custom shapes
+    std::vector<JitIsectBinding *> isect_bindings;
+};
 
 /// Vectorized CPU ray tracing acceleration via Embree
 template <typename Float, typename Spectrum>
@@ -38,9 +47,12 @@ struct EmbreeAccel {
     PreliminaryIntersection3f ray_intersect_preliminary(
         const Scene<Float, Spectrum> *scene, const Ray3f &ray, Mask coherent,
         bool reorder, UInt32 reorder_hint, uint32_t reorder_hint_bits,
-        Mask active) const;
-    Mask ray_test(const Scene<Float, Spectrum> *scene, const Ray3f &ray,
-                  Mask coherent, Mask active) const;
+        Mask active, UInt32 ray_mask) const;
+    ShadowTest<Mask> ray_test(const Scene<Float, Spectrum> *scene,
+                              const Ray3f &ray, Mask coherent, Mask active,
+                              UInt32 ray_mask,
+                              bool skip_null) const;
+    static constexpr bool stops_at_first_hit = false;
     /// Embree has no brute-force traversal; defer to the accelerated path.
     SurfaceInteraction3f ray_intersect_naive(
         const Scene<Float, Spectrum> *scene, const Ray3f &ray,
@@ -48,23 +60,61 @@ struct EmbreeAccel {
 
     // --- Declarative traversal ---
     DRJIT_TRAVERSE(EmbreeAccel, accel_handle, func_handle,
-                   occlude_handle, shapes_registry_ids)
+                   occlude_handle)
 
-    /// Native Embree scene, lifetime tied to ``accel_handle`` in JIT variants.
+    /// Native Embree scene, lifetime tied to ``accel_handle`` in JIT variants
     RTCSceneTy *accel = nullptr;
-    std::vector<int> geometries;
+
+    /// Bindings and the scene's deferred release (JIT variants only)
+    EmbreeSceneState *state = nullptr;
+
+    /// Geometry IDs currently attached to ``accel`` (detached on rebuild)
+    std::vector<unsigned int> geometries;
+
+    /// Whether this scene was created while another scene renders (see init())
     bool is_nested_scene = false;
-    /// One nested Embree scene per ShapeGroup, shared by its Instances.
+
+    /// One nested Embree scene per ShapeGroup, shared by its Instances
     tsl::robin_map<const void *, RTCSceneTy *, PointerHasher> group_scenes;
-    /// Width-specialized Embree entry points.
+
+    /// Width-specialized Embree closest-hit entry point
     void *func_ptr = nullptr;
+
+    /// Width-specialized Embree any-hit (shadow ray) entry point
     void *occlude_func_ptr = nullptr;
 
-    /// Freeze-visible handles and shape recovery table.
+    /// Freeze-visible handle owning ``accel``
     UInt64 accel_handle;
+
+    /// Freeze-visible handle wrapping ``func_ptr``
     UInt64 func_handle;
+
+    /// Freeze-visible handle wrapping ``occlude_func_ptr``
     UInt64 occlude_handle;
-    DynamicBuffer<UInt32> shapes_registry_ids;
+
+    /// Number of instances.
+    /// The Embree backends reserve the geometry IDs [0, instance_count) for
+    /// instances, so that a hit's ``instID`` can be directly interpreted as the
+    /// instance index. Non-instanced geometry follows at ``instance_count``
+    /// plus its registry ID (LLVM mode) or sequentially (scalar mode)
+    uint32_t instance_count = 0;
+
+    /// Scene-wide keyframe bounds used to normalize ray and keyframe times
+    /// to Embree's ``[0, 1]`` interval.
+    ScalarFloat time_min = 0.f;
+    ScalarFloat time_max = 0.f;
+
+    /**
+     * Map a ray time onto Embree's ``[0, 1]`` interval
+     *
+     * Clamp times outside the combined range of all animated instances
+     * to the nearest boundary.
+     */
+    template <typename Value> Value normalize_ray_time(const Value &time) const {
+        if (time_max <= time_min)
+            return Value(0.f);
+        return dr::clip((time - Value(time_min)) / Value(time_max - time_min), 0.f, 1.f);
+    }
 };
 
 NAMESPACE_END(mitsuba)

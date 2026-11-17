@@ -14,7 +14,7 @@ MI_VARIANT std::pair<Spectrum, Float>
 BSDF<Float, Spectrum>::eval_pdf(const BSDFContext &ctx,
                                 const SurfaceInteraction3f &si,
                                 const Vector3f &wo,
-                                Mask active) const {
+                                     Mask active) const {
     return { eval(ctx, si, wo, active), pdf(ctx, si, wo, active) };
 }
 
@@ -30,16 +30,29 @@ BSDF<Float, Spectrum>::eval_pdf_sample(const BSDFContext &ctx,
         return { e_val, pdf_val, bs, bsdf_weight };
 }
 
-MI_VARIANT Spectrum BSDF<Float, Spectrum>::eval_null_transmission(
+MI_VARIANT Spectrum BSDF<Float, Spectrum>::eval_null(
     const SurfaceInteraction3f & /* si */, Mask /* active */) const {
     return 0.f;
 }
 
-MI_VARIANT Spectrum BSDF<Float, Spectrum>::eval_diffuse_reflectance(
-    const SurfaceInteraction3f &si, Mask active) const {
-    Vector3f wo = Vector3f(0.0f, 0.0f, 1.0f);
-    BSDFContext ctx;
-    return eval(ctx, si, wo, active) * dr::Pi<Float>;
+MI_VARIANT typename BSDF<Float, Spectrum>::BSDFFeatures3f
+BSDF<Float, Spectrum>::eval_features(const SurfaceInteraction3f &si,
+                                     Mask active) const {
+    BSDFFeatures3f features = dr::zeros<BSDFFeatures3f>();
+    features.sh_frame = si.sh_frame;
+    if (has_flag(BSDFFlags::Null)) {
+        features.specular_transmittance = 1.f;
+        features.wt = -si.to_world(si.wi);
+    } else if (has_flag(BSDFFlags::Smooth)) {
+        BSDFContext ctx;
+        features.diffuse_albedo = dr::minimum(
+            unpolarized_spectrum(eval(ctx, si, Vector3f(0.f, 0.f, 1.f), active)) *
+                dr::Pi<Float>, 1.f);
+        features.roughness = 1.f;
+    } else {
+        features.specular_reflectance = 1.f;
+    }
+    return features;
 }
 
 template <typename Texture, typename Type>
@@ -68,6 +81,9 @@ struct AttributeCallback : public TraversalCallback {
     };
 
     std::string name;
+
+    /// Was an attribute of this name found? Attributes that the BSDF does
+    /// not carry leave `result` at zero (see `BSDF::has_attribute()`)
     bool found;
     Type result;
     F1 func_object;
@@ -90,10 +106,6 @@ BSDF<Float, Spectrum>::eval_attribute(const std::string &name,
     );
     const_cast<BSDF<Float, Spectrum>*>(this)->traverse((TraversalCallback *) &cb);
 
-    if (!cb.found)
-        if constexpr (!dr::is_jit_v<Float>)
-            Throw("Invalid attribute requested %s.", name.c_str());
-
     return cb.result;
 }
 
@@ -107,10 +119,6 @@ BSDF<Float, Spectrum>::eval_attribute_1(const std::string& name,
     );
     const_cast<BSDF<Float, Spectrum>*>(this)->traverse((TraversalCallback *) &cb);
 
-    if (!cb.found)
-        if constexpr (!dr::is_jit_v<Float>)
-            Throw("Invalid attribute requested %s.", name.c_str());
-
     return cb.result;
 }
 
@@ -123,10 +131,6 @@ BSDF<Float, Spectrum>::eval_attribute_3(const std::string& name,
         [&](Texture *texture) { return texture->eval_3(si, active); }
     );
     const_cast<BSDF<Float, Spectrum>*>(this)->traverse((TraversalCallback *) &cb);
-
-    if (!cb.found)
-        if constexpr (!dr::is_jit_v<Float>)
-            Throw("Invalid attribute requested %s.", name.c_str());
 
     return cb.result;
 }
@@ -237,6 +241,11 @@ std::string type_mask_to_string(Index type_mask) {
         oss << "anisotropic ";
         type_mask = type_mask & ~BSDFFlags::Anisotropic;
     }
+    if (has_flag(type_mask, BSDFFlags::NormalMapped)) {
+        add_separator();
+        oss << "normal_mapped ";
+        type_mask = type_mask & ~BSDFFlags::NormalMapped;
+    }
     if (has_flag(type_mask, BSDFFlags::FrontSide)) {
         add_separator();
         oss << "front_side ";
@@ -256,11 +265,6 @@ std::string type_mask_to_string(Index type_mask) {
         add_separator();
         oss << "non_symmetric ";
         type_mask = type_mask & ~BSDFFlags::NonSymmetric;
-    }
-    if (has_flag(type_mask, BSDFFlags::NeedsDifferentials)) {
-        add_separator();
-        oss << "needs_differentials ";
-        type_mask = type_mask & ~BSDFFlags::NeedsDifferentials;
     }
 
     Assert(type_mask == 0);

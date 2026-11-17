@@ -3,7 +3,7 @@ from __future__ import annotations # Delayed parsing of type annotations
 import drjit as dr
 import mitsuba as mi
 
-from .common import RBIntegrator, mis_weight, solid_angle_to_area_jacobian
+from .common import RBIntegrator, mis_weight, reattach_wi, reattach_wo
 
 class PRBIntegrator(RBIntegrator):
     r"""
@@ -27,10 +27,6 @@ class PRBIntegrator(RBIntegrator):
          the *russian roulette* path termination criterion. For example, if set to
          1, then path generation many randomly cease after encountering directly
          visible surfaces. (Default: 5)
-
-     * - hide_emitters
-       - |bool|
-       - Hide directly visible emitters. (Default: no, i.e. |false|)
 
     This plugin implements a basic Path Replay Backpropagation (PRB) integrator
     with the following properties:
@@ -76,7 +72,7 @@ class PRBIntegrator(RBIntegrator):
                **kwargs # Absorbs unused arguments
     ) -> Tuple[mi.Spectrum, mi.Bool, List[mi.Float], mi.Spectrum]:
         """
-        See ``ADIntegrator.sample()`` for a description of this interface and
+        See `ADIntegrator.sample` for a description of this interface and
         the role of the various parameters and return values.
         """
 
@@ -96,27 +92,25 @@ class PRBIntegrator(RBIntegrator):
         β = mi.Spectrum(1)                               # Path throughput weight
         η = mi.Float(1)                                  # Index of refraction
         active = mi.Bool(active)                         # Active SIMD lanes
+
+        # The camera mask hides emitters marked as invisible
         pi = scene.ray_intersect_preliminary(ray,        # Current interaction
                                              coherent=True,
                                              reorder=False,
-                                             active=active)
+                                             active=active,
+                                             ray_mask=mi.RayMask.Primary)
 
-        # Variables caching information from the previous bounce
+        # Variables caching information from the previous bounce. Null
+        # crossings are not path vertices and leave them unchanged.
         ray_prev        = mi.Ray3f(ray)
         pi_prev         = dr.zeros(mi.PreliminaryIntersection3f)
         si_prev         = dr.zeros(mi.SurfaceInteraction3f)
         bsdf_pdf_prev   = mi.Float(1.0)
         bsdf_delta_prev = mi.Bool(True)
+        ray_mask        = mi.UInt32(mi.RayMask.Primary)
 
-        # ---------------------- Hide area emitters ----------------------
-
-        if dr.hint(self.hide_emitters, mode='scalar'):
-            # Did we hit an area emitter? If so, skip all area emitters along this ray
-            skip_emitters = pi.is_valid() & (pi.shape.emitter() != None) & active
-            si_skip = pi.compute_surface_interaction(ray, mi.RayFlags.Minimal, skip_emitters)
-            ray_skip = si_skip.spawn_ray(ray.d)
-            pi_after_skip = self.skip_area_emitters(scene, ray_skip, True, skip_emitters)
-            pi[skip_emitters] = pi_after_skip
+        # Null tests fold to literals in scenes without null shapes
+        has_null = scene.has_null_shapes()
 
         while dr.hint(active,
                       max_iterations=self.max_depth,
@@ -127,30 +121,24 @@ class PRBIntegrator(RBIntegrator):
             # from differentiable shape parameters (position, normals, etc.)
             # In primal mode, this is just an ordinary ray tracing operation.
             with dr.resume_grad(when=not primal):
-                si = pi.compute_surface_interaction(ray, ray_flags=mi.RayFlags.All)
+                si = scene.compute_surface_interaction(ray, pi, ray_flags=mi.RayFlags.Default)
 
                 # Recompute an attached si.wi to account for motion of the
                 # previous surface interaction
                 if (not primal) & mi.Bool(depth >= 1):
-                    si_prev_diff = pi_prev.compute_surface_interaction(
-                        ray_prev, ray_flags=mi.RayFlags.Minimal
-                    )
-                    si_prev = dr.replace_grad(si_prev, si_prev_diff)
-                    si_detached = dr.detach(si) # Ignore motion of current point
-                    wi_global = dr.normalize(si_prev.p - si_detached.p)
-                    si.wi = dr.replace_grad(si.wi, si_detached.to_local(wi_global))
+                    si_prev_diff = dr.replace_grad(si_prev, scene.compute_surface_interaction(
+                        ray_prev, pi_prev, ray_flags=mi.RayFlags.Minimal))
+                    reattach_wi(si, si_prev_diff.p)
 
-            # Get the BSDF, potentially computes texture-space differentials
-            bsdf = si.bsdf(ray)
+            # Get the BSDF
+            bsdf = si.bsdf()
+            bsdf_flags = bsdf.flags()
 
             # ---------------------- Direct emission ----------------------
 
-            # Hide the environment emitter if necessary
-            if dr.hint(self.hide_emitters, mode='scalar'):
-                active_next &= ~((depth == 0) & ~si.is_valid())
-
-            # Compute MIS weight for emitter sample from previous bounce
-            ds = mi.DirectionSample3f(scene, si=si, ref=si_prev)
+            # The emitter lookup uses the mask of the ray that produced si
+            ds = mi.DirectionSample3f(scene, si=si, ref=si_prev,
+                                      ray_mask=ray_mask)
 
             mis = mis_weight(
                 bsdf_pdf_prev,
@@ -162,52 +150,21 @@ class PRBIntegrator(RBIntegrator):
 
             # ---------------------- Emitter sampling ----------------------
 
-            # Should we continue tracing to reach one more vertex?
-            active_next &= (depth + 1 < self.max_depth) & si.is_valid()
+            # Continue tracing? Null crossings don't count towards max_depth
+            depth_ok = depth + 1 < self.max_depth
+            can_cross = mi.has_flag(bsdf_flags, mi.BSDFFlags.Null) if has_null else mi.Bool(False)
+            active_next &= si.is_valid() & (depth_ok | can_cross)
 
             # Is emitter sampling even possible on the current vertex?
-            active_em = active_next & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth)
+            active_em = active_next & depth_ok & \
+                        mi.has_flag(bsdf_flags, mi.BSDFFlags.Smooth)
 
-            # If so, randomly sample an emitter without derivative tracking.
-            ds, em_weight = scene.sample_emitter_direction(
-                si, sampler.next_2d(), True, active_em)
-            active_em &= (ds.pdf != 0.0)
-
+            # If so, sample an emitter. The sample is detached, and its
+            # weight is attached to the emitter and to the motion of 'si'.
             with dr.resume_grad(when=not primal):
-                if dr.hint(not primal, mode='scalar'):
-                    is_surface = mi.has_flag(ds.emitter.flags(), mi.EmitterFlags.Surface)
-                    is_infinite = mi.has_flag(ds.emitter.flags(), mi.EmitterFlags.Infinite)
-                    is_spatially_varying = mi.has_flag(ds.emitter.flags(), mi.EmitterFlags.SpatiallyVarying)
-
-                    # For textured area lights, we need to track UV changes on
-                    # the emitter if it is moving
-                    textured_area_em = active_em & is_surface & is_spatially_varying
-                    ray_em = si.spawn_ray_to(ds.p)
-                    # Move ray origin closer, visibibliy is already accounted for
-                    ray_em.o = dr.fma(ray_em.d, ray_em.maxt, ray_em.o)
-                    ray_em.maxt = dr.largest(ray_em.maxt)
-                    si_em = scene.ray_intersect(ray_em, textured_area_em)
-
-                    # Re-attach gradients for the the `ds` struct
-                    ds_diff = mi.DirectionSample3f(scene, si_em, si)
-                    ds_diff = dr.select(textured_area_em, ds_diff, dr.zeros(mi.DirectionSample3f))
-                    ds_diff.d = dr.select(textured_area_em, ds_diff.d, dr.normalize(ds.p - si.p))
-                    ds_diff.d = dr.select(~is_infinite, ds_diff.d, ds.d)
-                    ds = dr.replace_grad(ds, ds_diff)
-
-                    # If the current interaction point is moving, we need
-                    # to differentiate the solid angle to surface area
-                    # reparameterization.
-                    J = solid_angle_to_area_jacobian(
-                        si.p, dr.detach(ds.p), dr.detach(ds.n), active_em & is_surface
-                    )
-
-                    # Given the detached emitter sample, *recompute* its
-                    # contribution with AD to enable light source optimization
-                    em_val_diff = scene.eval_emitter_direction(si, ds, active_em)
-                    inv_ds_pdf = dr.select(ds.pdf != 0, dr.rcp(ds.pdf), 0)
-                    em_weight = dr.replace_grad(em_weight, em_val_diff * dr.detach(inv_ds_pdf))
-                    em_weight *= dr.relative_grad(J)
+                ds, em_weight = scene.sample_emitter_direction(
+                    si, sampler.next_2d(), test_visibility=True, active=active_em)
+                active_em &= (ds.pdf != 0.0)
 
                 # Evaluate BSDF * cos(theta) differentiably
                 wo = si.to_local(ds.d)
@@ -229,12 +186,6 @@ class PRBIntegrator(RBIntegrator):
             η *= bsdf_sample.eta
             β *= bsdf_weight
 
-            # Information about the current vertex needed by the next iteration
-
-            si_prev = dr.detach(si, True)
-            bsdf_pdf_prev = bsdf_sample.pdf
-            bsdf_delta_prev = mi.has_flag(bsdf_sample.sampled_type, mi.BSDFFlags.Delta)
-
             # -------------------- Stopping criterion ---------------------
 
             # Don't run another iteration if the throughput has reached zero
@@ -251,44 +202,51 @@ class PRBIntegrator(RBIntegrator):
             rr_continue = sampler.next_1d() < rr_prob
             active_next &= ~rr_active | rr_continue
 
+            # Information about the current vertex needed by the next
+            # iteration (unchanged by null crossings)
+            null = bsdf_sample.is_null() if has_null else mi.Bool(False)
+            scattered = si.is_valid() & ~null
+            si_prev[scattered]         = dr.detach(si, True)
+            pi_prev[scattered]         = pi
+            ray_prev[scattered]        = ray
+            bsdf_pdf_prev[scattered]   = bsdf_sample.pdf
+            bsdf_delta_prev[scattered] = bsdf_sample.is_delta()
+            # A specular event leaves the visibility class unchanged
+            ray_mask[scattered & ~bsdf_sample.is_delta()] = \
+                mi.RayMask.Secondary
+            depth[scattered]          += 1
+            active_next &= depth_ok | ~scattered
+
             # ----------------- Find the next interaction -----------------
 
             pi_next = scene.ray_intersect_preliminary(ray_next,
                                                       coherent=False,
                                                       reorder=False,
-                                                      active=active_next)
+                                                      active=active_next,
+                                                      ray_mask=ray_mask)
 
             # ------------------ Differential phase only ------------------
 
             if dr.hint(not primal, mode='scalar'):
-                si_next = pi_next.compute_surface_interaction(ray_next,
-                                                              ray_flags=mi.RayFlags.Minimal,
-                                                              active=active_next)
+                si_next = scene.compute_surface_interaction(
+                    ray_next, pi_next, ray_flags=mi.RayFlags.Minimal,
+                    active=active_next)
 
                 with dr.resume_grad():
-                    # If the current interaction point is moving, we need
-                    # to differentiate the solid angle to surface area
-                    # reparameterization.
-                    J = solid_angle_to_area_jacobian(
-                        si.p, si_next.p, si_next.n, active_next & si_next.is_valid()
-                    )
-
                     # 'L' stores the reflected radiance at the current vertex
                     # but does not track parameter derivatives. The following
                     # addresses this by canceling the detached BSDF value and
                     # replacing it with an equivalent term that has derivative
-                    # tracking enabled.
+                    # tracking enabled. The direction to the next vertex and
+                    # the geometry term account for the motion of 'si'.
+                    wo, J = reattach_wo(si, si_next, ray_next, active_next)
 
-                    # Recompute 'wo' to propagate derivatives to cosine term
-                    wo_world_diff = dr.normalize(si_next.p - si.p)
-                    wo_world = dr.replace_grad(
-                        ray_next.d,
-                        dr.select(si_next.is_valid(), wo_world_diff, ray_next.d)
-                    )
-                    wo = si.to_local(wo_world)
-
-                    # Re-evaluate BSDF * cos(theta) differentiably
+                    # Re-evaluate BSDF * cos(theta) differentiably. A null
+                    # crossing continues with the null transmission instead.
                     bsdf_val = bsdf.eval(bsdf_ctx, si, wo, active_next)
+                    if dr.hint(has_null, mode='scalar'):
+                        null &= active_next
+                        bsdf_val[null] = bsdf.eval_null(si, null)
 
                     # Differentiable version of the reflected radiance.
                     Lr_ind = L * dr.relative_grad(bsdf_val) * dr.relative_grad(J)
@@ -296,7 +254,7 @@ class PRBIntegrator(RBIntegrator):
                     # Differentiable Monte Carlo estimate of all contributions
                     Lo = Le + Lr_dir + Lr_ind
 
-                    attached_contrib = dr.flag(dr.JitFlag.VCallRecord) and not dr.grad_enabled(Lo)
+                    attached_contrib = dr.flag(dr.JitFlag.SymbolicCalls) and not dr.grad_enabled(Lo)
                     if dr.hint(attached_contrib, mode='scalar'):
                         raise Exception(
                             "The contribution computed by the differential "
@@ -323,12 +281,8 @@ class PRBIntegrator(RBIntegrator):
 
             # ------------------ Update loop variables ------------------
 
-            depth[si.is_valid()] += 1
             active = active_next
-
-            pi_prev = pi
             pi = pi_next
-            ray_prev = ray
             ray = ray_next
 
         return (

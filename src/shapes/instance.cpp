@@ -1,3 +1,4 @@
+#include <mitsuba/core/animated_transform.h>
 #include <mitsuba/core/fwd.h>
 #include <mitsuba/core/properties.h>
 #include <mitsuba/render/fwd.h>
@@ -54,8 +55,7 @@ details on how to create instances, refer to the :ref:`shape-shapegroup` plugin.
 template <typename Float, typename Spectrum>
 class Instance final: public Shape<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Shape, m_to_world, m_shape_type,
-                   mark_dirty)
+    MI_IMPORT_BASE(Shape, m_to_world, m_shape_type, m_visibility, mark_dirty)
     MI_IMPORT_TYPES(BSDF)
 
     using typename Base::ScalarSize;
@@ -63,7 +63,14 @@ public:
     using ShapeGroup_ = ShapeGroup<Float, Spectrum>;
 
     Instance(const Properties &props) : Base(props) {
+        m_to_world_anim =
+            AnimatedTransform4f::from_properties(props, "to_world").second;
+
         for (auto &prop : props.objects()) {
+            // An <animation> arrives as an object property
+            if (prop.try_get<AnimatedTransform4f>())
+                continue;
+
             ShapeGroup_ *shapegroup = prop.try_get<ShapeGroup_>();
             if (!shapegroup)
                 Throw("Only a shapegroup can be specified in an instance.");
@@ -75,21 +82,35 @@ public:
         if (!m_shapegroup)
             Throw("A reference to a 'shapegroup' must be specified!");
 
+        if (m_visibility != ShapeVisibility::All)
+            Throw("Instances cannot be hidden from primary or secondary rays. "
+                  "Set 'visibility' on the shapes of the referenced shape group instead.");
+
         m_shape_type = ShapeType::Instance;
+
+        if (m_to_world_anim)
+            m_to_world_anim->ensure_uniform_keyframes();
 
         dr::make_opaque(m_to_world);
     }
 
     void traverse(TraversalCallback *cb) override {
-        cb->put("to_world", m_to_world, ParamFlags::NonDifferentiable);
+        auto flags = ParamFlags::Differentiable | ParamFlags::Discontinuous;
+        if (m_to_world_anim)
+            cb->put("to_world", m_to_world_anim, flags);
+        else
+            cb->put("to_world", m_to_world, flags);
     }
 
     void parameters_changed(const std::vector<std::string> &keys) override {
         if (keys.empty() || string::contains(keys, "to_world")) {
-            m_to_world = m_to_world.value().update();
+            if (m_to_world_anim)
+                m_to_world_anim->ensure_uniform_keyframes();
+            else
+                m_to_world = m_to_world.value().update();
             mark_dirty();
         }
-        Base::parameters_changed();
+        Base::parameters_changed(keys);
     }
 
     ScalarBoundingBox3f bbox() const override {
@@ -98,6 +119,9 @@ public:
         // If the shape group is empty, return the invalid bbox
         if (!bbox.valid())
             return bbox;
+
+        if (m_to_world_anim)
+            return m_to_world_anim->get_spatial_bounds(bbox);
 
         ScalarBoundingBox3f result;
         for (int i = 0; i < 8; ++i)
@@ -111,22 +135,21 @@ public:
         return m_shapegroup->primitive_count();
     }
 
-    //! @}
     // =============================================================
 
     // =============================================================
-    //! @{ \name Ray tracing routines
+    // Ray tracing routines
     // =============================================================
 
     template <typename FloatP, typename Ray3fP>
     std::tuple<dr::mask_t<FloatP>, FloatP, Point<FloatP, 2>,
                dr::uint32_array_t<FloatP>, dr::uint32_array_t<FloatP>>
     ray_intersect_preliminary_impl(const Ray3fP &ray,
-                                   ScalarIndex /*prim_index*/,
+                                   dr::uint32_array_t<FloatP> /*prim_index*/,
                                    dr::mask_t<FloatP> active) const {
         MI_MASK_ARGUMENT(active);
         if constexpr (!dr::is_array_v<FloatP>) {
-            return m_shapegroup->ray_intersect_preliminary_scalar(m_to_world.scalar().inverse() * ray);
+            return m_shapegroup->ray_intersect_preliminary_scalar(to_world_scalar_at(ray.time).inverse() * ray);
         } else {
             Throw("Instance::ray_intersect_preliminary() should only be called with scalar types.");
         }
@@ -134,12 +157,12 @@ public:
 
     template <typename FloatP, typename Ray3fP>
     dr::mask_t<FloatP> ray_test_impl(const Ray3fP &ray,
-                                     ScalarIndex /*prim_index*/,
+                                     dr::uint32_array_t<FloatP> /*prim_index*/,
                                      dr::mask_t<FloatP> active) const {
         MI_MASK_ARGUMENT(active);
 
         if constexpr (!dr::is_array_v<FloatP>) {
-            return m_shapegroup->ray_test_scalar(m_to_world.scalar().inverse() * ray);
+            return m_shapegroup->ray_test_scalar(to_world_scalar_at(ray.time).inverse() * ray);
         } else {
             Throw("Instance::ray_test_impl() should only be called with scalar types.");
         }
@@ -147,122 +170,49 @@ public:
 
     MI_SHAPE_DEFINE_RAY_INTERSECT_METHODS()
 
-    SurfaceInteraction3f compute_surface_interaction(const Ray3f &ray,
-                                                     const PreliminaryIntersection3f &pi,
-                                                     uint32_t ray_flags,
-                                                     uint32_t recursion_depth,
-                                                     Mask active) const override {
-        MI_MASK_ARGUMENT(active);
-
-        const AffineTransform4f& to_world  = m_to_world.value();
-        AffineTransform4f to_object = to_world.inverse();
-
-        constexpr bool IsDiff = dr::is_diff_v<Float>;
-        bool grad_enabled = dr::grad_enabled(to_world);
-
-        if constexpr (IsDiff) {
-            if (grad_enabled && m_shapegroup->parameters_grad_enabled())
-                Throw("Cannot differentiate instance parameters and shapegroup "
-                      "internal parameters at the same time!");
-        }
-
-        // Nested instancing is not supported
-        if (recursion_depth > 0)
-            return dr::zeros<SurfaceInteraction3f>();
-
-        bool detach_shape = has_flag(ray_flags, RayFlags::DetachShape);
-        bool follow_shape = has_flag(ray_flags, RayFlags::FollowShape);
-
-        /* If necessary, temporally suspend gradient tracking for all shape
-           parameters to construct a surface interaction completely detach from
-           the shape. */
-        dr::suspend_grad<Float> scope(detach_shape, to_world, to_object);
-
-        SurfaceInteraction3f si;
-        {
-            /* Temporally suspend gradient tracking when `to_world` need to be
-               differentiated as the various terms of `si` will be recomputed
-               to account for the motion of `si` already. */
-            dr::suspend_grad<Float> scope2(grad_enabled);
-            si = m_shapegroup->compute_surface_interaction(
-                to_object * ray, pi, ray_flags,
-                recursion_depth, active);
-        }
-
-        // Hit point `si.p` is only attached to the surface motion
-        si.p = to_world * si.p;
-        si.n = dr::normalize(dr::detach(to_world) * si.n);
-        if (likely(has_flag(ray_flags, RayFlags::ShadingFrame)))
-            si.sh_frame.n = dr::normalize(dr::detach(to_world) * si.sh_frame.n);
-
-        if constexpr (IsDiff) {
-            if (follow_shape && grad_enabled) {
-                /* Recompute si.t in a differential manner as the distance
-                   between the ray origin and the hit point following the moving
-                   surface. */
-                si.t = dr::sqrt(dr::squared_norm(si.p - ray.o) / dr::squared_norm(ray.d));
-            } else if (!follow_shape && grad_enabled) {
-                /* Differential recomputation of the intersection of the ray
-                   with the moving plane tangent to the hit point. In this
-                   scenario, it is important that `si.p` stays along the ray as
-                   the surface moves. */
-                si.t = (dr::dot(si.n, si.p) - dr::dot(si.n, ray.o)) / dr::dot(si.n, ray.d);
-                si.p = ray(si.t);
-                // TODO what can we do about the normals? Take into account curvature?
-                // TODO si.uv should be attached but we don't know about the underlying parameterization
-            }
-        }
-
-        if (likely(has_flag(ray_flags, RayFlags::ShadingFrame)))
-            si.initialize_sh_frame();
-
-        if (likely(has_flag(ray_flags, RayFlags::dPdUV))) {
-            si.dp_du = to_world * si.dp_du;
-            si.dp_dv = to_world * si.dp_dv;
-        }
-
-        if (has_flag(ray_flags, RayFlags::dNGdUV) || has_flag(ray_flags, RayFlags::dNSdUV)) {
-            Normal3f n = has_flag(ray_flags, RayFlags::dNGdUV) ? si.n : si.sh_frame.n;
-
-            // Determine the length of the transformed normal before it was re-normalized
-            Normal3f tn = to_world * dr::normalize(to_object * n);
-            Float inv_len = dr::rcp(dr::norm(tn));
-            tn *= inv_len;
-
-            // Apply transform to dn_du and dn_dv
-            si.dn_du = to_world * Normal3f(si.dn_du) * inv_len;
-            si.dn_dv = to_world * Normal3f(si.dn_dv) * inv_len;
-
-            si.dn_du -= tn * dr::dot(tn, si.dn_du);
-            si.dn_dv -= tn * dr::dot(tn, si.dn_dv);
-        }
-
-        si.prim_index = pi.prim_index;
-        si.instance = this;
-
-        return si;
-    }
-
-    //! @}
     // =============================================================
 
     std::string to_string() const override {
         std::ostringstream oss;
-            oss << "Instance[" << std::endl
-                << "  shapegroup = " << string::indent(m_shapegroup) << std::endl
-                << "  to_world = " << string::indent(m_to_world, 13) << "," << std::endl
-                << "]";
+        oss << "Instance[" << std::endl
+            << "  shapegroup = " << string::indent(m_shapegroup) << std::endl
+            << "  to_world = "
+            << string::indent(AnimatedTransform4f::transform_string(
+                                  m_to_world.scalar(), m_to_world_anim.get()), 13)
+            << "," << std::endl
+            << "]";
         return oss.str();
     }
 
     bool parameters_grad_enabled() const override {
-        return dr::grad_enabled(m_to_world) || m_shapegroup->parameters_grad_enabled();
+        return dr::grad_enabled(m_to_world) ||
+               m_shapegroup->parameters_grad_enabled();
+    }
+
+    const AnimatedTransform4f *to_world_anim() const override {
+        return m_to_world_anim.get();
     }
 
     void describe(ShapeIR &g) const override {
         g.kind = ShapeIR::Kind::Instance;
-        g.type = m_shape_type;
         g.ctx = this;
+
+        // Animated instances are emitted as decomposed keyframes. A static one
+        // is described by 'to_world' below.
+        if (m_to_world_anim) {
+            for (const auto &[time, kf] : m_to_world_anim->keyframes()) {
+                KeyframeIR kf_ir;
+                kf_ir.time = (float) time;
+                for (size_t i = 0; i < 3; ++i) {
+                    kf_ir.scale[i] = (float) kf.S[i];
+                    kf_ir.trans[i] = (float) kf.T[i];
+                }
+                for (size_t i = 0; i < 4; ++i)
+                    kf_ir.quat[i] = (float) kf.Q[i];
+                g.keyframes.push_back(kf_ir);
+            }
+        }
+
         // Column-major 3x4 affine (to_world[col*3 + row]). Each backend repacks
         // into its instance-descriptor convention.
         const auto &M = m_to_world.scalar().matrix;
@@ -275,9 +225,18 @@ public:
 
     MI_DECLARE_CLASS(Instance)
 private:
+    /// Return the scalar object-to-world transformation at ``time``
+    ScalarAffineTransform4f to_world_scalar_at(ScalarFloat time) const {
+        return m_to_world_anim ? m_to_world_anim->eval_scalar(time)
+                               : m_to_world.scalar();
+    }
+
    ref<ShapeGroup_> m_shapegroup;
 
-   MI_TRAVERSE_CB(Base, m_shapegroup)
+   /// Animated object-to-world transformation, or ``nullptr`` if it is constant
+   ref<AnimatedTransform4f> m_to_world_anim;
+
+   MI_TRAVERSE_CB(Base, m_shapegroup, m_to_world_anim)
 };
 
 MI_EXPORT_PLUGIN(Instance)

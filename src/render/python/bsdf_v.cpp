@@ -17,6 +17,7 @@ MI_PY_EXPORT(BSDFSample) {
     m.def("has_flag", [](uint32_t flags, BSDFFlags f) { return has_flag(flags, f); });
     m.def("has_flag", [](UInt32   flags, BSDFFlags f) { return has_flag(flags, f); });
 
+    {
     auto bs = nb::class_<BSDFSample3f>(m, "BSDFSample3f", D(BSDFSample3))
         .def(nb::init<>())
         .def(nb::init<const Vector3f &>(), "wo"_a, D(BSDFSample3, BSDFSample3))
@@ -26,16 +27,43 @@ MI_PY_EXPORT(BSDFSample) {
         .def_rw("eta", &BSDFSample3f::eta, D(BSDFSample3, eta))
         .def_rw("sampled_type", &BSDFSample3f::sampled_type, D(BSDFSample3, sampled_type))
         .def_rw("sampled_component", &BSDFSample3f::sampled_component, D(BSDFSample3, sampled_component))
+        .def("is_delta", &BSDFSample3f::is_delta, D(BSDFSample3, is_delta))
+        .def("is_null", &BSDFSample3f::is_null, D(BSDFSample3, is_null))
         .def_repr(BSDFSample3f);
 
     MI_PY_DRJIT_STRUCT(bs, BSDFSample3f, wo, pdf, eta, sampled_type, sampled_component);
+    }
+
+    {
+    auto bf = nb::class_<BSDFFeatures3f>(m, "BSDFFeatures3f", D(BSDFFeatures))
+        .def(nb::init<>())
+        .def(nb::init<const UnpolarizedSpectrum &, const UnpolarizedSpectrum &,
+                      const UnpolarizedSpectrum &, const Frame3f &,
+                      const Float &, const Vector3f &>(),
+             "diffuse_albedo"_a, "specular_reflectance"_a,
+             "specular_transmittance"_a, "sh_frame"_a, "roughness"_a,
+             "wt"_a = Vector3f(0.f))
+        .def(nb::init<const BSDFFeatures3f &>(), "f"_a, "Copy constructor")
+        .def_rw("diffuse_albedo", &BSDFFeatures3f::diffuse_albedo,
+                D(BSDFFeatures, diffuse_albedo))
+        .def_rw("specular_reflectance", &BSDFFeatures3f::specular_reflectance,
+                D(BSDFFeatures, specular_reflectance))
+        .def_rw("specular_transmittance", &BSDFFeatures3f::specular_transmittance,
+                D(BSDFFeatures, specular_transmittance))
+        .def_rw("sh_frame", &BSDFFeatures3f::sh_frame, D(BSDFFeatures, sh_frame))
+        .def_rw("roughness", &BSDFFeatures3f::roughness, D(BSDFFeatures, roughness))
+        .def_rw("wt", &BSDFFeatures3f::wt, D(BSDFFeatures, wt));
+
+    MI_PY_DRJIT_STRUCT(bf, BSDFFeatures3f, diffuse_albedo, specular_reflectance,
+                       specular_transmittance, sh_frame, roughness, wt);
+    }
 }
 
 /// Trampoline for derived types implemented in Python
 MI_VARIANT class PyBSDF : public BSDF<Float, Spectrum> {
 public:
     MI_IMPORT_TYPES(BSDF)
-    NB_TRAMPOLINE(BSDF, 12);
+    NB_TRAMPOLINE(BSDF);
 
     PyBSDF(const Properties &props) : BSDF(props) { }
 
@@ -67,14 +95,14 @@ public:
         NB_OVERRIDE(eval_pdf, ctx, si, wo, active);
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si,
-                                      Mask active) const override {
-        NB_OVERRIDE(eval_diffuse_reflectance, si, active);
+    Spectrum eval_null(const SurfaceInteraction3f &si,
+                       Mask active) const override {
+        NB_OVERRIDE(eval_null, si, active);
     }
 
-    Spectrum eval_null_transmission(const SurfaceInteraction3f &si,
-                                      Mask active) const override {
-        NB_OVERRIDE(eval_null_transmission, si, active);
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        NB_OVERRIDE(eval_features, si, active);
     }
 
     Mask has_attribute(const std::string &name, Mask active) const override {
@@ -107,8 +135,6 @@ public:
 
     using BSDF::m_flags;
     using BSDF::m_components;
-
-    DR_TRAMPOLINE_TRAVERSE_CB(BSDF);
 };
 
 template <typename Ptr, typename Cls> void bind_bsdf_generic(Cls &cls) {
@@ -142,14 +168,14 @@ template <typename Ptr, typename Cls> void bind_bsdf_generic(Cls &cls) {
                     return bsdf->eval_pdf_sample(ctx, si, wo, sample1, sample2, active);
                 }, "ctx"_a, "si"_a, "wo"_a, "sample1"_a, "sample2"_a, "active"_a = true,
                 D(BSDF, eval_pdf))
-        .def("eval_null_transmission",
+        .def("eval_null",
              [](Ptr bsdf, const SurfaceInteraction3f &si, Mask active) {
-                 return bsdf->eval_null_transmission(si, active);
-             }, "si"_a, "active"_a = true, D(BSDF, eval_null_transmission))
-        .def("eval_diffuse_reflectance",
+                 return bsdf->eval_null(si, active);
+             }, "si"_a, "active"_a = true, D(BSDF, eval_null))
+        .def("eval_features",
              [](Ptr bsdf, const SurfaceInteraction3f &si, Mask active) {
-                 return bsdf->eval_diffuse_reflectance(si, active);
-             }, "si"_a, "active"_a = true, D(BSDF, eval_diffuse_reflectance))
+                 return bsdf->eval_features(si, active);
+             }, "si"_a, "active"_a = true, D(BSDF, eval_features))
              .def("has_attribute",
             [](Ptr bsdf, const std::string &name, const Mask &active) {
                 return bsdf->has_attribute(name, active);
@@ -174,9 +200,8 @@ template <typename Ptr, typename Cls> void bind_bsdf_generic(Cls &cls) {
             },
             "name"_a, "si"_a, "active"_a = true, D(BSDF, eval_attribute_3))
         .def("flags", [](Ptr bsdf) { return bsdf->flags(); }, D(BSDF, flags))
-        .def("needs_differentials",
-             [](Ptr bsdf) { return bsdf->needs_differentials(); },
-             D(BSDF, needs_differentials));
+        .def("has_flag", [](Ptr bsdf, BSDFFlags flags) { return bsdf->has_flag(flags); },
+             "flags"_a, D(BSDF, has_flag));
 }
 
 MI_PY_EXPORT(BSDF) {
@@ -201,6 +226,7 @@ MI_PY_EXPORT(BSDF) {
         dr::ArrayBinding b;
         auto bsdf_ptr = dr::bind_array_t<BSDFPtr>(b, m, "BSDFPtr");
         bind_bsdf_generic<BSDFPtr>(bsdf_ptr);
+        bsdf_ptr.freeze();
     }
 
 }

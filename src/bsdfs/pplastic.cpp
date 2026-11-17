@@ -212,6 +212,21 @@ public:
         parameters_changed();
     }
 
+    /// Microfacet distribution matching the roughness at the surface position
+    MicrofacetDistribution distribution(const SurfaceInteraction3f &si,
+                                        Mask active) const {
+        if (m_uniform_alpha)
+            return m_distr;
+
+        Float alpha_u = m_alpha_u->eval_1(si, active);
+        if (m_alpha_u == m_alpha_v)
+            return MicrofacetDistribution(m_type, alpha_u, m_sample_visible);
+
+        return MicrofacetDistribution(m_type, alpha_u,
+                                      m_alpha_v->eval_1(si, active),
+                                      m_sample_visible);
+    }
+
     void traverse(TraversalCallback *cb) override {
         cb->put("diffuse_reflectance", m_diffuse_reflectance, ParamFlags::Differentiable);
         cb->put("eta",                 m_eta,                 ParamFlags::Differentiable | ParamFlags::Discontinuous);
@@ -219,7 +234,7 @@ public:
         if (m_specular_reflectance)
             cb->put("specular_reflectance", m_specular_reflectance, ParamFlags::Differentiable);
 
-        if (!has_flag(m_flags, BSDFFlags::Anisotropic)) {
+        if (!this->has_flag(BSDFFlags::Anisotropic)) {
             cb->put("alpha",   m_alpha_u, ParamFlags::Differentiable | ParamFlags::Discontinuous);
         } else {
             cb->put("alpha_u", m_alpha_u, ParamFlags::Differentiable | ParamFlags::Discontinuous);
@@ -228,17 +243,30 @@ public:
     }
 
     void parameters_changed(const std::vector<std::string> &/*keys*/ = {}) override {
-        /* Compute weights that further steer samples towards
-           the specular or diffuse components */
-        Float d_mean = m_diffuse_reflectance->mean(),
-              s_mean = 1.f;
+        dr::make_opaque(m_eta, m_alpha_u, m_alpha_v);
 
+        // Uniform roughness yields a single distribution for the whole
+        // surface. Precomputing it keeps the reciprocals and normalization
+        // constant out of the rendering kernels.
+        m_uniform_alpha = false;
+        if (!m_alpha_u->is_spatially_varying() && !m_alpha_v->is_spatially_varying()) {
+            m_distr = distribution(dr::zeros<SurfaceInteraction3f>(), true);
+            dr::make_opaque(m_distr);
+            m_uniform_alpha = true;
+        }
+    }
+
+    /**
+     * Compute the weight that steers samples towards the specular or diffuse
+     * component from the reflectance of both at the shading point
+     */
+    Float specular_sampling_weight(const SurfaceInteraction3f &si,
+                                   Mask active) const {
+        Float d = dr::mean(m_diffuse_reflectance->eval(si, active)),
+              s = 1.f;
         if (m_specular_reflectance)
-            s_mean = m_specular_reflectance->mean();
-
-        m_specular_sampling_weight = s_mean / (d_mean + s_mean);
-
-        dr::make_opaque(m_eta, m_alpha_u, m_alpha_v, m_specular_sampling_weight);
+            s = dr::mean(m_specular_reflectance->eval(si, active));
+        return s / dr::maximum(d + s, dr::Epsilon<Float>);
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
@@ -258,7 +286,7 @@ public:
         if (unlikely((!has_specular && !has_diffuse) || dr::none_or<false>(active)))
             return { bs, 0.f };
 
-        Float prob_specular = m_specular_sampling_weight;
+        Float prob_specular = specular_sampling_weight(si, active);
         if (unlikely(has_specular != has_diffuse))
             prob_specular = has_specular ? 1.f : 0.f;
 
@@ -268,10 +296,7 @@ public:
         bs.eta = 1.f;
 
         if (dr::any_or<true>(sample_specular)) {
-            MicrofacetDistribution distr(m_type,
-                                         m_alpha_u->eval_1(si, active),
-                                         m_alpha_v->eval_1(si, active),
-                                         m_sample_visible);
+            MicrofacetDistribution distr = distribution(si, active);
             Normal3f m = std::get<0>(distr.sample(si.wi, sample2));
 
             dr::masked(bs.wo, sample_specular) = reflect(si.wi, m);
@@ -309,26 +334,23 @@ public:
         Spectrum result = 0.f;
 
         if constexpr (is_polarized_v<Spectrum>) {
-            /* Due to the coordinate system rotations for polarization-aware
-               pBSDFs below we need to know the propagation direction of light.
-               In the following, light arrives along `-wo_hat` and leaves along
-               `+wi_hat`. */
+            // Due to the coordinate system rotations for polarization-aware
+            // pBSDFs below we need to know the propagation direction of light.
+            // In the following, light arrives along `-wo_hat` and leaves along
+            // `+wi_hat`.
             Vector3f wo_hat = ctx.mode == TransportMode::Radiance ? wo : si.wi,
                      wi_hat = ctx.mode == TransportMode::Radiance ? si.wi : wo;
 
             if (has_specular) {
-                MicrofacetDistribution distr(m_type,
-                                             m_alpha_u->eval_1(si, active),
-                                             m_alpha_v->eval_1(si, active),
-                                             m_sample_visible);
+                MicrofacetDistribution distr = distribution(si, active);
                 Vector3f H = dr::normalize(wo + si.wi);
                 Float D = distr.eval(H);
 
                 // Mueller matrix for specular reflection.
                 Spectrum F = mueller::specular_reflection(dot(wo_hat, H), m_eta->eval_1(si, active));
 
-                /* The Stokes reference frame vector of this matrix lies perpendicular
-                   to the plane of reflection. */
+                // The Stokes reference frame vector of this matrix lies perpendicular
+                // to the plane of reflection.
                 Vector3f s_axis_in  = dr::cross(H, -wo_hat);
                 Vector3f s_axis_out = dr::cross(H, wi_hat);
 
@@ -339,8 +361,8 @@ public:
                 s_axis_out = dr::select(collinear, Vector3f(1, 0, 0),
                                                    dr::normalize(s_axis_out));
 
-                /* Rotate in/out reference vector of F s.t. it aligns with the implicit
-                   Stokes bases of -wo_hat & wi_hat. */
+                // Rotate in/out reference vector of F s.t. it aligns with the implicit
+                // Stokes bases of -wo_hat & wi_hat.
                 F = mueller::rotate_mueller_basis(F,
                                                   -wo_hat, s_axis_in,  mueller::stokes_basis(-wo_hat),
                                                    wi_hat, s_axis_out, mueller::stokes_basis(wi_hat));
@@ -354,12 +376,12 @@ public:
             }
 
             if (has_diffuse) {
-                /* Diffuse scattering is modeled as a sequence of events:
-                   1) Specular refraction inside
-                   2) Subsurface scattering
-                   3) Specular refraction outside again
-                   where both refractions reduce the energy of the diffuse component.
-                   The refraction to the outside will introduce some polarization. */
+                // Diffuse scattering is modeled as a sequence of events:
+                // 1) Specular refraction inside
+                // 2) Subsurface scattering
+                // 3) Specular refraction outside again
+                // where both refractions reduce the energy of the diffuse component.
+                // The refraction to the outside will introduce some polarization.
 
                 // Refract inside
                 Spectrum To = mueller::specular_transmission(dr::abs(Frame3f::cos_theta(wo_hat)), m_eta->eval_1(si, active));
@@ -377,8 +399,8 @@ public:
 
                 diff = Ti * diff * To;
 
-                /* The Stokes reference frame vector of `diff` lies perpendicular
-                   to the plane of reflection. */
+                // The Stokes reference frame vector of `diff` lies perpendicular
+                // to the plane of reflection.
                 Vector3f s_axis_in  = dr::cross(n, -wo_hat);
                 Vector3f s_axis_out = dr::cross(n, wi_hat);
 
@@ -393,8 +415,8 @@ public:
                 s_axis_in = dr::normalize(handle_singularity(s_axis_in));
                 s_axis_out = dr::normalize(handle_singularity(s_axis_out));
 
-                /* Rotate in/out reference vector of `diff` s.t. it aligns with the
-                   implicit Stokes bases of -wo_hat & wi_hat. */
+                // Rotate in/out reference vector of `diff` s.t. it aligns with the
+                // implicit Stokes bases of -wo_hat & wi_hat.
                 diff = mueller::rotate_mueller_basis(diff,
                                                       -wo_hat, s_axis_in,  mueller::stokes_basis(-wo_hat),
                                                        wi_hat, s_axis_out, mueller::stokes_basis(wi_hat));
@@ -403,10 +425,7 @@ public:
             }
         } else {
             if (has_specular) {
-                MicrofacetDistribution distr(m_type,
-                                             m_alpha_u->eval_1(si, active),
-                                             m_alpha_v->eval_1(si, active),
-                                             m_sample_visible);
+                MicrofacetDistribution distr = distribution(si, active);
                 Vector3f H = dr::normalize(wo + si.wi);
                 Float D = distr.eval(H);
 
@@ -421,11 +440,11 @@ public:
 
             if (has_diffuse) {
                 UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
-                /* Diffuse scattering is modeled as a sequence of events:
-                   1) Specular refraction inside
-                   2) Subsurface scattering
-                   3) Specular refraction outside again
-                   where both refractions reduce the energy of the diffuse component. */
+                // Diffuse scattering is modeled as a sequence of events:
+                // 1) Specular refraction inside
+                // 2) Subsurface scattering
+                // 3) Specular refraction outside again
+                // where both refractions reduce the energy of the diffuse component.
                 UnpolarizedSpectrum r_i = std::get<0>(fresnel(cos_theta_i, m_eta->eval_1(si, active))),
                                     r_o = std::get<0>(fresnel(cos_theta_o, m_eta->eval_1(si, active)));
                 diff = (1.f - r_o) * diff * (1.f - r_i);
@@ -451,17 +470,14 @@ public:
         if (unlikely((!has_specular && !has_diffuse) || dr::none_or<false>(active)))
             return 0.f;
 
-        Float prob_specular = m_specular_sampling_weight,
+        Float prob_specular = specular_sampling_weight(si, active),
               prob_diffuse  = 1.f - prob_specular;
         if (unlikely(has_specular != has_diffuse))
             prob_specular = has_specular ? 1.f : 0.f;
 
         // Specular component
         Vector3f H = dr::normalize(wo + si.wi);
-        MicrofacetDistribution distr(m_type,
-                                     m_alpha_u->eval_1(si, active),
-                                     m_alpha_v->eval_1(si, active),
-                                     m_sample_visible);
+        MicrofacetDistribution distr = distribution(si, active);
 
         Float p_specular;
         if (m_sample_visible)
@@ -502,17 +518,17 @@ private:
     MicrofacetType m_type;
     /// Importance sample the distribution of visible normals?
     bool m_sample_visible;
+    /// Precomputed distribution, valid when both roughness textures are uniform
+    MicrofacetDistribution m_distr;
+    bool m_uniform_alpha = false;
     /// Roughness values
     ref<Texture> m_alpha_u, m_alpha_v;
 
     /// Relative refractive index
     ref<Texture> m_eta;
 
-    /// Sampling weight for specular component
-    Float m_specular_sampling_weight;
-
     MI_TRAVERSE_CB(Base, m_diffuse_reflectance, m_specular_reflectance,
-                   m_alpha_u, m_alpha_v, m_eta, m_specular_sampling_weight)
+                   m_alpha_u, m_alpha_v, m_eta, m_distr)
 };
 
 MI_EXPORT_PLUGIN(PolarizedPlastic)

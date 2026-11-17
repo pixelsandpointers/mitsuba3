@@ -11,7 +11,7 @@ import importlib
 SHAPE_ORDERING = [
     'obj',
     'ply',
-    'serialized',
+    'packed',
     'cube',
     'sphere',
     'rectangle',
@@ -22,6 +22,7 @@ SHAPE_ORDERING = [
     'sdfgrid',
     'shapegroup',
     'instance',
+    'displace',
     'ellipsoids',
     'ellipsoidsmesh'
 ]
@@ -55,6 +56,7 @@ EMITTER_ORDERING = [
     'point',
     'constant',
     'envmap',
+    'portal',
     'sunsky',
     'spot',
     'projector'
@@ -71,6 +73,8 @@ SENSOR_ORDERING = [
 TEXTURE_ORDERING = [
     'bitmap',
     'checkerboard',
+    'lut',
+    'math',
     'mesh_attribute',
     'volume'
 ]
@@ -104,6 +108,7 @@ INTEGRATOR_ORDERING = [
     '../src/python/python/ad/integrators/direct_projective.py',
     '../src/python/python/ad/integrators/prb_projective.py',
     '../src/python/python/ad/integrators/prbvolpath.py',
+    '../src/python/python/ad/integrators/volprim_rf_basic.py',
 ]
 
 FILM_ORDERING = [
@@ -153,7 +158,7 @@ def extract(target, filename):
         match = re.match(r'^/\*\*! ?(.*)$', line)
         if match is not None:
             print("Processing %s" % filename)
-            line = match.group(1).replace('%', '\%')
+            line = match.group(1).replace('%', r'\%')
             target.write(line + '\n')
             inheader = True
             continue

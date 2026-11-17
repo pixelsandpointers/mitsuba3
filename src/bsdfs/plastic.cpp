@@ -190,20 +190,32 @@ public:
     }
 
     void parameters_changed(const std::vector<std::string> &/*keys*/ = {}) override {
-        m_inv_eta_2 = 1.f / (m_eta * m_eta);
+        m_inv_eta   = dr::rcp(m_eta);
+        m_inv_eta_2 = dr::square(m_inv_eta);
 
         // Numerically approximate the diffuse Fresnel reflectance
-        m_fdr_int = fresnel_diffuse_reflectance(1.f / m_eta);
+        m_fdr_int = fresnel_diffuse_reflectance(m_inv_eta);
         m_fdr_ext = fresnel_diffuse_reflectance(m_eta);
 
-        // Compute weights that further steer samples towards the specular or diffuse components
-        Float d_mean = m_diffuse_reflectance->mean(),
-              s_mean = 1.f;
+        dr::make_opaque(m_eta, m_inv_eta, m_inv_eta_2, m_fdr_int, m_fdr_ext);
+    }
 
+    UnpolarizedSpectrum eval_specular_reflectance(const SurfaceInteraction3f &si,
+                                                  Mask active) const {
         if (m_specular_reflectance)
-            s_mean = m_specular_reflectance->mean();
+            return m_specular_reflectance->eval(si, active);
+        else
+            return UnpolarizedSpectrum(1.f);
+    }
 
-        m_specular_sampling_weight = s_mean / (d_mean + s_mean);
+    /**
+     * Compute the weight that steers samples towards the specular or diffuse
+     * component from the reflectance of both at the shading point
+     */
+    static Float specular_sampling_weight(const UnpolarizedSpectrum &diff,
+                                          const UnpolarizedSpectrum &spec) {
+        Float d = dr::mean(diff), s = dr::mean(spec);
+        return s / dr::maximum(d + s, dr::Epsilon<Float>);
     }
 
     std::pair<BSDFSample3f, Spectrum> sample(const BSDFContext &ctx,
@@ -224,10 +236,14 @@ public:
         if (unlikely((!has_specular && !has_diffuse) || dr::none_or<false>(active)))
             return { bs, result };
 
+        UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active),
+                            spec = eval_specular_reflectance(si, active);
+
         // Determine which component should be sampled
-        Float f_i           = std::get<0>(fresnel(cos_theta_i, Float(m_eta))),
-              prob_specular = f_i * m_specular_sampling_weight,
-              prob_diffuse  = (1.f - f_i) * (1.f - m_specular_sampling_weight);
+        Float f_i           = std::get<0>(fresnel(cos_theta_i, m_eta, m_inv_eta)),
+              weight        = specular_sampling_weight(diff, spec),
+              prob_specular = f_i * weight,
+              prob_diffuse  = (1.f - f_i) * (1.f - weight);
 
         if (unlikely(has_specular != has_diffuse))
             prob_specular = has_specular ? 1.f : 0.f;
@@ -248,10 +264,7 @@ public:
             dr::masked(bs.sampled_component, sample_specular) = 0;
             dr::masked(bs.sampled_type, sample_specular) = +BSDFFlags::DeltaReflection;
 
-            UnpolarizedSpectrum value = f_i / bs.pdf;
-            if (m_specular_reflectance)
-                value *= m_specular_reflectance->eval(si, sample_specular);
-            result[sample_specular] = value;
+            result[sample_specular] = spec * f_i / bs.pdf;
         }
 
         if (dr::any_or<true>(sample_diffuse)) {
@@ -260,9 +273,10 @@ public:
             dr::masked(bs.sampled_component, sample_diffuse) = 1;
             dr::masked(bs.sampled_type, sample_diffuse) = +BSDFFlags::DiffuseReflection;
 
-            Float f_o = std::get<0>(fresnel(Frame3f::cos_theta(bs.wo), Float(m_eta)));
-            UnpolarizedSpectrum value = m_diffuse_reflectance->eval(si, sample_diffuse);
-            value /= 1.f - (m_nonlinear ? (value * m_fdr_int) : m_fdr_int);
+            Float f_o = std::get<0>(fresnel(Frame3f::cos_theta(bs.wo), m_eta, m_inv_eta));
+            UnpolarizedSpectrum value = diff;
+            value /= m_nonlinear ? dr::fnmadd(value, m_fdr_int, 1.f)
+                                 : UnpolarizedSpectrum(1.f - m_fdr_int);
             value *= m_inv_eta_2 * (1.f - f_i) * (1.f - f_o) / prob_diffuse;
             result[sample_diffuse] = value;
         }
@@ -284,11 +298,12 @@ public:
         if (unlikely(!has_diffuse || dr::none_or<false>(active)))
             return 0.f;
 
-        Float f_i = std::get<0>(fresnel(cos_theta_i, Float(m_eta))),
-              f_o = std::get<0>(fresnel(cos_theta_o, Float(m_eta)));
+        Float f_i = std::get<0>(fresnel(cos_theta_i, m_eta, m_inv_eta)),
+              f_o = std::get<0>(fresnel(cos_theta_o, m_eta, m_inv_eta));
 
         UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
-        diff /= 1.f - (m_nonlinear ? (diff * m_fdr_int) : m_fdr_int);
+        diff /= m_nonlinear ? dr::fnmadd(diff, m_fdr_int, 1.f)
+                            : UnpolarizedSpectrum(1.f - m_fdr_int);
 
         diff *= warp::square_to_cosine_hemisphere_pdf(wo) *
                 m_inv_eta_2 * (1.f - f_i) * (1.f - f_o);
@@ -311,9 +326,12 @@ public:
         Float prob_diffuse = 1.f;
 
         if (ctx.is_enabled(BSDFFlags::DeltaReflection, 0)) {
-            Float f_i           = std::get<0>(fresnel(cos_theta_i, Float(m_eta))),
-                  prob_specular = f_i * m_specular_sampling_weight;
-            prob_diffuse  = (1.f - f_i) * (1.f - m_specular_sampling_weight);
+            Float f_i           = std::get<0>(fresnel(cos_theta_i, m_eta, m_inv_eta)),
+                  weight        = specular_sampling_weight(
+                      m_diffuse_reflectance->eval(si, active),
+                      eval_specular_reflectance(si, active)),
+                  prob_specular = f_i * weight;
+            prob_diffuse  = (1.f - f_i) * (1.f - weight);
             prob_diffuse = prob_diffuse / (prob_specular + prob_diffuse);
         }
 
@@ -338,30 +356,47 @@ public:
         if (unlikely(!has_diffuse || dr::none_or<false>(active)))
             return { 0.f, 0.f };
 
-        Float f_i = std::get<0>(fresnel(cos_theta_i, Float(m_eta))),
-              f_o = std::get<0>(fresnel(cos_theta_o, Float(m_eta)));
+        Float f_i = std::get<0>(fresnel(cos_theta_i, m_eta, m_inv_eta)),
+              f_o = std::get<0>(fresnel(cos_theta_o, m_eta, m_inv_eta));
 
         UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
-        diff /= 1.f - (m_nonlinear ? (diff * m_fdr_int) : m_fdr_int);
+
+        Float prob_diffuse = 1.f;
+        if (ctx.is_enabled(BSDFFlags::DeltaReflection, 0)) {
+            Float weight        = specular_sampling_weight(
+                      diff, eval_specular_reflectance(si, active)),
+                  prob_specular = f_i * weight;
+            prob_diffuse  = (1.f - f_i) * (1.f - weight);
+            prob_diffuse = prob_diffuse / (prob_specular + prob_diffuse);
+        }
+
+        diff /= m_nonlinear ? dr::fnmadd(diff, m_fdr_int, 1.f)
+                            : UnpolarizedSpectrum(1.f - m_fdr_int);
 
         Float hemi_pdf = warp::square_to_cosine_hemisphere_pdf(wo);
 
         diff *= hemi_pdf * m_inv_eta_2 * (1.f - f_i) * (1.f - f_o);
 
-        Float prob_diffuse = 1.f;
-        if (ctx.is_enabled(BSDFFlags::DeltaReflection, 0)) {
-            Float prob_specular = f_i * m_specular_sampling_weight;
-            prob_diffuse  = (1.f - f_i) * (1.f - m_specular_sampling_weight);
-            prob_diffuse = prob_diffuse / (prob_specular + prob_diffuse);
-        }
-
         return { dr::select(active, depolarizer<Spectrum>(diff), 0.f),
                  dr::select(active, hemi_pdf * prob_diffuse, 0.f) };
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si,
-                                      Mask active) const override {
-        return m_diffuse_reflectance->eval(si, active);
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
+        Float cos_theta_i = Frame3f::cos_theta(si.wi);
+        active &= cos_theta_i > 0.f;
+
+        // Integrated over the hemisphere, the diffusely scattered light
+        // leaves with 1 - m_fdr_int
+        Float f_i = std::get<0>(fresnel(cos_theta_i, m_eta, m_inv_eta));
+        UnpolarizedSpectrum diff = m_diffuse_reflectance->eval(si, active);
+        diff /= m_nonlinear ? dr::fnmadd(diff, m_fdr_int, 1.f)
+                            : UnpolarizedSpectrum(1.f - m_fdr_int);
+        diff *= (1.f - f_i) * (1.f - m_fdr_int);
+
+        return { dr::select(active, diff, 0.f),
+                 dr::select(active, eval_specular_reflectance(si, active) * f_i, 0.f),
+                 0.f, si.sh_frame, 0.f };
     }
 
     std::string to_string() const override {
@@ -371,8 +406,7 @@ public:
         if (m_specular_reflectance)
             oss << "  specular_reflectance = " << m_specular_reflectance     << "," << std::endl;
 
-        oss << "  specular_sampling_weight = " << m_specular_sampling_weight << "," << std::endl
-            << "  nonlinear = "                << (int) m_nonlinear          << "," << std::endl
+        oss << "  nonlinear = "                << (int) m_nonlinear          << "," << std::endl
             << "  eta = "                      << m_eta                      << "," << std::endl
             << "  fdr_int = "                  << m_fdr_int                  << "," << std::endl
             << "  fdr_ext = "                  << m_fdr_ext                         << std::endl
@@ -384,15 +418,12 @@ public:
 private:
     ref<Texture> m_diffuse_reflectance;
     ref<Texture> m_specular_reflectance;
-    ScalarFloat m_eta;
-    ScalarFloat m_inv_eta_2;
-    ScalarFloat m_fdr_int;
-    ScalarFloat m_fdr_ext;
-    Float m_specular_sampling_weight;
+    Float m_eta, m_inv_eta, m_inv_eta_2;
+    Float m_fdr_int, m_fdr_ext;
     bool m_nonlinear;
 
-    MI_TRAVERSE_CB(Base, m_diffuse_reflectance, m_specular_reflectance,
-                   m_specular_sampling_weight)
+    MI_TRAVERSE_CB(Base, m_diffuse_reflectance, m_specular_reflectance, m_eta,
+                   m_inv_eta, m_inv_eta_2, m_fdr_int, m_fdr_ext)
 };
 
 MI_EXPORT_PLUGIN(SmoothPlastic)

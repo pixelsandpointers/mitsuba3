@@ -1,0 +1,602 @@
+#pragma once
+
+#include <mitsuba/core/platform.h>
+#include <mitsuba/core/fwd.h>
+#include <mitsuba/core/vector.h>
+#include <mitsuba/core/bbox.h>
+#include <mitsuba/core/transform.h>
+#include <drjit/quaternion.h>
+#include <drjit/unique_buffer.h>
+#include <drjit-core/hash.h>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+NAMESPACE_BEGIN(mitsuba)
+
+/// Number of 32-bit words per packed face record
+constexpr uint32_t MeshFaceStride = 4;
+
+/// Number of 32-bit words per packed vertex record
+constexpr uint32_t MeshVertexStride = 8;
+
+/// Offset of the position (3 floats) in a packed vertex record
+constexpr uint32_t PackedPositionOffset = 0;
+
+/// Offset of the normal or shading frame in a packed vertex record
+constexpr uint32_t PackedFrameOffset = 3;
+
+/// Offset of the texture coordinates (2 floats)
+constexpr uint32_t PackedTexcoordOffset = 6;
+
+/// Bit of the face state word which indicates a face with flipped UVs
+constexpr uint32_t FaceUVFlipped = 0x80000000u;
+
+/// Bits of the face state word that store the rounding error bound
+constexpr uint32_t FaceErrorMask = 0x7fffffffu;
+
+/// Content of the packed vertex records of a `Mesh`
+enum class Layout : uint32_t {
+    Positions = 0x0,  ///< Every vertex record carries positions
+    Normals   = 0x1,  ///< Shading normals
+    Tangents  = 0x2,  ///< Shading tangents
+    Texcoords = 0x4,  ///< Texture coordinates
+};
+
+MI_DECLARE_ENUM_OPERATORS(Layout)
+
+/// Assemble the `Layout` flags of the packed records
+constexpr Layout make_layout(bool normals, bool texcoords,
+                             bool tangents = false) {
+    return (Layout) ((normals    ? (uint32_t) Layout::Normals   : 0u) |
+                     (texcoords  ? (uint32_t) Layout::Texcoords : 0u) |
+                     (tangents   ? (uint32_t) Layout::Tangents  : 0u));
+}
+
+/**
+ * Identifies a set of mutually mergeable meshes
+ *
+ * The fields are the state that `Mesh.merge()` inherits from its first
+ * input, so a difference in any of them would misrepresent the remaining
+ * inputs. Obtain the key of a mesh through `Mesh.merge_key()`.
+ */
+struct MergeKey {
+    const Object *bsdf, *emitter, *sensor, *interior_medium, *exterior_medium;
+
+    /**
+     * Packed record layout
+     *
+     * The face-normal setting needs no separate field, since a built mesh
+     * carries the ``Normals`` bit exactly when it shades with vertex normals.
+     */
+    Layout layout;
+
+    /// Ray categories that can see the mesh (a ``ShapeVisibility`` value)
+    uint32_t visibility;
+
+    bool operator==(const MergeKey &k) const {
+        return bsdf == k.bsdf && emitter == k.emitter && sensor == k.sensor &&
+               interior_medium == k.interior_medium &&
+               exterior_medium == k.exterior_medium && layout == k.layout &&
+               visibility == k.visibility;
+    }
+
+    bool operator!=(const MergeKey &k) const { return !operator==(k); }
+};
+
+/// Hash function of a ``MergeKey``, for use with ``tsl::robin_map``
+struct MergeKeyHasher {
+    size_t operator()(const MergeKey &k) const {
+        uint64_t h = (uint64_t) k.layout | ((uint64_t) k.visibility << 32);
+        for (const Object *p : { k.bsdf, k.emitter, k.sensor,
+                                 k.interior_medium, k.exterior_medium })
+            h = fmix64(h ^ (uintptr_t) p);
+        return (size_t) h;
+    }
+};
+
+/**
+ * Bound the position error of a ray-triangle intersection along the normal
+ *
+ * This function computes the ``p_err`` bound used to offset spawned rays
+ * and avoid self-intersections. It covers two sources of rounding errors:
+ *
+ * 1. The interpolation that produces a hit position interpolates three
+ *    vertices with barycentric weights. Rounding error is proportional to
+ *    the maximum vertex magnitude projected onto ``n``. This term vanishes
+ *    for a triangle in a coordinate plane through the origin.
+ *
+ * 2. Intersection tests typically express the vertices relative to the ray
+ *    origin, and then form a cross product of the edges or edge functions
+ *    that are parameterized by them. A spawned ray starts on the triangle,
+ *    so these relative vertices are at most an edge long, and the terms of
+ *    the resulting expressions are bounded by the Euclidean lengths of the
+ *    edges. We do not know which vertex the backend will use as base
+ *    vertex, hence the calculation sums the largest two edge lengths to be
+ *    conservative.
+ *
+ * ``eps`` is used to provide an appropriate floating point epsilon such as
+ * ``mi.math.PositionEpsilon``, which is the variant-dependent unit roundoff
+ * times a safety factor.
+ */
+template <typename Value>
+Value triangle_position_error(const Point<Value, 3> &p0,
+                              const Point<Value, 3> &p1,
+                              const Point<Value, 3> &p2,
+                              const Normal<Value, 3> &n,
+                              dr::scalar_t<Value> eps) {
+    Value e0 = dr::norm(p1 - p0), e1 = dr::norm(p2 - p0),
+          e2 = dr::norm(p2 - p1);
+    Vector<Value, 3> mag =
+        dr::maximum(dr::abs(p0), dr::maximum(dr::abs(p1), dr::abs(p2)));
+    return (dr::dot(dr::abs(n), mag) +
+            (e0 + e1 + e2 - dr::minimum(e0, dr::minimum(e1, e2)))) *
+           eps;
+}
+
+/**
+ * Face state word of a triangle with the given vertex positions
+ *
+ * The word stores the position error bound along the face normal (see
+ * ``FaceErrorMask``), with ``eps`` the ``mi.math.PositionEpsilon`` of the
+ * variant. The overload with texture coordinates additionally sets
+ * ``FaceUVFlipped`` when the UV triangle is mirrored, which decides the
+ * handedness of the interpolated tangent frame.
+ */
+template <typename Value>
+dr::uint32_array_t<Value> face_state(const Point<Value, 3> &p0,
+                                     const Point<Value, 3> &p1,
+                                     const Point<Value, 3> &p2,
+                                     dr::scalar_t<Value> eps) {
+    Normal<Value, 3> n = dr::normalize(dr::cross(p1 - p0, p2 - p0));
+    return dr::reinterpret_array<dr::uint32_array_t<Value>>(
+        triangle_position_error(p0, p1, p2, n, eps));
+}
+
+template <typename Value>
+dr::uint32_array_t<Value> face_state(const Point<Value, 3> &p0,
+                                     const Point<Value, 3> &p1,
+                                     const Point<Value, 3> &p2,
+                                     const Point<Value, 2> &uv0,
+                                     const Point<Value, 2> &uv1,
+                                     const Point<Value, 2> &uv2,
+                                     dr::scalar_t<Value> eps) {
+    using UInt32 = dr::uint32_array_t<Value>;
+    Vector<Value, 2> t1 = uv1 - uv0, t2 = uv2 - uv0;
+    auto flipped = dr::fmsub(t1.x(), t2.y(), t1.y() * t2.x()) < 0.f;
+    return face_state(p0, p1, p2, eps) |
+           dr::select(flipped, UInt32(FaceUVFlipped), UInt32(0));
+}
+
+/**
+ * Encode a unit normal ``n`` and a tangent ``s`` into three floats
+ *
+ * Together with the (implied) bitangent, this is an element of ``SO(3)``,
+ * which this function parameterizes using 3 parameters by stereographically
+ * projecting the frame's unit quaternion (the *modified Rodrigues
+ * parameters* of Terzakis et al. :cite:`Terzakis2018Rodrigues`).
+ *
+ * After flipping the quaternion to a non-negative real part ``w``, the result
+ * is ``imag(q) / (1 + w)``, of length ``tan(angle/4) <= 1``.
+ *
+ * The parameterization has a (benign) seam at ``angle=pi``. Antipodal points
+ * of the unit sphere decode to the same frame.
+ */
+template <typename Value>
+Vector<Value, 3> frame_encode(const Normal<Value, 3> &n,
+                              const Vector<Value, 3> &s) {
+    Vector<Value, 3> t = dr::cross(n, s);
+
+    dr::Matrix<Value, 3> R(s.x(), t.x(), n.x(),
+                           s.y(), t.y(), n.y(),
+                           s.z(), t.z(), n.z());
+
+    dr::Quaternion<Value> q = dr::matrix_to_quat(R);
+    Value w = dr::real(q);
+
+    return Vector<Value, 3>(dr::imag(q)) *
+           dr::mulsign(dr::rcp(1.f + dr::abs(w)), w);
+}
+
+/// Decode a frame produced by `frame_encode()` into normal and tangent
+template <typename Value>
+std::pair<Normal<Value, 3>, Vector<Value, 3>>
+frame_decode(const Vector<Value, 3> &p) {
+    // Inverting the stereographic projection with ``a = 1/(1 + |p|^2)``
+    // recovers the quaternion ``(imag, real) = (2 a p, 2 a - 1)``. The
+    // rotation matrix is assembled from the products ``2 imag_i imag_j``
+    // and ``2 real imag_i``, which collapse to ``A p_i p_j`` and ``B p_i``.
+
+    Value a  = dr::rcp(1.f + dr::squared_norm(p)),
+          A  = 8.f * dr::square(a),
+          B  = dr::fnmadd(4.f, a, A),
+          X  = A * p.x(), Y = A * p.y(), Z = A * p.z(),
+          yy = p.y() * Y, xy = p.x() * Y,
+          xz = p.x() * Z, yz = p.y() * Z,
+          u  = 1.f - yy;
+
+    // The third and first column of the rotation matrix
+    return { Normal<Value, 3>(dr::fmadd (B, p.y(), xz),
+                              dr::fnmadd(B, p.x(), yz),
+                              dr::fnmadd(p.x(), X, u)),
+             Vector<Value, 3>(dr::fnmadd(p.z(), Z, u),
+                              dr::fmadd (B, p.z(), xy),
+                              dr::fnmadd(B, p.y(), xz)) };
+}
+
+/**
+ * Helper data structure to efficiently construct and upload
+ * the internal `Mesh` data structure.
+ *
+ * Loaders fill this structure on the host and pass it to
+ * `Mesh.from_packed`(PackedMesh &&), which uploads or adopts each
+ * buffer exactly once.
+ *
+ * The constructor allocates staging memory of the flavor appropriate for
+ * the target backend (host-pinned on CUDA, shared on Metal, plain host
+ * memory otherwise), so the subsequent transfer is a single asynchronous
+ * copy per buffer, or an in-place adoption on CPU backends.
+ *
+ * When ``position_count`` / ``normal_count`` are nonzero, they indicate the
+ * size of the ``*_index`` maps (see `Mesh` for details).
+ */
+struct MI_EXPORT_LIB PackedMesh {
+    using ScalarPoint3f  = Point<float, 3>;
+    using ScalarNormal3f = Normal<float, 3>;
+    using ScalarPoint2f  = Point<float, 2>;
+    using ScalarVector2f = Vector<float, 2>;
+    using ScalarVector3f = Vector<float, 3>;
+    using ScalarVector3u = Vector<uint32_t, 3>;
+    using ScalarAffineTransform4f = AffineTransform<Point<float, 4>>;
+
+    /// Custom mesh attribute (see `Mesh.add_attribute()`).
+    struct Attribute {
+        std::string name;
+        size_t dim = 0;
+        /// Upsample RGB colors to color spectra?
+        bool upsample_srgb = true;
+        drjit::unique_buffer<float> values;
+    };
+
+    PackedMesh() = default;
+    PackedMesh(JitBackend backend, size_t vertex_count, size_t face_count,
+               Layout layout, size_t position_count = 0,
+               size_t normal_count = 0);
+
+    PackedMesh(PackedMesh &&) = default;
+    PackedMesh &operator=(PackedMesh &&) = default;
+    PackedMesh(const PackedMesh &) = delete;
+    PackedMesh &operator=(const PackedMesh &) = delete;
+
+    /**
+     * Bake a placement and orientation into the mesh
+     *
+     * Call this method to apply a to-world transformation to any mesh data
+     * that is subsequently filled via ``set_face()`` and ``set_vertex()``.
+     * Mirroring transformations and ``flip_normals`` may also reverse the
+     * winding order.
+     */
+    void set_transform(const ScalarAffineTransform4f &to_world,
+                       bool flip_normals = false);
+
+    /**
+     * Transform mesh data written so far
+     *
+     * Producers that fill ``PackedMesh`` directly without ``set_vertex()``
+     * and ``set_face()`` should call this method at the end.
+     */
+    void transform_records();
+
+    /// Write one vertex record and grow `bbox`
+    void set_vertex(size_t i, const ScalarPoint3f &p,
+                    const ScalarNormal3f &n = { 0.f, 0.f, 0.f },
+                    const ScalarVector2f &uv = { 0.f, 0.f });
+
+    /// Write one face record, checking that its indices are in bounds
+    void set_face(size_t i, const ScalarVector3u &indices);
+
+    /**
+     * Allocate a custom attribute and return a pointer to its buffer
+     *
+     * The name must be prefixed ``vertex_`` or ``face_``. Spectral variants
+     * turn 3-channel ``*color*`` attributes into sRGB upsampling
+     * coefficients while adopting the buffer. Clear ``upsample_srgb`` when
+     * the producer already stores coefficients.
+     */
+    float *add_attribute(std::string_view name, size_t dim,
+                         bool upsample_srgb = true);
+
+    /**
+     * Generate tangents for a mesh with normals and texture coordinates
+     *
+     * This commit populates the packed mesh data with vertex tangent frames,
+     * matching the behavior of `Mesh::compute_tangents()`. In contrast to
+     * this method, the computation is done on the host machine.
+     * Call this after every face and vertex record has been written and
+     * transformed.
+     */
+    void add_tangents();
+
+    /**
+     * Compute the state word of every face record on the host
+     *
+     * See ``face_state()``, whose ``eps`` is the ``mi.math.PositionEpsilon``
+     * of the variant. Call this last, after the records are transformed
+     * and tangents are added.
+     */
+    void update_face_state(float eps);
+
+    /// Dr.Jit backend of the allocated buffers
+    JitBackend backend = JitBackend::None;
+
+    /// Content of the vertex records
+    Layout layout = Layout::Positions;
+
+    /// Sizes of the vertex/face/position/normal arrays
+    size_t vertex_count = 0, face_count = 0;
+    size_t position_count = 0, normal_count = 0;
+
+    /// Bounding box computed from the mesh positions
+    BoundingBox<ScalarPoint3f> bbox;
+
+    /// Reverse the corner order of the face records? (``set_transform()``)
+    bool reverse_winding = false;
+
+    drjit::unique_buffer<float>    vertices;
+    drjit::unique_buffer<uint32_t> faces;
+    drjit::unique_buffer<uint32_t> position_index, normal_index;
+    std::vector<Attribute> attrs;
+
+private:
+    ScalarAffineTransform4f m_to_world;
+    bool m_transform = false;
+    bool m_negate_normals = false;
+
+    bool m_written = false;
+};
+
+/**
+ * Per-corner values of one attribute, see ``CornerMesh``
+ *
+ * ``data`` points to ``value_count x dim`` records. When ``indices`` is
+ * null, the records align with the corner records of the ``CornerMesh``.
+ * Otherwise, ``indices`` supplies one record index per corner record, and
+ * ``UINT32_MAX`` marks a missing entry that resolves to zeros.
+ */
+struct CornerAttribute {
+    /// Attribute name, which custom attributes must prefix with ``vertex_``
+    std::string_view name;
+
+    /// Number of channels (1 to 4 for custom attributes)
+    size_t dim = 0;
+
+    /// Attribute records (``value_count * dim`` floats)
+    const float *data = nullptr;
+    size_t value_count = 0;
+
+    /// Optional indices into ``data`` (``CornerMesh.record_count`` entries)
+    const uint32_t *indices = nullptr;
+};
+
+/**
+ * Corner-indexed mesh description
+ *
+ * Many DCC applications and file formats store positions per vertex, while
+ * normals, texture coordinates and colors live per *face corner* so that
+ * they can be discontinuous across edges. This structure is a non-owning
+ * view of such data: `positions` holds one entry per source vertex, the
+ * faces are triangles or arbitrary polygons (``face_offsets``), and the
+ * per-corner attributes are read either directly or through the record
+ * indirection of ``corner_index``.
+ *
+ * ``corner_to_packed_mesh()`` turns this description into the split-vertex
+ * representation used by `Mesh`.
+ */
+struct CornerMesh {
+    /// Number of source vertices
+    size_t vertex_count = 0;
+
+    /// Vertex positions (``vertex_count * 3`` floats)
+    const float *positions = nullptr;
+
+    /// Number of face corners
+    size_t corner_count = 0;
+
+    /**
+     * Optional map from face corner to corner record
+     *
+     * When given (``corner_count`` entries), ``corner_vertex`` and the
+     * ``CornerAttribute`` records hold ``record_count`` entries that
+     * corner ``c`` reads at ``corner_index[c]``, instead of one per corner.
+     */
+    const uint32_t *corner_index = nullptr;
+
+    /// Number of corner records. Zero implies a value of ``corner_count``.
+    size_t record_count = 0;
+
+    /// Vertex referenced by each corner record (``record_count`` entries)
+    const uint32_t *corner_vertex = nullptr;
+
+    /// Number of faces (only used together with ``face_offsets``)
+    size_t face_count = 0;
+
+    /**
+     * Optional polygonal face topology (``face_count + 1`` entries)
+     *
+     * Face ``i`` spans corners ``[face_offsets[i], face_offsets[i+1])``
+     * and fans into triangles. The array must be non-decreasing, start at 0,
+     * and end at ``corner_count``. Null input implies pure triangles.
+     */
+    const uint32_t *face_offsets = nullptr;
+
+    /// Shading normals (3 channels); optional
+    CornerAttribute normals { "normals", 3 };
+
+    /// Texture coordinates (2 channels); optional
+    CornerAttribute texcoords { "texcoords", 2 };
+
+    /// Custom ``vertex_*`` attributes (``attr_count`` entries)
+    const CornerAttribute *attrs = nullptr;
+    size_t attr_count = 0;
+};
+
+/**
+ * Convert a corner-indexed mesh description into a packed mesh
+ * compatible with the internal representation of `Mesh`
+ *
+ * This function triangulates polygonal faces and then welds the corners of
+ * each source vertex: corners that agree on all per-corner data collapse
+ * into a single vertex, while differing ones yield separate copies. The
+ * generated ``position_index`` and ``normal_index`` maps record which of
+ * these copies still share a position or a normal, so that seams do not
+ * turn into geometric cuts (see the `Mesh` documentation). Corners also
+ * split when their triangles disagree on the orientation of the texture
+ * parameterization, since such triangles cannot share a tangent frame.
+ *
+ * Unreferenced source vertices are dropped, the remaining ones keep their
+ * relative order, and split copies follow their original vertex.
+ *
+ * ``name`` identifies the mesh in error messages. ``face_normals``
+ * announces that the mesh will use per-face normals, in which case any
+ * supplied shading normals are ignored. The ``flip_normals`` and ``to_world``
+ * arguments are baked into the result, see ``PackedMesh.set_transform()``.
+ */
+extern PackedMesh
+corner_to_packed_mesh(JitBackend backend, const CornerMesh &desc,
+                      std::string_view name = "",
+                      bool face_normals = false,
+                      bool flip_normals = false,
+                      const PackedMesh::ScalarAffineTransform4f &to_world = {});
+
+/**
+ * Version of the mesh entries of a ``.packed`` container, whose writer and
+ * reader are ``Mesh::write_packed()`` and the ``packed`` shape plugin. Keep
+ * the two in step. Every entry starts with the four bytes ``MESH``.
+ *
+ * The face records are stored verbatim. Their fourth word is derived data
+ * that the loader regenerates.
+ */
+constexpr uint32_t PackedMeshVersion = 1;
+
+/// Flag word of a packed mesh entry. The low bits store the `Layout` of
+/// the vertex records verbatim.
+enum class PackedMeshFlags : uint32_t {
+    LayoutMask  = 0x000F,
+    FaceNormals = 0x0010
+};
+
+
+NAMESPACE_BEGIN(detail)
+
+// ---------------------------------------------------------------------------
+// Helpers to unify JIT and scalar code paths of mesh computations
+// ---------------------------------------------------------------------------
+
+/// Invoke ``func(UInt32)`` for every index in ``[0, count)``.
+template <typename UInt32, typename Func>
+void foreach_index(size_t count, Func &&func) {
+    if constexpr (dr::is_jit_v<UInt32>) {
+        func(dr::arange<UInt32>(count));
+    } else {
+        for (uint32_t i = 0; i < (uint32_t) count; ++i)
+            func(i);
+    }
+}
+
+/// Evaluate map[idx], treating an empty map as the identity
+template <typename Index, typename Buffer>
+DRJIT_INLINE Index gather_map(const Buffer &map, const Index &idx) {
+    if (map.empty())
+        return idx;
+
+    if constexpr (std::is_integral_v<Index>)
+        return map.data()[idx];
+    else
+        return dr::gather<Index>(map, idx);
+}
+
+/// Construct the array [func(i/dim, i%dim) for i in range(rows*dim)],
+/// where ``func`` returns one lane
+template <typename Buf, typename F>
+Buf element_view(size_t rows, uint32_t dim, F &&func) {
+    if (rows == 0)
+        return Buf();
+    if constexpr (dr::is_jit_v<Buf>) {
+        using UInt32 = dr::uint32_array_t<Buf>;
+        UInt32 j    = dr::arange<UInt32>(rows * dim),
+               r    = j / dim,
+               lane = j - r * dim;
+        return func(r, lane);
+    } else {
+        Buf result = dr::empty<Buf>(rows * dim);
+        auto *dst = result.data();
+        for (size_t r = 0; r < rows; ++r)
+            for (uint32_t lane = 0; lane < dim; ++lane)
+                *dst++ = func((uint32_t) r, lane);
+        return result;
+    }
+}
+
+/// Selects how `interleaved()` evaluates in JIT variants
+enum Eval { Eager, Symbolic };
+
+/// Construct the array [func(i/N)[i%N] for i in range(count*N)], where
+/// ``func`` returns a whole row. ``Eager`` scatters into fresh storage,
+/// ``Symbolic`` builds an unevaluated lane selection.
+template <size_t N, typename Buf, Eval E = Eager, typename Func>
+Buf interleaved(size_t count, Func &&func) {
+    using UInt32 = dr::uint32_array_t<Buf>;
+    if constexpr (dr::is_jit_v<Buf> && E == Symbolic) {
+        if (count == 0)
+            return Buf();
+        UInt32 j    = dr::arange<UInt32>(count * N),
+               r    = j / (uint32_t) N,
+               lane = j - r * (uint32_t) N;
+        auto v = func(r);
+        Buf result = v[N - 1];
+        for (size_t k = N - 1; k-- > 0; )
+            result = dr::select(lane == (uint32_t) k, v[k], result);
+        return result;
+    } else {
+        Buf result = dr::empty<Buf>(count * N);
+        if constexpr (dr::is_jit_v<Buf>) {
+            UInt32 i = dr::arange<UInt32>(count);
+            dr::scatter(result, func(i), i, true, ReduceMode::NoConflicts);
+        } else {
+            auto *dst = result.data();
+            for (uint32_t i = 0; i < (uint32_t) count; ++i)
+                dr::store(dst + N * (size_t) i, func(i));
+        }
+        return result;
+    }
+}
+
+/// Gather the ``Dim``-wide row ``idx`` of an interleaved tensor or buffer
+template <size_t Dim, typename Source, typename Index>
+DRJIT_INLINE auto deinterleave(const Source &src, const Index &idx) {
+    if constexpr (dr::is_tensor_v<Source>) {
+        return deinterleave<Dim>(src.array(), idx);
+    } else if constexpr (std::is_integral_v<Index>) {
+        using Value = dr::scalar_t<Source>;
+        return dr::load<dr::Array<Value, Dim>>(src.data() + Dim * idx);
+    } else {
+        return dr::gather<dr::Array<Source, Dim>>(src, idx);
+    }
+}
+
+/// Add ``value`` to the ``Dim``-wide row ``idx`` of the interleaved buffer ``buf``
+template <size_t Dim, typename Buffer, typename Value, typename Index,
+          typename Mask>
+DRJIT_INLINE void interleaved_add(Buffer &buf, const Value &value,
+                                  const Index &idx, const Mask &active) {
+    Index base = Dim * idx;
+    for (size_t k = 0; k < Dim; ++k)
+        dr::scatter_reduce(ReduceOp::Add, buf, value[k],
+                           Index(base + (uint32_t) k), active);
+}
+
+NAMESPACE_END(detail)
+
+NAMESPACE_END(mitsuba)

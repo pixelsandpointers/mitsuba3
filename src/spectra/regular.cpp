@@ -32,7 +32,7 @@ Regular spectrum (:monosp:`regular`)
  * - range
    - |string|
    - Spectral emission range.
-   - |exposed|, |differentiable|
+   - |exposed|
 
 This spectrum returns linearly interpolated reflectance or emission values from *regularly*
 placed samples.
@@ -42,8 +42,9 @@ placed samples.
         :name: regular
 
         <spectrum type="regular">
-            <string name="range" value="400, 700">
-            <string name="values" value="0.1, 0.2">
+            <float name="wavelength_min" value="400"/>
+            <float name="wavelength_max" value="700"/>
+            <string name="values" value="0.1, 0.2"/>
         </spectrum>
 
     .. code-tab:: python
@@ -136,11 +137,6 @@ public:
             DRJIT_MARK_USED(sample);
             NotImplementedError("sample");
         }
-    }
-
-    Float mean() const override {
-        ScalarVector2f range = m_distr.range();
-        return m_distr.integral() / (range[1] - range[0]);
     }
 
     ScalarVector2f wavelength_range() const override {

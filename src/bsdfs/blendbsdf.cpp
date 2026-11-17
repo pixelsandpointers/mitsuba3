@@ -225,21 +225,34 @@ public:
         return dr::clip(m_weight->eval_1(si, active), 0.f, 1.f);
     }
 
-    Spectrum eval_diffuse_reflectance(const SurfaceInteraction3f &si,
-                                     Mask active) const override {
+    BSDFFeatures3f eval_features(const SurfaceInteraction3f &si,
+                                 Mask active) const override {
         Float weight = eval_weight(si, active);
-        return m_nested_bsdf[0]->eval_diffuse_reflectance(si, active) * (1 - weight) +
-               m_nested_bsdf[1]->eval_diffuse_reflectance(si, active) * weight;
+        BSDFFeatures3f f0 = m_nested_bsdf[0]->eval_features(si, active),
+                       f1 = m_nested_bsdf[1]->eval_features(si, active);
+        // Frames, roughnesses, and directions come from the dominant
+        // component, since interpolating them is not meaningful
+        Float w0 = 1.f - weight;
+        Mask spec0  = w0 * dr::mean(f0.specular_reflectance + f0.specular_transmittance) >=
+                      weight * dr::mean(f1.specular_reflectance + f1.specular_transmittance),
+             trans0 = w0 * dr::mean(f0.specular_transmittance) >=
+                      weight * dr::mean(f1.specular_transmittance);
+        return { dr::lerp(f0.diffuse_albedo, f1.diffuse_albedo, weight),
+                 dr::lerp(f0.specular_reflectance, f1.specular_reflectance, weight),
+                 dr::lerp(f0.specular_transmittance, f1.specular_transmittance, weight),
+                 dr::select(weight < 0.5f, f0.sh_frame, f1.sh_frame),
+                 dr::select(spec0, f0.roughness, f1.roughness),
+                 dr::select(trans0, f0.wt, f1.wt) };
     }
 
-    Spectrum eval_null_transmission(const SurfaceInteraction3f &si,
-                                    Mask active) const override {
-        if (likely(!has_flag(m_flags, BSDFFlags::Null)))
+    Spectrum eval_null(const SurfaceInteraction3f &si,
+                       Mask active) const override {
+        if (likely(!this->has_flag(BSDFFlags::Null)))
             return 0.f;
         // Evaluate the null transmission of the nested BSDFs
         Float weight = eval_weight(si, active);
-        return m_nested_bsdf[0]->eval_null_transmission(si, active) * (1 - weight) +
-               m_nested_bsdf[1]->eval_null_transmission(si, active) * weight;
+        return m_nested_bsdf[0]->eval_null(si, active) * (1 - weight) +
+               m_nested_bsdf[1]->eval_null(si, active) * weight;
     }
 
     std::string to_string() const override {

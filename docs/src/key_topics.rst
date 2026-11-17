@@ -23,3 +23,5 @@ Topics
     key_topics/scene_format
     key_topics/differences
     key_topics/polarization
+    key_topics/file_formats
+    key_topics/animation
